@@ -8,7 +8,7 @@ let adminApp: App;
 function getAdminApp(): App {
   if (getApps().length === 0) {
     const serviceAccount = process.env.FIREBASE_ADMIN_SERVICE_ACCOUNT;
-    if (!serviceAccount || serviceAccount === '{}') {
+    if (!serviceAccount || serviceAccount === '{}' || serviceAccount === 'undefined') {
       // For development without real credentials, use application default
       adminApp = initializeApp({
         projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID || 'routeiq-dev',
