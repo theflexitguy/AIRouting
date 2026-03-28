@@ -1,0 +1,37 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "jobs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "scheduledDate", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "jobs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "scheduledDate", "order": "ASCENDING" },
+        { "fieldPath": "assignedTechId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "routes",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "date", "order": "ASCENDING" },
+        { "fieldPath": "techId", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "routeHistory",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "modifiedAt", "order": "DESCENDING" },
+        { "fieldPath": "feedbackProcessed", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

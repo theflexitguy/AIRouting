@@ -1,0 +1,22 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users can only read/write their own profile
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Company data: only users with matching companyId can access
+    match /companies/{companyId} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.companyId == companyId;
+
+      // All subcollections under a company
+      match /{collection}/{document=**} {
+        allow read, write: if request.auth != null &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.companyId == companyId;
+      }
+    }
+  }
+}
