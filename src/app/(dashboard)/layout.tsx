@@ -18,7 +18,9 @@ export default function DashboardLayout({
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   useEffect(() => {
-    if (!loading && !user) {
+    // In demo mode (no Firebase configured), skip login redirect so
+    // the full UI is visible with sample data
+    if (!loading && !user && !isDemoMode) {
       router.push("/login");
     }
   }, [user, loading, router]);
@@ -34,7 +36,8 @@ export default function DashboardLayout({
     );
   }
 
-  if (!user) return null;
+  // In demo mode, render even without a logged-in user
+  if (!user && !isDemoMode) return null;
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-background relative">
