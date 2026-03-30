@@ -151,10 +151,25 @@ echo ""
 echo -e "${BOLD}Now get your service account key:${RESET}"
 echo -e "1. Firebase → ⚙️ Project Settings → Service Accounts"
 echo -e "2. Click ${BOLD}Generate new private key${RESET} → Generate key"
-echo -e "3. Open the downloaded .json file in TextEdit or Notes"
-echo -e "4. Select all (Cmd+A), copy"
+echo -e "3. It downloads a .json file to your Downloads folder"
 echo ""
-ask_multiline FB_SERVICE_ACCOUNT "Paste the entire service account JSON, then type END on a new line:"
+echo -e "${BOLD}Drag the downloaded .json file from Finder into this terminal window,${RESET}"
+echo -e "then press Enter:"
+read -r FB_SERVICE_ACCOUNT_PATH
+# Strip any quotes or whitespace from drag-and-drop
+FB_SERVICE_ACCOUNT_PATH=$(echo "$FB_SERVICE_ACCOUNT_PATH" | tr -d "'" | xargs)
+if [ ! -f "$FB_SERVICE_ACCOUNT_PATH" ]; then
+  echo -e "${RED}File not found: $FB_SERVICE_ACCOUNT_PATH${RESET}"
+  echo -e "Enter the full path manually (e.g. /Users/jalenbrown/Downloads/routeiq-xxxx.json):"
+  read -r FB_SERVICE_ACCOUNT_PATH
+  FB_SERVICE_ACCOUNT_PATH=$(echo "$FB_SERVICE_ACCOUNT_PATH" | tr -d "'" | xargs)
+fi
+FB_SERVICE_ACCOUNT=$(python3 -c "import sys,json; print(json.dumps(json.load(open('$FB_SERVICE_ACCOUNT_PATH'))))" 2>/dev/null)
+if [ -z "$FB_SERVICE_ACCOUNT" ]; then
+  echo -e "${RED}Could not read the file. Check the path and try again.${RESET}"
+  exit 1
+fi
+echo -e "${GREEN}✓ Service account loaded${RESET}"
 
 # ══════════════════════════════════════════════════════════════
 # STEP 3 — FieldRoutes
