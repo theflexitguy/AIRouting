@@ -4,29 +4,37 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 
-// Prefer explicit server-only var, fall back to the public one (works in docker-compose)
-const BACKEND_URL = process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || process.env.BACKEND_URL || "";
 
+/**
+ * POST /api/generate
+ *
+ * Pulls pending jobs from Firestore for the given company, sends them to the
+ * production routing backend (OGRouting FastAPI), and writes the resulting
+ * routes back into Firestore.
+ *
+ * If BACKEND_URL is not set the endpoint returns a clear error — the JS
+ * fallback solver was removed in favour of the Python engine.
+ */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { companyId, date, techIds, runSettings } = body as {
+    const { companyId, date, runSettings } = body as {
       companyId: string;
-      date: string;
-      techIds?: string[];
+      date?: string;
       runSettings?: Record<string, unknown>;
     };
 
-    if (!companyId || !date) {
-      return NextResponse.json({ error: "companyId and date are required" }, { status: 400 });
+    if (!companyId) {
+      return NextResponse.json({ error: "companyId is required" }, { status: 400 });
     }
 
     if (!BACKEND_URL) {
       return NextResponse.json(
         {
           error:
-            "Routing backend not configured. " +
-            "Run docker-compose up, then set BACKEND_URL=http://localhost:8000 in your .env.local.",
+            "Routing backend not configured. Set BACKEND_URL (or NEXT_PUBLIC_BACKEND_URL) " +
+            "to your FastAPI backend URL (e.g. http://localhost:8000 when running docker-compose).",
         },
         { status: 503 }
       );
@@ -34,13 +42,13 @@ export async function POST(request: NextRequest) {
 
     // --- 1. Fetch jobs from Firestore ---
     const db = adminDb();
-    let q = db.collection(`companies/${companyId}/jobs`) as FirebaseFirestore.Query;
-    q = q.where("scheduledDate", "==", date);
-    if (techIds && techIds.length > 0) {
-      q = q.where("assignedTechId", "in", techIds.slice(0, 10)); // Firestore 'in' limit
+    let jobsQuery = db.collection(`companies/${companyId}/jobs`) as FirebaseFirestore.Query;
+    if (date) {
+      jobsQuery = jobsQuery.where("scheduledDate", "==", date);
     }
-    const snapshot = await q.limit(500).get();
+    jobsQuery = jobsQuery.where("status", "in", ["pending", "unassigned"]).limit(500);
 
+    const snapshot = await jobsQuery.get();
     const jobs = snapshot.docs.map((doc) => {
       const d = doc.data();
       return {
@@ -50,8 +58,8 @@ export async function POST(request: NextRequest) {
         address: d.address || "",
         lat: d.lat ?? d.latitude ?? null,
         lng: d.lng ?? d.longitude ?? null,
-        preferredTech: d.assignedTechId || "",
-        serviceDue: date,
+        preferredTech: d.assignedTechId || d.preferredTech || "",
+        serviceDue: d.scheduledDate || date || "",
         schedulingRequest: d.schedulingRequest || "",
         duration: d.estimatedDuration || 25,
         serviceType: d.serviceType || "",
@@ -59,10 +67,10 @@ export async function POST(request: NextRequest) {
     });
 
     if (jobs.length === 0) {
-      return NextResponse.json({ success: false, error: "No jobs found for this date" }, { status: 404 });
+      return NextResponse.json({ error: "No pending jobs found for this date/company" }, { status: 404 });
     }
 
-    // --- 2. Call Python routing backend ---
+    // --- 2. Call the Python routing backend ---
     const backendRes = await fetch(`${BACKEND_URL}/routeiq/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -72,32 +80,30 @@ export async function POST(request: NextRequest) {
     if (!backendRes.ok) {
       const text = await backendRes.text();
       return NextResponse.json(
-        { success: false, error: `Routing engine returned ${backendRes.status}: ${text}` },
+        { error: `Routing backend returned ${backendRes.status}: ${text}` },
         { status: 502 }
       );
     }
 
     const result = await backendRes.json();
 
-    // --- 3. Save routes to Firestore ---
+    // --- 3. Write routes back to Firestore ---
     if (db && result.routes?.length > 0) {
       const batch = db.batch();
       const now = new Date().toISOString();
 
-      for (const route of result.routes as Array<Record<string, unknown>>) {
-        const routeName = String(route.routeName || "");
+      for (const route of result.routes) {
         const routeRef = db
           .collection(`companies/${companyId}/routes`)
-          .doc(`${date}-${routeName.replace(/\s+/g, "-")}`);
+          .doc(`${route.routeName}-${result.runId}`);
 
         batch.set(routeRef, {
-          name: routeName,
-          date: route.routeDate || date,
+          name: route.routeName,
+          date: route.routeDate,
           routeIndex: route.routeIndex,
           fieldRoutesTemplateID: route.fieldRoutesTemplateID,
           totalDriveMinutes: route.totalDriveMinutes,
-          stopCount: (route.stops as unknown[])?.length || 0,
-          stopSequence: ((route.stops as Array<Record<string, unknown>>) || []).map((s) => s.customerID),
+          stopCount: route.stops?.length || 0,
           stops: route.stops || [],
           status: "draft",
           generatedBy: "routeiq-engine",
@@ -112,17 +118,16 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json({
-      success: true,
       runId: result.runId,
       routeCount: result.routes?.length || 0,
       stopCount: result.stops?.length || 0,
-      warnings: result.warnings || [],
       summary: result.summary,
+      warnings: result.warnings || [],
     });
   } catch (error) {
     console.error("Generate routes API error:", error);
     return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : "Failed to generate routes" },
+      { error: error instanceof Error ? error.message : "Failed to generate routes" },
       { status: 500 }
     );
   }

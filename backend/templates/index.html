@@ -1,0 +1,1804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flex Routing Engine</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #111a2e;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: rgba(255,255,255,0.10);
+      --accent: #35b2ff;
+      --good: #22c55e;
+      --bad: #ef4444;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 800px at 20% -10%, rgba(53,178,255,0.25), transparent 60%),
+                  radial-gradient(900px 700px at 110% 10%, rgba(168,85,247,0.20), transparent 55%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .wrap {
+      width: 100%;
+      max-width: 760px;
+    }
+
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      letter-spacing: 0.2px;
+    }
+
+    p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .settingsCard {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.18);
+    }
+
+    .settingsHead {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .settingsTitle {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .settingsToggle {
+      padding: 7px 10px;
+      font-size: 12px;
+    }
+
+    .settingsGrid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .settingField {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .settingField label {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.2;
+    }
+
+    .settingField input[type="number"] {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.22);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .settingCheck {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-top: 20px;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .settingCheck input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+    }
+
+    .settingsAdvanced {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px dashed rgba(255,255,255,0.12);
+      display: none;
+    }
+
+    .settingsAdvanced.open {
+      display: block;
+    }
+
+    .settingsStatus {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      min-height: 16px;
+    }
+
+    .settingsStatus.bad {
+      color: #fca5a5;
+    }
+
+    input[type="file"] {
+      flex: 1;
+      min-width: 240px;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.22);
+      color: var(--text);
+    }
+
+    button {
+      padding: 10px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(53,178,255,0.35);
+      background: rgba(53,178,255,0.18);
+      color: var(--text);
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.05s ease, background 0.15s ease;
+      white-space: nowrap;
+    }
+
+    button:active { transform: translateY(1px); }
+
+    button[disabled] {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    .progress {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.18);
+    }
+
+    .bar {
+      width: 100%;
+      height: 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.10);
+    }
+
+    .bar > div {
+      height: 100%;
+      width: 0%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(53,178,255,0.85), rgba(34,197,94,0.85));
+      transition: width 0.25s ease;
+    }
+
+    .meta {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 14px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .meta b { color: var(--text); font-weight: 600; }
+
+    .status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+
+    .pill {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .pill.good { border-color: rgba(34,197,94,0.35); background: rgba(34,197,94,0.14); }
+    .pill.bad { border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.14); }
+
+    .downloads {
+      margin-top: 14px;
+      display: none;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .downloads a {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .downloads a:hover {
+      border-color: rgba(53,178,255,0.35);
+    }
+
+    .preflight {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.20);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .preflightMain {
+      min-width: 260px;
+      flex: 1;
+    }
+
+    .osrmUrl {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      word-break: break-all;
+    }
+
+    .preflightActions {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .preflightActions button {
+      padding: 7px 10px;
+      font-size: 12px;
+    }
+
+    .hint {
+      margin-top: 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 760px) {
+      .settingsGrid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .fieldRoutesGrid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 560px) {
+      .settingsGrid {
+        grid-template-columns: 1fr;
+      }
+      .fieldRoutesGrid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .errorBox {
+      margin-top: 12px;
+      display: none;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(239,68,68,0.35);
+      background: rgba(239,68,68,0.10);
+      color: var(--text);
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .recovery {
+      margin-top: 10px;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .recoveryNote {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .recentRuns {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.18);
+    }
+
+    .recentRunsHead {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .recentRunsTitle {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .runInfo {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .runList {
+      display: grid;
+      gap: 6px;
+    }
+
+    .runItem {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: var(--text);
+      background: rgba(255,255,255,0.03);
+    }
+
+    .runMeta {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .fieldRoutesPanel {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.18);
+    }
+
+    .fieldRoutesHead {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .fieldRoutesTitle {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .fieldRoutesGrid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .fieldRoutesField {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .fieldRoutesField label {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.2;
+    }
+
+    .fieldRoutesField input,
+    .fieldRoutesField select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,0.22);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .fieldRoutesRow {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .fieldRoutesFileInput {
+      flex: 1 1 260px;
+      min-width: 220px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .fieldRoutesNote {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      white-space: pre-wrap;
+      line-height: 1.3;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Flex Routing Engine</h1>
+      <p>
+        Upload the appointments CSV, then watch live progress while routes are generated.
+        When it finishes, download the FieldRoutes-ready CSV and the interactive map.
+      </p>
+
+      <form id="uploadForm" action="/upload" enctype="multipart/form-data" method="post">
+        <div class="row">
+          <input id="fileInput" name="file" type="file" accept=".csv,text/csv" required />
+          <button id="submitBtn" type="submit">Generate Routes</button>
+          <button id="resetBtn" type="button" title="Clear stale running state">Reset</button>
+        </div>
+      </form>
+
+      <div class="settingsCard" id="settingsCard">
+        <div class="settingsHead">
+          <h2 class="settingsTitle">Run Settings</h2>
+          <button id="toggleAdvancedBtn" class="settingsToggle" type="button">Show Advanced</button>
+        </div>
+
+        <div class="settingsGrid" id="settingsBasicGrid">
+          <div class="settingField">
+            <label for="targetStopsPerRoute">Target Stops / Route</label>
+            <input id="targetStopsPerRoute" type="number" />
+          </div>
+          <div class="settingField">
+            <label for="minStopsPerRoute">Min Stops / Route</label>
+            <input id="minStopsPerRoute" type="number" />
+          </div>
+          <div class="settingField">
+            <label for="maxStopsPerRoute">Max Stops / Route</label>
+            <input id="maxStopsPerRoute" type="number" />
+          </div>
+          <div class="settingField">
+            <label for="maxRouteDriveMinutes">Max Drive Minutes / Route</label>
+            <input id="maxRouteDriveMinutes" type="number" />
+          </div>
+          <div class="settingField">
+            <label for="defaultStopDurationMinutes">Default Stop Duration (min)</label>
+            <input id="defaultStopDurationMinutes" type="number" />
+          </div>
+          <div class="settingField">
+            <label for="planningHorizonMonths">Planning Horizon (months)</label>
+            <input id="planningHorizonMonths" type="number" />
+          </div>
+          <label class="settingCheck">
+            <input id="allowSaturdayOverflow" type="checkbox" />
+            Allow Saturday Overflow (requested; forced on in active policy)
+          </label>
+        </div>
+
+        <div class="settingsAdvanced" id="settingsAdvanced">
+          <div class="settingsGrid">
+            <label class="settingCheck">
+              <input id="remoteStrict" type="checkbox" />
+              Remote Strict
+            </label>
+            <div class="settingField">
+              <label for="preferredRouteDriveMinLocal">Preferred Local Drive Min</label>
+              <input id="preferredRouteDriveMinLocal" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="preferredRouteDriveMinRemote">Preferred Remote Drive Min</label>
+              <input id="preferredRouteDriveMinRemote" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="maxRouteDiameterMiLocal">Max Local Route Diameter (mi)</label>
+              <input id="maxRouteDiameterMiLocal" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="maxRouteDiameterMiRemote">Max Remote Route Diameter (mi)</label>
+              <input id="maxRouteDiameterMiRemote" type="number" />
+            </div>
+            <label class="settingCheck">
+              <input id="qualityGateHardFail" type="checkbox" />
+              Quality Gate Hard-Fail
+            </label>
+            <div class="settingField">
+              <label for="fieldRoutesTemplateIdRegular">FieldRoutes Template ID (Regular)</label>
+              <input id="fieldRoutesTemplateIdRegular" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="fieldRoutesTemplateIdSpecialty">FieldRoutes Template ID (Specialty)</label>
+              <input id="fieldRoutesTemplateIdSpecialty" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="fieldRoutesTemplateIdLawn">FieldRoutes Template ID (Lawn)</label>
+              <input id="fieldRoutesTemplateIdLawn" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="fieldRoutesTemplateIdTuesday">FieldRoutes Template ID (Tuesday Override)</label>
+              <input id="fieldRoutesTemplateIdTuesday" type="number" />
+            </div>
+            <div class="settingField">
+              <label for="fieldRoutesTemplateIdDefault">FieldRoutes Template ID (Fallback)</label>
+              <input id="fieldRoutesTemplateIdDefault" type="number" />
+            </div>
+            <label class="settingCheck">
+              <input id="fieldRoutesTuesdayOverride" type="checkbox" />
+              FieldRoutes Tuesday Override Enabled
+            </label>
+          </div>
+        </div>
+
+        <div class="settingsStatus" id="settingsStatus">Loading run settings…</div>
+      </div>
+
+      <div class="preflight" id="osrmPreflightPanel" aria-live="polite">
+        <div class="preflightMain">
+          <div><b>OSRM Preflight:</b> <span id="osrmMsg">Checking OSRM…</span></div>
+          <div class="osrmUrl" id="osrmUrl">—</div>
+        </div>
+        <div class="preflightActions">
+          <div class="pill" id="osrmPill">checking</div>
+          <button id="checkOsrmBtn" type="button">Recheck OSRM</button>
+        </div>
+      </div>
+
+      <div class="progress" id="progressPanel" aria-live="polite">
+        <div class="bar"><div id="barFill"></div></div>
+
+        <div class="status">
+          <div id="statusMsg">Idle — choose a CSV and click “Generate Routes”.</div>
+          <div class="pill" id="statusPill">idle</div>
+        </div>
+
+        <div class="meta">
+          <div><b>Progress:</b> <span id="pct">0%</span></div>
+          <div><b>Stage:</b> <span id="stage">—</span></div>
+          <div><b>Elapsed:</b> <span id="elapsed">—</span></div>
+          <div><b>ETA:</b> <span id="eta">—</span></div>
+          <div><b>Settings:</b> <span id="activeSettingsSummary">—</span></div>
+        </div>
+
+        <div class="errorBox" id="errorBox"></div>
+        <div class="recovery" id="recoveryActions">
+          <button id="rebuildMapBtn" type="button">Rebuild Map</button>
+          <span class="recoveryNote" id="rebuildMapNote">Map output is missing. Rebuild from existing CSV.</span>
+        </div>
+
+        <div class="downloads" id="downloads">
+          <a href="/download-csv" id="dlCsv">⬇️ Download FieldRoutes CSV</a>
+          <a href="/open-map" id="dlMap">🗺️ Open Route Map</a>
+        </div>
+
+        <div class="hint">
+          Tip: keep this tab open — progress updates automatically every second.
+        </div>
+      </div>
+
+      <div class="recentRuns" id="recentRunsPanel">
+        <div class="recentRunsHead">
+          <h2 class="recentRunsTitle">Recent Runs</h2>
+          <button id="refreshRunsBtn" type="button">Refresh</button>
+        </div>
+        <div class="runInfo" id="activeRunInfo">Active run: —</div>
+        <div class="runList" id="recentRunsList"></div>
+      </div>
+
+      <div class="fieldRoutesPanel" id="fieldRoutesPanel">
+        <div class="fieldRoutesHead">
+          <h2 class="fieldRoutesTitle">FieldRoutes Pilot Push</h2>
+          <div class="pill" id="frStatusPill">idle</div>
+        </div>
+        <div class="fieldRoutesGrid">
+          <div class="fieldRoutesField">
+            <label for="frRunIdSelect">Run ID</label>
+            <select id="frRunIdSelect"></select>
+          </div>
+          <div class="fieldRoutesField">
+            <label for="frDateInput">Pilot Date</label>
+            <input id="frDateInput" type="date" value="2026-04-01" />
+          </div>
+          <div class="fieldRoutesField" id="frAdminPasswordWrap" style="display:none;">
+            <label for="frAdminPasswordInput">Admin Password</label>
+            <input id="frAdminPasswordInput" type="password" autocomplete="current-password" placeholder="FieldRoutes admin password" />
+          </div>
+          <label class="settingCheck" style="padding-top: 20px;">
+            <input id="frUseEdited" type="checkbox" checked />
+            Use Edited CSV
+          </label>
+        </div>
+        <div class="fieldRoutesRow">
+          <input
+            id="frEditedCsvInput"
+            class="fieldRoutesFileInput"
+            type="file"
+            accept=".csv,text/csv"
+          />
+          <button id="frUploadEditedBtn" type="button">Upload Edited CSV</button>
+        </div>
+        <div class="fieldRoutesNote" id="frUploadNote">Upload an edited routing CSV for the selected run.</div>
+        <div class="fieldRoutesRow">
+          <button id="frDryRunBtn" type="button">Dry Run</button>
+          <button id="frApplyBtn" type="button">Apply</button>
+          <button id="frRefreshBtn" type="button">Refresh Status</button>
+        </div>
+        <div class="fieldRoutesRow downloads" id="frDownloads" style="display:none;">
+          <a href="#" id="frReportLink">Push Report</a>
+          <a href="#" id="frExceptionsLink">Exceptions CSV</a>
+          <a href="#" id="frRequestLogLink">Request Log</a>
+        </div>
+        <div class="fieldRoutesNote" id="frConfigNote">Checking FieldRoutes credentials…</div>
+        <div class="fieldRoutesNote" id="frOutputNote">Status: idle.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // This page expects your FastAPI app to expose a GET /progress endpoint
+    // that returns JSON like:
+    // {
+    //   status: 'idle'|'running'|'done'|'error',
+    //   percent: 0..100,          // preferred
+    //   progress: 0..1,           // alternate
+    //   message, stage,
+    //   elapsedSec, etaSec,
+    //   error
+    // }
+
+    const form = document.getElementById('uploadForm');
+    const submitBtn = document.getElementById('submitBtn');
+    const fileInput = document.getElementById('fileInput');
+    const resetBtn = document.getElementById('resetBtn');
+    const osrmMsgEl = document.getElementById('osrmMsg');
+    const osrmPillEl = document.getElementById('osrmPill');
+    const osrmUrlEl = document.getElementById('osrmUrl');
+    const checkOsrmBtn = document.getElementById('checkOsrmBtn');
+    const toggleAdvancedBtn = document.getElementById('toggleAdvancedBtn');
+    const settingsAdvancedEl = document.getElementById('settingsAdvanced');
+    const settingsStatusEl = document.getElementById('settingsStatus');
+    const activeSettingsSummaryEl = document.getElementById('activeSettingsSummary');
+
+    const barFill = document.getElementById('barFill');
+    const pctEl = document.getElementById('pct');
+    const stageEl = document.getElementById('stage');
+    const elapsedEl = document.getElementById('elapsed');
+    const etaEl = document.getElementById('eta');
+    const statusMsgEl = document.getElementById('statusMsg');
+    const statusPillEl = document.getElementById('statusPill');
+    const downloadsEl = document.getElementById('downloads');
+    const errorBoxEl = document.getElementById('errorBox');
+    const recoveryActionsEl = document.getElementById('recoveryActions');
+    const rebuildMapBtn = document.getElementById('rebuildMapBtn');
+    const rebuildMapNoteEl = document.getElementById('rebuildMapNote');
+    const dlCsvEl = document.getElementById('dlCsv');
+    const dlMapEl = document.getElementById('dlMap');
+    const recentRunsListEl = document.getElementById('recentRunsList');
+    const activeRunInfoEl = document.getElementById('activeRunInfo');
+    const refreshRunsBtn = document.getElementById('refreshRunsBtn');
+    const frRunIdSelect = document.getElementById('frRunIdSelect');
+    const frDateInput = document.getElementById('frDateInput');
+    const frAdminPasswordWrap = document.getElementById('frAdminPasswordWrap');
+    const frAdminPasswordInput = document.getElementById('frAdminPasswordInput');
+    const frUseEdited = document.getElementById('frUseEdited');
+    const frEditedCsvInput = document.getElementById('frEditedCsvInput');
+    const frUploadEditedBtn = document.getElementById('frUploadEditedBtn');
+    const frUploadNote = document.getElementById('frUploadNote');
+    const frDryRunBtn = document.getElementById('frDryRunBtn');
+    const frApplyBtn = document.getElementById('frApplyBtn');
+    const frRefreshBtn = document.getElementById('frRefreshBtn');
+    const frStatusPill = document.getElementById('frStatusPill');
+    const frConfigNote = document.getElementById('frConfigNote');
+    const frOutputNote = document.getElementById('frOutputNote');
+    const frDownloads = document.getElementById('frDownloads');
+    const frReportLink = document.getElementById('frReportLink');
+    const frExceptionsLink = document.getElementById('frExceptionsLink');
+    const frRequestLogLink = document.getElementById('frRequestLogLink');
+
+    const SETTINGS_KEYS = [
+      'planningHorizonMonths',
+      'targetStopsPerRoute',
+      'minStopsPerRoute',
+      'maxStopsPerRoute',
+      'maxRouteDriveMinutes',
+      'defaultStopDurationMinutes',
+      'allowSaturdayOverflow',
+      'remoteStrict',
+      'preferredRouteDriveMinLocal',
+      'preferredRouteDriveMinRemote',
+      'maxRouteDiameterMiLocal',
+      'maxRouteDiameterMiRemote',
+      'qualityGateHardFail',
+      'fieldRoutesTemplateIdRegular',
+      'fieldRoutesTemplateIdSpecialty',
+      'fieldRoutesTemplateIdLawn',
+      'fieldRoutesTemplateIdTuesday',
+      'fieldRoutesTemplateIdDefault',
+      'fieldRoutesTuesdayOverride',
+    ];
+
+    const BOOLEAN_SETTING_KEYS = new Set([
+      'allowSaturdayOverflow',
+      'remoteStrict',
+      'qualityGateHardFail',
+      'fieldRoutesTuesdayOverride',
+    ]);
+
+    const STATIC_DEFAULTS = {
+      planningHorizonMonths: 1,
+      targetStopsPerRoute: 12,
+      minStopsPerRoute: 8,
+      maxStopsPerRoute: 14,
+      maxRouteDriveMinutes: 60,
+      defaultStopDurationMinutes: 25,
+      allowSaturdayOverflow: true,
+      remoteStrict: true,
+      preferredRouteDriveMinLocal: 35,
+      preferredRouteDriveMinRemote: 40,
+      maxRouteDiameterMiLocal: 12,
+      maxRouteDiameterMiRemote: 20,
+      qualityGateHardFail: true,
+      fieldRoutesTemplateIdRegular: 34,
+      fieldRoutesTemplateIdSpecialty: 35,
+      fieldRoutesTemplateIdLawn: 38,
+      fieldRoutesTemplateIdTuesday: 26,
+      fieldRoutesTemplateIdDefault: 34,
+      fieldRoutesTuesdayOverride: true,
+    };
+
+    const STATIC_LIMITS = {
+      planningHorizonMonths: { type: 'int', min: 1, max: 6, step: 1 },
+      targetStopsPerRoute: { type: 'int', min: 4, max: 30, step: 1 },
+      minStopsPerRoute: { type: 'int', min: 1, max: 30, step: 1 },
+      maxStopsPerRoute: { type: 'int', min: 1, max: 40, step: 1 },
+      maxRouteDriveMinutes: { type: 'float', min: 15, max: 180, step: 1 },
+      defaultStopDurationMinutes: { type: 'int', min: 5, max: 180, step: 1 },
+      allowSaturdayOverflow: { type: 'bool' },
+      remoteStrict: { type: 'bool' },
+      preferredRouteDriveMinLocal: { type: 'float', min: 5, max: 180, step: 1 },
+      preferredRouteDriveMinRemote: { type: 'float', min: 5, max: 180, step: 1 },
+      maxRouteDiameterMiLocal: { type: 'float', min: 1, max: 100, step: 0.5 },
+      maxRouteDiameterMiRemote: { type: 'float', min: 1, max: 100, step: 0.5 },
+      qualityGateHardFail: { type: 'bool' },
+      fieldRoutesTemplateIdRegular: { type: 'int', min: 1, max: 9999, step: 1 },
+      fieldRoutesTemplateIdSpecialty: { type: 'int', min: 1, max: 9999, step: 1 },
+      fieldRoutesTemplateIdLawn: { type: 'int', min: 1, max: 9999, step: 1 },
+      fieldRoutesTemplateIdTuesday: { type: 'int', min: 1, max: 9999, step: 1 },
+      fieldRoutesTemplateIdDefault: { type: 'int', min: 1, max: 9999, step: 1 },
+      fieldRoutesTuesdayOverride: { type: 'bool' },
+    };
+
+    const settingInputs = Object.fromEntries(SETTINGS_KEYS.map((k) => [k, document.getElementById(k)]));
+
+    let pollTimer = null;
+    let osrmTimer = null;
+    let osrmReady = false;
+    let settingsValid = false;
+    let lastProgressPayload = null;
+    let uploadInFlight = false;
+    let runSettingsDefaults = { ...STATIC_DEFAULTS };
+    let runSettingsLimits = { ...STATIC_LIMITS };
+    let runSettingsUiHints = { persistenceKey: 'flexRouting.runSettings.v1' };
+    let currentRunSettings = { ...STATIC_DEFAULTS };
+    let currentRunId = null;
+    let runsState = [];
+    let fieldRoutesPollTimer = null;
+    let fieldRoutesAdminRequired = false;
+    let lastFieldRoutesState = {};
+
+    function withRunId(path, runId = currentRunId) {
+      const p = String(path || '').trim();
+      if (!p || !runId) return p;
+      const joiner = p.includes('?') ? '&' : '?';
+      if (p.includes('runId=')) return p;
+      return `${p}${joiner}runId=${encodeURIComponent(String(runId))}`;
+    }
+
+    function updateDownloadLinks(runId = currentRunId) {
+      const csvPath = withRunId('/download-csv', runId) || '/download-csv';
+      const mapPath = withRunId('/open-map', runId) || '/open-map';
+      dlCsvEl.href = csvPath;
+      dlMapEl.href = mapPath;
+    }
+
+    function setCurrentRunId(runId) {
+      const next = (runId == null || String(runId).trim() === '') ? null : String(runId);
+      currentRunId = next;
+      activeRunInfoEl.textContent = `Active run: ${next || '—'}`;
+      updateDownloadLinks(next);
+      ensureFieldRoutesRunSelect();
+    }
+
+    function renderRecentRuns() {
+      const items = Array.isArray(runsState) ? runsState : [];
+      if (!items.length) {
+        recentRunsListEl.innerHTML = '<div class=\"runMeta\">No runs yet.</div>';
+        return;
+      }
+
+      recentRunsListEl.innerHTML = '';
+      items.slice(0, 12).forEach((run) => {
+        const runId = String(run.runId || '').trim();
+        if (!runId) return;
+        const row = document.createElement('div');
+        row.className = 'runItem';
+        const left = document.createElement('div');
+        const status = String(run.status || 'unknown');
+        const createdAt = String(run.createdAt || '—');
+        const updatedAt = String(run.updatedAt || run.createdAt || '—');
+        left.innerHTML = `<div><b>${runId}</b> · ${status}</div><div class=\"runMeta\">created ${createdAt} · updated ${updatedAt}</div>`;
+
+        const actions = document.createElement('div');
+        actions.style.display = 'flex';
+        actions.style.gap = '6px';
+
+        const openBtn = document.createElement('button');
+        openBtn.type = 'button';
+        openBtn.textContent = 'Open';
+        openBtn.addEventListener('click', () => {
+          window.location.href = withRunId('/open-map', runId);
+        });
+
+        const csvBtn = document.createElement('button');
+        csvBtn.type = 'button';
+        csvBtn.textContent = 'CSV';
+        csvBtn.addEventListener('click', () => {
+          window.location.href = withRunId('/download-csv', runId);
+        });
+
+        const mapBtn = document.createElement('button');
+        mapBtn.type = 'button';
+        mapBtn.textContent = 'Map';
+        mapBtn.addEventListener('click', () => {
+          window.location.href = withRunId('/open-map', runId);
+        });
+
+        actions.appendChild(openBtn);
+        actions.appendChild(csvBtn);
+        actions.appendChild(mapBtn);
+
+        row.appendChild(left);
+        row.appendChild(actions);
+        recentRunsListEl.appendChild(row);
+      });
+    }
+
+    function ensureFieldRoutesRunSelect() {
+      const prev = String((frRunIdSelect.value || '').trim());
+      const ids = [];
+      if (currentRunId) ids.push(String(currentRunId));
+      (Array.isArray(runsState) ? runsState : []).forEach((run) => {
+        const rid = String(run && run.runId ? run.runId : '').trim();
+        if (rid) ids.push(rid);
+      });
+      const unique = Array.from(new Set(ids));
+
+      frRunIdSelect.innerHTML = '';
+      if (!unique.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = 'No runs available';
+        frRunIdSelect.appendChild(opt);
+        frRunIdSelect.disabled = true;
+        return;
+      }
+
+      frRunIdSelect.disabled = false;
+      unique.forEach((rid) => {
+        const opt = document.createElement('option');
+        opt.value = rid;
+        opt.textContent = rid;
+        frRunIdSelect.appendChild(opt);
+      });
+
+      if (prev && unique.includes(prev)) {
+        frRunIdSelect.value = prev;
+      } else if (currentRunId && unique.includes(String(currentRunId))) {
+        frRunIdSelect.value = String(currentRunId);
+      } else {
+        frRunIdSelect.value = unique[0];
+      }
+    }
+
+    function selectedFieldRoutesRunId() {
+      const rid = String((frRunIdSelect.value || '').trim());
+      if (rid) return rid;
+      return currentRunId ? String(currentRunId) : '';
+    }
+
+    function fieldRoutesAdminPasswordValue() {
+      return String((frAdminPasswordInput && frAdminPasswordInput.value) || '').trim();
+    }
+
+    function fieldRoutesAuthHeaders(extra) {
+      const headers = Object.assign({}, extra || {});
+      const pwd = fieldRoutesAdminPasswordValue();
+      if (pwd) headers['X-FieldRoutes-Admin-Password'] = pwd;
+      return headers;
+    }
+
+    function updateFieldRoutesAuthUi() {
+      if (!frAdminPasswordWrap || !frAdminPasswordInput) return;
+      frAdminPasswordWrap.style.display = fieldRoutesAdminRequired ? 'flex' : 'none';
+      frAdminPasswordInput.required = fieldRoutesAdminRequired;
+    }
+
+    function setFieldRoutesPill(status) {
+      const txt = String(status || 'idle');
+      frStatusPill.textContent = txt;
+      frStatusPill.classList.remove('good', 'bad');
+      if (txt === 'done') frStatusPill.classList.add('good');
+      if (txt === 'error') frStatusPill.classList.add('bad');
+    }
+
+    function setFieldRoutesPushControlsEnabled(enabled) {
+      const on = Boolean(enabled);
+      frDryRunBtn.disabled = !on;
+      frApplyBtn.disabled = !on;
+      frRunIdSelect.disabled = !on || frRunIdSelect.options.length <= 1;
+      frDateInput.disabled = !on;
+      frUseEdited.disabled = !on;
+    }
+
+    function setFieldRoutesUploadControlsEnabled(enabled) {
+      const on = Boolean(enabled);
+      frUploadEditedBtn.disabled = !on;
+      frEditedCsvInput.disabled = !on;
+    }
+
+    function applyFieldRoutesState(data) {
+      const state = (data && typeof data === 'object') ? data : {};
+      lastFieldRoutesState = state;
+      const status = String(state.status || 'idle');
+      const runId = String(state.runId || '').trim();
+      const mode = String(state.mode || '').trim();
+      const date = String(state.date || '').trim();
+      const startedAt = String(state.startedAt || '').trim();
+      const finishedAt = String(state.finishedAt || '').trim();
+      const stdout = String(state.stdout || '').trim();
+      const stderr = String(state.stderr || '').trim();
+      const err = String(state.error || '').trim();
+      const creds = (state.credentials && typeof state.credentials === 'object') ? state.credentials : {};
+      const missingCreds = Array.isArray(creds.missing) ? creds.missing : [];
+      fieldRoutesAdminRequired = Boolean(state.adminRequired);
+      updateFieldRoutesAuthUi();
+
+      if (runId) setCurrentRunId(runId);
+
+      setFieldRoutesPill(status);
+      if (!creds.configured) {
+        frConfigNote.textContent = `FieldRoutes credentials missing on server: ${missingCreds.join(', ') || 'unknown'}`;
+        frConfigNote.style.color = '#fca5a5';
+      } else {
+        frConfigNote.style.color = '';
+        const baseMsg = `FieldRoutes API ready: ${String(creds.baseUrl || '').trim() || '(base URL set)'}`;
+        frConfigNote.textContent = fieldRoutesAdminRequired
+          ? `${baseMsg} • admin password required for upload/push.`
+          : baseMsg;
+      }
+
+      let note = `Status: ${status}.`;
+      if (runId) note += ` runId=${runId}.`;
+      if (mode) note += ` mode=${mode}.`;
+      if (date) note += ` date=${date}.`;
+      if (startedAt) note += ` started=${startedAt}.`;
+      if (finishedAt) note += ` finished=${finishedAt}.`;
+      if (err) note += ` Error: ${err}`;
+      else if (stderr) note += ` ${stderr}`;
+      else if (stdout) note += ` ${stdout}`;
+      frOutputNote.textContent = note;
+
+      const artifacts = (state.artifacts && typeof state.artifacts === 'object') ? state.artifacts : null;
+      const reportExists = Boolean(artifacts && artifacts.report && artifacts.report.exists);
+      const excExists = Boolean(artifacts && artifacts.exceptions && artifacts.exceptions.exists);
+      const logExists = Boolean(artifacts && artifacts.requestLog && artifacts.requestLog.exists);
+      if (artifacts && runId) {
+        frReportLink.href = withRunId('/download-fieldroutes-report', runId);
+        frExceptionsLink.href = withRunId('/download-fieldroutes-exceptions', runId);
+        frRequestLogLink.href = withRunId('/download-fieldroutes-request-log', runId);
+      }
+      frDownloads.style.display = (reportExists || excExists || logExists) ? 'flex' : 'none';
+
+      const running = status === 'running';
+      const hasAdmin = !fieldRoutesAdminRequired || Boolean(fieldRoutesAdminPasswordValue());
+      const canRun = !running && Boolean(creds.configured) && hasAdmin;
+      setFieldRoutesPushControlsEnabled(canRun);
+      setFieldRoutesUploadControlsEnabled(!running && hasAdmin);
+      if (fieldRoutesAdminRequired && !hasAdmin && !running) {
+        frOutputNote.textContent = 'Enter admin password to upload/push to FieldRoutes.';
+      }
+      if (running) {
+        if (!fieldRoutesPollTimer) {
+          fieldRoutesPollTimer = setInterval(() => fetchFieldRoutesStatus(), 2000);
+        }
+      } else if (fieldRoutesPollTimer) {
+        clearInterval(fieldRoutesPollTimer);
+        fieldRoutesPollTimer = null;
+      }
+    }
+
+    async function fetchRuns() {
+      try {
+        const resp = await fetch('/runs?limit=30', { cache: 'no-store' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        runsState = Array.isArray(data.runs) ? data.runs : [];
+        const active = data.activeRunId != null ? String(data.activeRunId) : null;
+        if (!currentRunId && active) {
+          setCurrentRunId(active);
+        }
+        renderRecentRuns();
+        ensureFieldRoutesRunSelect();
+      } catch (_) {
+        // ignore list refresh failures
+      }
+    }
+
+    async function fetchFieldRoutesConfig() {
+      try {
+        const resp = await fetch('/fieldroutes/pilot/config', { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`FieldRoutes config endpoint returned ${resp.status}`);
+        const data = await resp.json();
+        applyFieldRoutesState(data.state || data);
+      } catch (err) {
+        frConfigNote.style.color = '#fca5a5';
+        frConfigNote.textContent = `Could not read FieldRoutes config: ${String(err)}`;
+        setFieldRoutesPushControlsEnabled(false);
+        setFieldRoutesUploadControlsEnabled(true);
+      }
+    }
+
+    async function fetchFieldRoutesStatus() {
+      try {
+        const resp = await fetch('/fieldroutes/pilot/status', { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`FieldRoutes status endpoint returned ${resp.status}`);
+        const data = await resp.json();
+        applyFieldRoutesState(data);
+      } catch (err) {
+        frOutputNote.textContent = `Could not read FieldRoutes status: ${String(err)}`;
+        setFieldRoutesPill('error');
+      }
+    }
+
+    async function uploadFieldRoutesEditedCsv() {
+      const file = frEditedCsvInput.files && frEditedCsvInput.files[0];
+      if (!file) {
+        frUploadNote.style.color = '#fca5a5';
+        frUploadNote.textContent = 'Select an edited CSV file first.';
+        return;
+      }
+
+      const runId = selectedFieldRoutesRunId();
+      const fd = new FormData();
+      fd.append('file', file);
+      if (runId) fd.append('runId', runId);
+
+      setFieldRoutesUploadControlsEnabled(false);
+      frUploadNote.style.color = '';
+      frUploadNote.textContent = runId
+        ? `Uploading edited CSV to run ${runId}...`
+        : 'Uploading edited CSV to a new run...';
+
+      try {
+        const resp = await fetch('/fieldroutes/pilot/upload-edited', {
+          method: 'POST',
+          headers: fieldRoutesAuthHeaders(),
+          body: fd,
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(data.message || data.error || `upload failed (${resp.status})`);
+        }
+
+        const nextRunId = String(data.runId || '').trim();
+        if (nextRunId) setCurrentRunId(nextRunId);
+        frUseEdited.checked = true;
+        frEditedCsvInput.value = '';
+        frUploadNote.style.color = '';
+        frUploadNote.textContent = data.message || 'Edited CSV uploaded.';
+        await fetchRuns();
+        await fetchFieldRoutesStatus();
+      } catch (err) {
+        frUploadNote.style.color = '#fca5a5';
+        frUploadNote.textContent = `Upload failed: ${String(err)}`;
+        setFieldRoutesPill('error');
+      } finally {
+        setFieldRoutesUploadControlsEnabled(true);
+      }
+    }
+
+    async function startFieldRoutesPush(mode) {
+      const runId = selectedFieldRoutesRunId();
+      const dateValue = String(frDateInput.value || '').trim();
+      if (!runId) {
+        frOutputNote.textContent = 'Select a run ID first.';
+        setFieldRoutesPill('error');
+        return;
+      }
+      if (!dateValue) {
+        frOutputNote.textContent = 'Choose a pilot date first.';
+        setFieldRoutesPill('error');
+        return;
+      }
+      setFieldRoutesPushControlsEnabled(false);
+      setFieldRoutesUploadControlsEnabled(false);
+      frOutputNote.textContent = `Starting FieldRoutes ${mode} for ${dateValue}...`;
+      setFieldRoutesPill('running');
+      try {
+        const resp = await fetch('/fieldroutes/pilot/start', {
+          method: 'POST',
+          headers: fieldRoutesAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            runId,
+            date: dateValue,
+            mode,
+            useEdited: Boolean(frUseEdited.checked),
+            syncDuration: false,
+          }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(data.message || data.error || `start failed (${resp.status})`);
+        }
+        applyFieldRoutesState(data.state || data);
+      } catch (err) {
+        setFieldRoutesPushControlsEnabled(true);
+        setFieldRoutesUploadControlsEnabled(true);
+        setFieldRoutesPill('error');
+        frOutputNote.textContent = `Start failed: ${String(err)}`;
+      }
+    }
+
+    function getSettingsStorageKey() {
+      return String(runSettingsUiHints.persistenceKey || 'flexRouting.runSettings.v1');
+    }
+
+    async function resetServerProgress() {
+      try {
+        await fetch('/reset', { method: 'POST' });
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    function fmtSeconds(s) {
+      if (s == null || !isFinite(s)) return '—';
+      const sec = Math.max(0, Math.round(s));
+      const m = Math.floor(sec / 60);
+      const r = sec % 60;
+      if (m <= 0) return `${r}s`;
+      return `${m}m ${String(r).padStart(2,'0')}s`;
+    }
+
+    function setPill(status) {
+      statusPillEl.textContent = status || 'unknown';
+      statusPillEl.classList.remove('good','bad');
+      if (status === 'done') statusPillEl.classList.add('good');
+      if (status === 'error') statusPillEl.classList.add('bad');
+    }
+
+    function setProgress(p) {
+      let n = Number(p);
+      if (!isFinite(n)) n = 0;
+      let pct100 = (n <= 1) ? Math.round(n * 100) : Math.round(n);
+      pct100 = Math.max(0, Math.min(100, pct100));
+      barFill.style.width = pct100 + '%';
+      pctEl.textContent = pct100 + '%';
+    }
+
+    function showError(text) {
+      if (!text) {
+        errorBoxEl.style.display = 'none';
+        errorBoxEl.textContent = '';
+        return;
+      }
+      errorBoxEl.style.display = 'block';
+      errorBoxEl.textContent = text;
+    }
+
+    function showRecoveryAction(show, noteText) {
+      recoveryActionsEl.style.display = show ? 'flex' : 'none';
+      if (noteText) rebuildMapNoteEl.textContent = noteText;
+    }
+
+    async function shouldOfferMapRecovery(data) {
+      const outputs = (data && typeof data === 'object') ? (data.outputs || {}) : {};
+      const outputCsv = String(outputs.csv || '').trim();
+      const outputMap = String(outputs.map || '').trim();
+      if (outputCsv && !outputMap) return true;
+      try {
+        const resp = await fetch(withRunId('/plan-editor/status'), { cache: 'no-store' });
+        if (!resp.ok) return false;
+        const st = await resp.json();
+        return Boolean(st && st.base && st.base.csv && st.base.csv.exists && st.base.map && !st.base.map.exists);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    async function rebuildMapFromCsv() {
+      rebuildMapBtn.disabled = true;
+      rebuildMapNoteEl.textContent = 'Rebuilding map from routing_plan.csv…';
+      try {
+        const resp = await fetch(withRunId('/rebuild-map'), { method: 'POST' });
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => '');
+          throw new Error(`Rebuild failed (${resp.status}). ${txt}`);
+        }
+        const data = await resp.json();
+        if (data && data.runId) setCurrentRunId(data.runId);
+        showRecoveryAction(false, '');
+        showError(null);
+        setPill('done');
+        stageEl.textContent = 'map_rebuilt';
+        statusMsgEl.textContent = 'Rebuilt route map from existing CSV.';
+        downloadsEl.style.display = 'flex';
+        if (data && data.downloadMapUrl) {
+          dlMapEl.href = String(data.downloadMapUrl);
+        }
+        updateDownloadLinks(currentRunId);
+        fetchRuns();
+      } catch (err) {
+        showError(String(err));
+        statusMsgEl.textContent = 'Map rebuild failed.';
+        showRecoveryAction(true, 'Map rebuild failed. Fix the error and retry.');
+      } finally {
+        rebuildMapBtn.disabled = false;
+      }
+    }
+
+    function setOsrmPill(mode) {
+      osrmPillEl.classList.remove('good', 'bad');
+      if (mode === 'ok') {
+        osrmPillEl.textContent = 'ready';
+        osrmPillEl.classList.add('good');
+        return;
+      }
+      if (mode === 'bad') {
+        osrmPillEl.textContent = 'blocked';
+        osrmPillEl.classList.add('bad');
+        return;
+      }
+      osrmPillEl.textContent = 'checking';
+    }
+
+    function formatRunSettingsSummary(settings) {
+      if (!settings) return '—';
+      const horizon = Number(settings.planningHorizonMonths);
+      const target = Number(settings.targetStopsPerRoute);
+      const minStops = Number(settings.minStopsPerRoute);
+      const maxStops = Number(settings.maxStopsPerRoute);
+      const drive = Number(settings.maxRouteDriveMinutes);
+      const satRequested = settings.allowSaturdayOverflow ? 'on' : 'off';
+      const sat = `forced-on (requested ${satRequested})`;
+      const gate = settings.qualityGateHardFail ? 'hard-fail' : 'warn';
+      const tpl = `${Number(settings.fieldRoutesTemplateIdRegular)}/${Number(settings.fieldRoutesTemplateIdSpecialty)}/${Number(settings.fieldRoutesTemplateIdLawn)}/${Number(settings.fieldRoutesTemplateIdTuesday)}`;
+      const tue = settings.fieldRoutesTuesdayOverride ? 'on' : 'off';
+      return `horizon=${horizon}mo; stops=${target} (min ${minStops}, max ${maxStops}); maxDrive=${drive}m; sat=${sat}; gate=${gate}; frTpl(R/S/L/T)=${tpl}; tueOv=${tue}`;
+    }
+
+    function setActiveSettingsSummary(text) {
+      activeSettingsSummaryEl.textContent = text || '—';
+    }
+
+    function syncControls(status) {
+      if (status === 'running') {
+        submitBtn.disabled = true;
+        fileInput.disabled = uploadInFlight;
+        return;
+      }
+      submitBtn.disabled = !osrmReady || !settingsValid;
+      fileInput.disabled = false;
+    }
+
+    function applyInputBounds() {
+      SETTINGS_KEYS.forEach((key) => {
+        const spec = runSettingsLimits[key] || {};
+        const el = settingInputs[key];
+        if (!el || BOOLEAN_SETTING_KEYS.has(key)) return;
+        if (typeof spec.min === 'number') el.min = String(spec.min);
+        if (typeof spec.max === 'number') el.max = String(spec.max);
+        if (typeof spec.step === 'number') el.step = String(spec.step);
+        el.required = true;
+      });
+    }
+
+    function loadSavedSettings() {
+      try {
+        const raw = localStorage.getItem(getSettingsStorageKey());
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === 'object') ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function persistSettings(settings) {
+      try {
+        localStorage.setItem(getSettingsStorageKey(), JSON.stringify(settings));
+      } catch (_) {
+        // ignore storage failures
+      }
+    }
+
+    function applySettingsToInputs(settings) {
+      SETTINGS_KEYS.forEach((key) => {
+        const el = settingInputs[key];
+        if (!el) return;
+        if (BOOLEAN_SETTING_KEYS.has(key)) {
+          el.checked = Boolean(settings[key]);
+        } else {
+          const v = settings[key];
+          el.value = (v == null || Number.isNaN(Number(v))) ? '' : String(v);
+        }
+      });
+    }
+
+    function collectRawSettingsFromInputs() {
+      const out = {};
+      SETTINGS_KEYS.forEach((key) => {
+        const el = settingInputs[key];
+        if (!el) return;
+        if (BOOLEAN_SETTING_KEYS.has(key)) {
+          out[key] = Boolean(el.checked);
+          return;
+        }
+        out[key] = el.value;
+      });
+      return out;
+    }
+
+    function normalizeSettingsForUi(raw) {
+      const effective = { ...runSettingsDefaults };
+      const corrections = [];
+      const invalidFields = [];
+
+      SETTINGS_KEYS.forEach((key) => {
+        const spec = runSettingsLimits[key] || {};
+        if (BOOLEAN_SETTING_KEYS.has(key)) {
+          effective[key] = Boolean(raw[key]);
+          return;
+        }
+        const num = Number(raw[key]);
+        if (!isFinite(num)) {
+          invalidFields.push(key);
+          return;
+        }
+        let clamped = num;
+        if (typeof spec.min === 'number') clamped = Math.max(spec.min, clamped);
+        if (typeof spec.max === 'number') clamped = Math.min(spec.max, clamped);
+        if (Math.abs(clamped - num) > 1e-9) corrections.push(`${key} clamped to bounds`);
+        const t = String(spec.type || '').toLowerCase();
+        effective[key] = (t === 'int') ? Math.trunc(clamped) : clamped;
+      });
+
+      let minStops = Number(effective.minStopsPerRoute);
+      let targetStops = Number(effective.targetStopsPerRoute);
+      let maxStops = Number(effective.maxStopsPerRoute);
+      if (minStops > targetStops) {
+        targetStops = minStops;
+        corrections.push('targetStopsPerRoute raised to minStopsPerRoute');
+      }
+      if (targetStops > maxStops) {
+        maxStops = targetStops;
+        corrections.push('maxStopsPerRoute raised to targetStopsPerRoute');
+      }
+      if (minStops > maxStops) {
+        maxStops = minStops;
+        targetStops = minStops;
+        corrections.push('maxStopsPerRoute and targetStopsPerRoute raised to minStopsPerRoute');
+      }
+      effective.minStopsPerRoute = Math.trunc(minStops);
+      effective.targetStopsPerRoute = Math.trunc(targetStops);
+      effective.maxStopsPerRoute = Math.trunc(maxStops);
+
+      if (Number(effective.preferredRouteDriveMinLocal) > Number(effective.preferredRouteDriveMinRemote)) {
+        effective.preferredRouteDriveMinRemote = Number(effective.preferredRouteDriveMinLocal);
+        corrections.push('preferredRouteDriveMinRemote raised to preferredRouteDriveMinLocal');
+      }
+      if (Number(effective.maxRouteDiameterMiLocal) > Number(effective.maxRouteDiameterMiRemote)) {
+        effective.maxRouteDiameterMiRemote = Number(effective.maxRouteDiameterMiLocal);
+        corrections.push('maxRouteDiameterMiRemote raised to maxRouteDiameterMiLocal');
+      }
+
+      return { effective, corrections, invalidFields };
+    }
+
+    function renderSettingsStatus(corrections, invalidFields) {
+      settingsStatusEl.classList.remove('bad');
+      if (invalidFields.length > 0) {
+        settingsStatusEl.classList.add('bad');
+        settingsStatusEl.textContent = `Invalid setting input: ${invalidFields.join(', ')}`;
+        return;
+      }
+      if (corrections.length > 0) {
+        settingsStatusEl.textContent = `Auto-adjusted: ${corrections.join(' • ')}`;
+        return;
+      }
+      settingsStatusEl.textContent = 'Settings valid.';
+    }
+
+    function reconcileSettingsFromInputs(opts = {}) {
+      const persist = opts.persist !== false;
+      const raw = collectRawSettingsFromInputs();
+      const normalized = normalizeSettingsForUi(raw);
+      applySettingsToInputs(normalized.effective);
+      currentRunSettings = { ...normalized.effective };
+      settingsValid = normalized.invalidFields.length === 0;
+      renderSettingsStatus(normalized.corrections, normalized.invalidFields);
+      setActiveSettingsSummary(formatRunSettingsSummary(currentRunSettings));
+      if (persist && settingsValid) persistSettings(currentRunSettings);
+      const status = (lastProgressPayload && lastProgressPayload.status) ? lastProgressPayload.status : 'idle';
+      syncControls(status);
+    }
+
+    async function fetchRunSettingsSchema() {
+      try {
+        const resp = await fetch('/run-settings', { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`run-settings endpoint returned ${resp.status}`);
+        const data = await resp.json();
+        if (data && typeof data.defaults === 'object') {
+          runSettingsDefaults = { ...runSettingsDefaults, ...data.defaults };
+        }
+        if (data && typeof data.limits === 'object') {
+          runSettingsLimits = { ...runSettingsLimits, ...data.limits };
+        }
+        if (data && typeof data.uiHints === 'object') {
+          runSettingsUiHints = { ...runSettingsUiHints, ...data.uiHints };
+        }
+      } catch (_) {
+        // fallback to static defaults/limits
+      }
+
+      applyInputBounds();
+
+      const saved = loadSavedSettings();
+      const seed = { ...runSettingsDefaults };
+      if (saved && typeof saved === 'object') {
+        SETTINGS_KEYS.forEach((key) => {
+          if (Object.prototype.hasOwnProperty.call(saved, key)) seed[key] = saved[key];
+        });
+      }
+      applySettingsToInputs(seed);
+      reconcileSettingsFromInputs({ persist: true });
+    }
+
+    async function fetchOsrmPreflight(opts = {}) {
+      const silent = Boolean(opts.silent);
+      if (!silent) setOsrmPill('checking');
+      try {
+        const resp = await fetch('/osrm-preflight', { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`OSRM preflight endpoint returned ${resp.status}`);
+        const data = await resp.json();
+
+        osrmReady = Boolean(data.ok);
+        osrmUrlEl.textContent = data.osrmBaseUrl || '—';
+        osrmMsgEl.textContent = data.message || (osrmReady ? 'OSRM reachable.' : 'OSRM unreachable.');
+        setOsrmPill(osrmReady ? 'ok' : 'bad');
+
+        const status = (lastProgressPayload && lastProgressPayload.status) ? lastProgressPayload.status : 'idle';
+        syncControls(status);
+
+        if (!osrmReady && status !== 'running') {
+          statusMsgEl.textContent = 'OSRM preflight failed — Generate Routes is disabled.';
+        }
+        return osrmReady;
+      } catch (_) {
+        osrmReady = false;
+        osrmMsgEl.textContent = 'Preflight check failed.';
+        osrmUrlEl.textContent = '—';
+        setOsrmPill('bad');
+        const status = (lastProgressPayload && lastProgressPayload.status) ? lastProgressPayload.status : 'idle';
+        syncControls(status);
+        if (status !== 'running') {
+          statusMsgEl.textContent = 'OSRM preflight failed — Generate Routes is disabled.';
+        }
+        return false;
+      }
+    }
+
+    async function fetchProgress() {
+      try {
+        const resp = await fetch(withRunId('/progress'), { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`Progress endpoint returned ${resp.status}`);
+        const data = await resp.json();
+        if (data && (data.resolvedRunId || data.runId)) {
+          setCurrentRunId(data.resolvedRunId || data.runId);
+        }
+
+        lastProgressPayload = data;
+
+        const status = data.status || 'unknown';
+        setPill(status);
+        setProgress((data.progress != null) ? data.progress : data.percent);
+
+        stageEl.textContent = data.stage || data.step || '—';
+        elapsedEl.textContent = fmtSeconds((data.elapsedSec != null) ? data.elapsedSec : data.elapsed);
+        etaEl.textContent = (data.etaSec != null || data.eta != null) ? fmtSeconds((data.etaSec != null) ? data.etaSec : data.eta) : '—';
+        statusMsgEl.textContent = data.message || (status === 'running' ? 'Working…' : '—');
+
+        if (data.runSettingsSummary) {
+          setActiveSettingsSummary(String(data.runSettingsSummary));
+        } else if (data.runSettings && typeof data.runSettings === 'object') {
+          setActiveSettingsSummary(formatRunSettingsSummary(data.runSettings));
+        } else {
+          setActiveSettingsSummary(formatRunSettingsSummary(currentRunSettings));
+        }
+
+        if (status === 'done') {
+          downloadsEl.style.display = 'flex';
+          updateDownloadLinks(currentRunId);
+          syncControls(status);
+          showError(null);
+          showRecoveryAction(false, '');
+          fetchRuns();
+          stopPolling();
+        } else if (status === 'error') {
+          downloadsEl.style.display = 'none';
+          syncControls(status);
+          showError(data.error || data.detail || 'Unknown error');
+          const canRecover = await shouldOfferMapRecovery(data);
+          showRecoveryAction(Boolean(canRecover), 'Map output is missing. Rebuild from existing CSV.');
+          fetchRuns();
+          stopPolling();
+        } else if (status === 'running') {
+          downloadsEl.style.display = 'none';
+          showError(null);
+          showRecoveryAction(false, '');
+          syncControls(status);
+        } else {
+          downloadsEl.style.display = 'none';
+          showError(null);
+          showRecoveryAction(false, '');
+          syncControls(status);
+        }
+      } catch (e) {
+        setPill('error');
+        statusMsgEl.textContent = 'Could not read progress. Is GET /progress implemented?';
+        showError(String(e));
+        syncControls('idle');
+        downloadsEl.style.display = 'none';
+        stopPolling();
+      }
+    }
+
+    function startPolling(runIdOverride = null) {
+      if (runIdOverride) setCurrentRunId(runIdOverride);
+      stopPolling();
+      fetchProgress();
+      pollTimer = setInterval(fetchProgress, 1000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    SETTINGS_KEYS.forEach((key) => {
+      const el = settingInputs[key];
+      if (!el) return;
+      const eventName = BOOLEAN_SETTING_KEYS.has(key) ? 'change' : 'input';
+      el.addEventListener(eventName, () => reconcileSettingsFromInputs({ persist: true }));
+      if (!BOOLEAN_SETTING_KEYS.has(key)) {
+        el.addEventListener('blur', () => reconcileSettingsFromInputs({ persist: true }));
+      }
+    });
+
+    toggleAdvancedBtn.addEventListener('click', () => {
+      const open = settingsAdvancedEl.classList.toggle('open');
+      toggleAdvancedBtn.textContent = open ? 'Hide Advanced' : 'Show Advanced';
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      if (!settingsValid) {
+        setPill('error');
+        statusMsgEl.textContent = 'Fix invalid run settings before generating routes.';
+        syncControls('idle');
+        return;
+      }
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        statusMsgEl.textContent = 'Choose a CSV file first.';
+        return;
+      }
+
+      const osrmOk = await fetchOsrmPreflight({ silent: true });
+      if (!osrmOk) {
+        setPill('error');
+        statusMsgEl.textContent = 'OSRM preflight failed. Fix OSRM and recheck.';
+        showError('OSRM is unreachable. Strict mode blocks route generation.');
+        syncControls('idle');
+        return;
+      }
+
+      downloadsEl.style.display = 'none';
+      showError(null);
+      setPill('running');
+      setProgress(0);
+      stageEl.textContent = 'uploading';
+      elapsedEl.textContent = '0s';
+      etaEl.textContent = '—';
+      statusMsgEl.textContent = 'Uploading…';
+      setActiveSettingsSummary(formatRunSettingsSummary(currentRunSettings));
+
+      uploadInFlight = true;
+      submitBtn.disabled = true;
+      fileInput.disabled = true;
+
+      const fd = new FormData();
+      fd.append('file', fileInput.files[0]);
+      fd.append('settings', JSON.stringify(currentRunSettings));
+
+      try {
+        const resp = await fetch('/upload', { method: 'POST', body: fd });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => null);
+          if (resp.status === 409 && data && data.activeRunId) {
+            setCurrentRunId(String(data.activeRunId));
+            statusMsgEl.textContent = `Run ${data.activeRunId} is in progress. Try again after completion.`;
+            showError(data.message || 'Another run is currently running.');
+            await fetchRuns();
+            throw new Error(data.message || `Upload blocked (${resp.status}).`);
+          }
+          const txt = data ? JSON.stringify(data) : await resp.text().catch(() => '');
+          throw new Error(`Upload failed (${resp.status}). ${txt}`);
+        }
+        const data = await resp.json().catch(() => ({}));
+        if (data && data.runId) setCurrentRunId(data.runId);
+        await fetchRuns();
+        uploadInFlight = false;
+        fileInput.disabled = false;
+        statusMsgEl.textContent = 'Generating routes…';
+        stageEl.textContent = 'running';
+        startPolling(currentRunId);
+      } catch (err) {
+        uploadInFlight = false;
+        setPill('error');
+        statusMsgEl.textContent = 'Upload failed.';
+        showError(String(err));
+        syncControls('idle');
+      }
+    });
+
+    resetBtn.addEventListener('click', async () => {
+      stopPolling();
+      downloadsEl.style.display = 'none';
+      showError(null);
+      setPill('idle');
+      setProgress(0);
+      stageEl.textContent = '—';
+      elapsedEl.textContent = '—';
+      etaEl.textContent = '—';
+      statusMsgEl.textContent = 'Idle — choose a CSV and click “Generate Routes”.';
+      setActiveSettingsSummary(formatRunSettingsSummary(currentRunSettings));
+      uploadInFlight = false;
+      setCurrentRunId(null);
+      syncControls('idle');
+
+      await resetServerProgress();
+      fetchProgress();
+      fetchOsrmPreflight({ silent: true });
+      fetchRuns();
+    });
+
+    checkOsrmBtn.addEventListener('click', () => {
+      fetchOsrmPreflight();
+    });
+
+    rebuildMapBtn.addEventListener('click', () => {
+      rebuildMapFromCsv();
+    });
+
+    refreshRunsBtn.addEventListener('click', () => {
+      fetchRuns();
+    });
+
+    frRefreshBtn.addEventListener('click', () => {
+      fetchFieldRoutesStatus();
+    });
+
+    frUploadEditedBtn.addEventListener('click', () => {
+      uploadFieldRoutesEditedCsv();
+    });
+
+    frDryRunBtn.addEventListener('click', () => {
+      startFieldRoutesPush('dry-run');
+    });
+
+    frApplyBtn.addEventListener('click', () => {
+      startFieldRoutesPush('apply');
+    });
+
+    if (frAdminPasswordInput) {
+      frAdminPasswordInput.addEventListener('input', () => {
+        applyFieldRoutesState(lastFieldRoutesState || {});
+      });
+    }
+
+    frRunIdSelect.addEventListener('change', () => {
+      const rid = selectedFieldRoutesRunId();
+      if (rid) setCurrentRunId(rid);
+    });
+
+    async function initPage() {
+      await fetchRunSettingsSchema();
+      await fetchOsrmPreflight();
+      await fetchRuns();
+      await fetchFieldRoutesConfig();
+      await fetchFieldRoutesStatus();
+      if (!osrmTimer) {
+        osrmTimer = setInterval(() => fetchOsrmPreflight({ silent: true }), 15000);
+      }
+      startPolling();
+    }
+
+    initPage();
+  </script>
+</body>
+</html>

@@ -35,6 +35,18 @@ next-env.d.ts
 .firebase/
 firebase-debug.log
 firestore-debug.log
+
+# Backend data (OSRM matrix cache, run outputs)
+backend/data/
+backend/__pycache__/
+backend/*.pyc
+backend/uploaded.csv
+backend/routing_plan.csv
+backend/routing_plan.edited.csv
+backend/route_preview.html
+backend/route_preview.edited.html
+backend/route_edits.audit.json
+backend/routing_progress.json
 ui-debug.log
 functions/lib/
 
