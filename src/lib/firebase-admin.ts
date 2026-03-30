@@ -6,16 +6,11 @@ import { getAuth } from 'firebase-admin/auth';
 let adminApp: App;
 
 function parseServiceAccount(raw: string) {
-  // Try plain JSON first, then base64-encoded JSON
-  try {
-    return JSON.parse(raw);
-  } catch {
-    try {
-      return JSON.parse(Buffer.from(raw, 'base64').toString('utf-8'));
-    } catch {
-      return null;
-    }
-  }
+  // Try plain JSON first, then base64url, then standard base64
+  try { return JSON.parse(raw); } catch { /* not plain JSON */ }
+  try { return JSON.parse(Buffer.from(raw, 'base64url').toString('utf-8')); } catch { /* not base64url */ }
+  try { return JSON.parse(Buffer.from(raw, 'base64').toString('utf-8')); } catch { /* not base64 */ }
+  return null;
 }
 
 function getAdminApp(): App {
