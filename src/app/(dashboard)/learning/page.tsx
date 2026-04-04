@@ -10,10 +10,10 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import { Badge } from "@/components/ui/badge";
+import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
 import { ModelMetrics } from "@/types";
 import { formatDate } from "@/lib/utils";
-import { Brain, Loader2, RefreshCw, TrendingUp, Database, Target, Eye } from "lucide-react";
+import { Brain, Loader2, RefreshCw, Target, Database, Eye } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 
 export default function LearningPage() {
@@ -22,7 +22,7 @@ export default function LearningPage() {
   const [loading, setLoading] = useState(true);
   const [retraining, setRetraining] = useState(false);
   const [shadowMode, setShadowMode] = useState(false);
-  const [retrainResult, setRetrainResult] = useState<string | null>(null);
+  const [retrainResult, setRetrainResult] = useState<{ success: boolean; message: string } | null>(null);
 
   useEffect(() => {
     if (!userProfile?.companyId) return;
@@ -74,13 +74,13 @@ export default function LearningPage() {
       });
       const data = await res.json();
       if (data.success) {
-        setRetrainResult(`✓ Model retrained. Accuracy: ${Math.round((data.accuracy || 0) * 100)}%. Learned from ${data.totalRoutesLearned} routes.`);
+        setRetrainResult({ success: true, message: `Model retrained. Accuracy: ${Math.round((data.accuracy || 0) * 100)}%. Learned from ${data.totalRoutesLearned} routes.` });
         await loadMetrics(userProfile.companyId);
       } else {
-        setRetrainResult(`⚠ ${data.message || data.error || "Retraining failed"}`);
+        setRetrainResult({ success: false, message: data.message || data.error || "Retraining failed" });
       }
     } catch {
-      setRetrainResult("⚠ Retrain request sent (Python Cloud Run service may need deployment)");
+      setRetrainResult({ success: false, message: "Retrain request sent (Python Cloud Run service may need deployment)" });
     } finally {
       setRetraining(false);
     }
@@ -94,28 +94,37 @@ export default function LearningPage() {
   return (
     <div className="flex flex-col h-full">
       <TopBar title="AI Learning" />
-      <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6 animate-fade-in">
+      <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6">
         {loading ? (
-          <div className="flex justify-center py-16"><Loader2 className="w-6 h-6 animate-spin text-blue-400" /></div>
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <SkeletonCard key={i} className={`animate-fade-in stagger-${i + 1}`} />
+              ))}
+            </div>
+            <SkeletonChart className="animate-fade-in stagger-5" />
+          </div>
         ) : metrics ? (
           <>
             {/* Key metrics */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               {[
-                { label: "Model Accuracy", value: `${Math.round(metrics.accuracy * 100)}%`, icon: Target, color: "text-emerald-400", progress: metrics.accuracy * 100 },
-                { label: "Routes Learned", value: metrics.totalRoutesLearned, icon: Database, color: "text-blue-400", progress: Math.min(metrics.totalRoutesLearned / 5, 100) },
-                { label: "Avg Confidence", value: `${Math.round(metrics.avgConfidence * 100)}%`, icon: Brain, color: "text-purple-400", progress: metrics.avgConfidence * 100 },
-                { label: "Last Trained", value: formatDate(metrics.lastTrainedAt), icon: RefreshCw, color: "text-orange-400" },
-              ].map(stat => (
-                <Card key={stat.label} className="border-border/50">
+                { label: "Model Accuracy", value: `${Math.round(metrics.accuracy * 100)}%`, icon: Target, color: "text-emerald-400", bg: "bg-emerald-500/10", progress: metrics.accuracy * 100 },
+                { label: "Routes Learned", value: metrics.totalRoutesLearned, icon: Database, color: "text-blue-400", bg: "bg-blue-500/10", progress: Math.min(metrics.totalRoutesLearned / 5, 100) },
+                { label: "Avg Confidence", value: `${Math.round(metrics.avgConfidence * 100)}%`, icon: Brain, color: "text-purple-400", bg: "bg-purple-500/10", progress: metrics.avgConfidence * 100 },
+                { label: "Last Trained", value: formatDate(metrics.lastTrainedAt), icon: RefreshCw, color: "text-orange-400", bg: "bg-orange-500/10" },
+              ].map((stat, i) => (
+                <Card key={stat.label} className={`border-border/40 animate-fade-in stagger-${i + 1}`}>
                   <CardContent className="p-4">
                     <div className="flex items-center justify-between mb-3">
-                      <p className="text-xs text-muted-foreground">{stat.label}</p>
-                      <stat.icon className={`w-4 h-4 ${stat.color}`} />
+                      <p className="text-xs text-muted-foreground/60 font-medium">{stat.label}</p>
+                      <div className={`p-1.5 rounded-md ${stat.bg}`}>
+                        <stat.icon className={`w-3.5 h-3.5 ${stat.color}`} />
+                      </div>
                     </div>
-                    <p className="text-2xl font-bold text-foreground">{stat.value}</p>
+                    <p className="text-2xl font-bold text-foreground tracking-tight">{stat.value}</p>
                     {stat.progress !== undefined && (
-                      <Progress value={stat.progress} className="mt-2 h-1.5" />
+                      <Progress value={stat.progress} className="mt-2.5 h-1" />
                     )}
                   </CardContent>
                 </Card>
@@ -123,23 +132,23 @@ export default function LearningPage() {
             </div>
 
             {/* Accuracy trend chart */}
-            <Card className="border-border/50">
-              <CardHeader>
-                <CardTitle className="text-base">Model Accuracy Over Time</CardTitle>
-                <CardDescription>How accuracy improves as the model learns from more routes</CardDescription>
+            <Card className="border-border/40 animate-fade-in stagger-5">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-semibold">Model Accuracy Over Time</CardTitle>
+                <CardDescription className="text-xs">How accuracy improves as the model learns from dispatcher feedback</CardDescription>
               </CardHeader>
               <CardContent>
                 <ResponsiveContainer width="100%" height={220}>
                   <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
                     <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
-                    <YAxis domain={[0, 100]} tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} unit="%" />
+                    <YAxis domain={[0, 100]} tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} unit="%" width={35} />
                     <Tooltip
-                      contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))" }}
+                      contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))", fontSize: "13px" }}
                       formatter={(val) => [`${val}%`, "Accuracy"]}
                     />
-                    <ReferenceLine y={85} stroke="#3b82f6" strokeDasharray="4 4" label={{ value: "Auto-approve threshold (85%)", fill: "#3b82f6", fontSize: 11 }} />
-                    <Line type="monotone" dataKey="accuracy" stroke="#10b981" strokeWidth={2.5} dot={{ fill: "#10b981", r: 4 }} activeDot={{ r: 6 }} />
+                    <ReferenceLine y={85} stroke="#3b82f6" strokeDasharray="4 4" label={{ value: "Auto-approve (85%)", fill: "#3b82f6", fontSize: 11 }} />
+                    <Line type="monotone" dataKey="accuracy" stroke="#10b981" strokeWidth={2.5} dot={{ fill: "#10b981", r: 4 }} activeDot={{ r: 6, strokeWidth: 2, stroke: "#10b981", fill: "hsl(var(--background))" }} />
                   </LineChart>
                 </ResponsiveContainer>
               </CardContent>
@@ -147,20 +156,20 @@ export default function LearningPage() {
 
             {/* Controls */}
             <div className="grid lg:grid-cols-2 gap-4">
-              <Card className="border-border/50">
-                <CardHeader>
-                  <CardTitle className="text-base">Retrain Model</CardTitle>
-                  <CardDescription>Process new route feedback and update the model weights</CardDescription>
+              <Card className="border-border/40 animate-fade-in stagger-5">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm font-semibold">Retrain Model</CardTitle>
+                  <CardDescription className="text-xs">Process new route feedback and update the model weights</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="bg-accent/30 rounded-lg p-3 text-sm space-y-1">
-                    <p className="text-muted-foreground">Training data: <span className="text-foreground font-medium">{metrics.totalRoutesLearned} routes</span></p>
-                    <p className="text-muted-foreground">Current accuracy: <span className="text-emerald-400 font-medium">{Math.round(metrics.accuracy * 100)}%</span></p>
-                    <p className="text-muted-foreground">Auto-approve threshold: <span className="text-blue-400 font-medium">85%</span></p>
+                  <div className="bg-accent/20 rounded-lg p-3 text-sm space-y-1.5">
+                    <p className="text-muted-foreground/60 text-xs">Training data: <span className="text-foreground font-medium">{metrics.totalRoutesLearned} routes</span></p>
+                    <p className="text-muted-foreground/60 text-xs">Current accuracy: <span className="text-emerald-400 font-medium">{Math.round(metrics.accuracy * 100)}%</span></p>
+                    <p className="text-muted-foreground/60 text-xs">Auto-approve threshold: <span className="text-blue-400 font-medium">85%</span></p>
                   </div>
                   {retrainResult && (
-                    <div className={`text-sm px-3 py-2 rounded-md border ${retrainResult.startsWith("✓") ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" : "bg-yellow-500/10 border-yellow-500/20 text-yellow-400"}`}>
-                      {retrainResult}
+                    <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in ${retrainResult.success ? "bg-emerald-500/8 border-emerald-500/15 text-emerald-400" : "bg-yellow-500/8 border-yellow-500/15 text-yellow-400"}`}>
+                      {retrainResult.message}
                     </div>
                   )}
                   <Button
@@ -174,29 +183,29 @@ export default function LearningPage() {
                 </CardContent>
               </Card>
 
-              <Card className="border-border/50">
-                <CardHeader>
-                  <CardTitle className="text-base">Shadow Mode</CardTitle>
-                  <CardDescription>Control how the AI interacts with your dispatch workflow</CardDescription>
+              <Card className="border-border/40 animate-fade-in stagger-6">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm font-semibold">Shadow Mode</CardTitle>
+                  <CardDescription className="text-xs">Control how the AI interacts with your dispatch workflow</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="flex items-center justify-between p-3 bg-accent/30 rounded-lg">
+                  <div className="flex items-center justify-between p-3 bg-accent/20 rounded-lg">
                     <div>
-                      <Label htmlFor="shadow-mode" className="font-medium cursor-pointer">Observe Only Mode</Label>
-                      <p className="text-xs text-muted-foreground mt-0.5">AI generates routes but never auto-approves</p>
+                      <Label htmlFor="shadow-mode" className="font-medium text-sm cursor-pointer">Observe Only Mode</Label>
+                      <p className="text-xs text-muted-foreground/50 mt-0.5">AI generates routes but never auto-approves</p>
                     </div>
                     <Switch id="shadow-mode" checked={shadowMode} onCheckedChange={setShadowMode} />
                   </div>
-                  <div className="space-y-2 text-sm">
-                    <div className="flex items-center gap-2">
-                      <div className={`w-2 h-2 rounded-full ${shadowMode ? "bg-yellow-400" : "bg-emerald-400"}`} />
-                      <span className="text-muted-foreground">
-                        {shadowMode ? "Shadow mode ON — all routes require manual approval" : "Auto mode ON — routes with ≥85% confidence are auto-approved"}
+                  <div className="space-y-2.5 text-sm">
+                    <div className="flex items-center gap-2.5">
+                      <div className={`w-2 h-2 rounded-full transition-colors ${shadowMode ? "bg-yellow-400" : "bg-emerald-400"}`} />
+                      <span className="text-muted-foreground/60 text-xs">
+                        {shadowMode ? "Shadow mode ON — all routes require manual approval" : "Auto mode ON — routes with 85%+ confidence are auto-approved"}
                       </span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <Eye className="w-4 h-4 text-muted-foreground" />
-                      <span className="text-muted-foreground text-xs">Switch to shadow mode when testing new service areas or technician assignments</span>
+                    <div className="flex items-start gap-2.5">
+                      <Eye className="w-4 h-4 text-muted-foreground/40 shrink-0 mt-0.5" />
+                      <span className="text-muted-foreground/50 text-xs leading-relaxed">Switch to shadow mode when testing new service areas or technician assignments</span>
                     </div>
                   </div>
                 </CardContent>

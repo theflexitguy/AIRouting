@@ -38,22 +38,29 @@ export function Sidebar() {
     <TooltipProvider delayDuration={0}>
       <aside
         className={cn(
-          "flex flex-col h-screen bg-[hsl(224,71%,3%)] border-r border-border transition-all duration-300 ease-in-out shrink-0",
+          "flex flex-col h-screen bg-[hsl(224,71%,3%)] border-r border-border/60 shrink-0 relative",
+          "transition-[width] duration-300 ease-[cubic-bezier(0.25,0.1,0.25,1)]",
           collapsed ? "w-16" : "w-60"
         )}
       >
         {/* Logo */}
-        <div className={cn("flex items-center h-16 px-4 border-b border-border", collapsed ? "justify-center" : "gap-2")}>
-          <div className="flex items-center justify-center w-8 h-8 bg-blue-500 rounded-lg shrink-0">
+        <div className={cn(
+          "flex items-center h-16 px-4 border-b border-border/60",
+          collapsed ? "justify-center" : "gap-3"
+        )}>
+          <div className="flex items-center justify-center w-8 h-8 bg-blue-500 rounded-lg shrink-0 shadow-lg shadow-blue-500/20">
             <Zap className="w-4 h-4 text-white" />
           </div>
-          {!collapsed && (
-            <span className="font-bold text-lg text-white tracking-tight">RouteIQ</span>
-          )}
+          <span className={cn(
+            "font-bold text-lg text-white tracking-tight transition-all duration-300",
+            collapsed ? "opacity-0 w-0 overflow-hidden" : "opacity-100"
+          )}>
+            RouteIQ
+          </span>
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto">
+        <nav className="flex-1 px-2 py-4 space-y-0.5 overflow-y-auto">
           {navItems.map((item) => {
             const Icon = item.icon;
             const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
@@ -62,22 +69,33 @@ export function Sidebar() {
                 key={item.href}
                 href={item.href}
                 className={cn(
-                  "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors min-h-[44px]",
+                  "group flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium min-h-[44px]",
+                  "transition-all duration-150",
                   isActive
-                    ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
-                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                    ? "bg-blue-500/10 text-blue-400"
+                    : "text-muted-foreground hover:bg-white/[0.04] hover:text-foreground",
                   collapsed && "justify-center px-0"
                 )}
               >
-                <Icon className={cn("shrink-0", collapsed ? "w-5 h-5" : "w-4 h-4")} />
-                {!collapsed && item.label}
+                <div className="relative shrink-0">
+                  <Icon className={cn("transition-transform duration-150", collapsed ? "w-5 h-5" : "w-[18px] h-[18px]")} />
+                  {isActive && (
+                    <div className="absolute -left-[19px] top-1/2 -translate-y-1/2 w-[3px] h-4 bg-blue-400 rounded-r-full" />
+                  )}
+                </div>
+                <span className={cn(
+                  "transition-all duration-300",
+                  collapsed ? "opacity-0 w-0 overflow-hidden" : "opacity-100"
+                )}>
+                  {item.label}
+                </span>
               </Link>
             );
             if (collapsed) {
               return (
                 <Tooltip key={item.href}>
                   <TooltipTrigger asChild>{linkEl}</TooltipTrigger>
-                  <TooltipContent side="right">{item.label}</TooltipContent>
+                  <TooltipContent side="right" className="font-medium">{item.label}</TooltipContent>
                 </Tooltip>
               );
             }
@@ -86,9 +104,9 @@ export function Sidebar() {
         </nav>
 
         {/* Bottom */}
-        <div className="p-2 border-t border-border space-y-1">
+        <div className="p-2 border-t border-border/60 space-y-1">
           {!collapsed && userProfile && (
-            <div className="px-3 py-2 text-xs text-muted-foreground truncate">
+            <div className="px-3 py-2 text-xs text-muted-foreground/70 truncate">
               {userProfile.email}
             </div>
           )}
@@ -97,11 +115,19 @@ export function Sidebar() {
               <Button
                 variant="ghost"
                 size={collapsed ? "icon" : "sm"}
-                className={cn("w-full text-muted-foreground hover:text-foreground", collapsed ? "" : "justify-start gap-3")}
+                className={cn(
+                  "w-full text-muted-foreground hover:text-foreground transition-colors",
+                  collapsed ? "" : "justify-start gap-3"
+                )}
                 onClick={signOut}
               >
                 <LogOut className="w-4 h-4 shrink-0" />
-                {!collapsed && "Sign out"}
+                <span className={cn(
+                  "transition-all duration-300",
+                  collapsed ? "opacity-0 w-0 overflow-hidden sr-only" : "opacity-100"
+                )}>
+                  Sign out
+                </span>
               </Button>
             </TooltipTrigger>
             {collapsed && <TooltipContent side="right">Sign out</TooltipContent>}
@@ -109,14 +135,16 @@ export function Sidebar() {
         </div>
 
         {/* Collapse toggle */}
-        <Button
-          variant="ghost"
-          size="icon"
-          className="absolute -right-3 top-20 w-6 h-6 rounded-full border border-border bg-background shadow-sm z-10"
+        <button
+          className={cn(
+            "absolute -right-3 top-20 w-6 h-6 rounded-full border border-border/60 bg-background",
+            "flex items-center justify-center shadow-sm z-10",
+            "hover:bg-accent hover:border-border transition-colors duration-150"
+          )}
           onClick={() => setCollapsed(!collapsed)}
         >
-          {collapsed ? <ChevronRight className="w-3 h-3" /> : <ChevronLeft className="w-3 h-3" />}
-        </Button>
+          {collapsed ? <ChevronRight className="w-3 h-3 text-muted-foreground" /> : <ChevronLeft className="w-3 h-3 text-muted-foreground" />}
+        </button>
       </aside>
     </TooltipProvider>
   );

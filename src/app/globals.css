@@ -22,7 +22,7 @@
     --secondary-foreground: 210 40% 98%;
     --destructive: 0 63% 31%;
     --destructive-foreground: 210 40% 98%;
-    --ring: 216 34% 17%;
+    --ring: 210 100% 52%;
     --radius: 0.5rem;
   }
 }
@@ -31,26 +31,51 @@
   * {
     @apply border-border;
   }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
   body {
     @apply bg-background text-foreground;
     font-feature-settings: "rlig" 1, "calt" 1;
   }
+
+  /* Brand-colored text selection */
+  ::selection {
+    background: hsl(210 100% 52% / 0.3);
+    color: hsl(var(--foreground));
+  }
+
+  /* Smooth focus transitions everywhere */
+  *:focus-visible {
+    @apply outline-none ring-2 ring-blue-500/40 ring-offset-2 ring-offset-background;
+    transition: box-shadow 0.15s ease;
+  }
 }
 
-/* Custom scrollbar */
+/* Custom scrollbar — thin, minimal, Apple-style */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: hsl(var(--background));
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: hsl(var(--border));
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: hsl(var(--muted-foreground));
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--border)) transparent;
 }
 
 /* Touch-friendly targets for iPad */
@@ -59,4 +84,24 @@
     min-height: 44px;
     min-width: 44px;
   }
+}
+
+/* Stagger animation delays for card grids */
+@layer utilities {
+  .stagger-1 { animation-delay: 0ms; }
+  .stagger-2 { animation-delay: 60ms; }
+  .stagger-3 { animation-delay: 120ms; }
+  .stagger-4 { animation-delay: 180ms; }
+  .stagger-5 { animation-delay: 240ms; }
+  .stagger-6 { animation-delay: 300ms; }
+
+  .animate-in {
+    animation: fade-in 0.4s ease-out both;
+  }
+}
+
+/* Print styles */
+@media print {
+  .no-print { display: none !important; }
+  body { background: white; color: black; }
 }

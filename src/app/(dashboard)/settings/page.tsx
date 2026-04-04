@@ -11,15 +11,20 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Technician } from "@/types";
 import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell } from "lucide-react";
 
+interface FeedbackMessage {
+  success: boolean;
+  message: string;
+}
+
 export default function SettingsPage() {
   const { userProfile } = useAuth();
   const [saving, setSaving] = useState(false);
-  const [saveResult, setSaveResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [saveResult, setSaveResult] = useState<FeedbackMessage | null>(null);
+  const [techFeedback, setTechFeedback] = useState<FeedbackMessage | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
   const [techs, setTechs] = useState<Technician[]>([]);
@@ -60,6 +65,7 @@ export default function SettingsPage() {
   async function saveApiCredentials() {
     if (!userProfile?.companyId) return;
     setSaving(true);
+    setSaveResult(null);
     try {
       const updateData: Record<string, unknown> = {};
       if (apiKey && !apiKey.startsWith("••")) updateData.fieldRoutesApiKey = apiKey;
@@ -70,13 +76,14 @@ export default function SettingsPage() {
       setSaveResult({ success: false, message: "Failed to save. Check Firestore connection." });
     } finally {
       setSaving(false);
-      setTimeout(() => setSaveResult(null), 3000);
+      setTimeout(() => setSaveResult(null), 4000);
     }
   }
 
   async function addTechnician() {
     if (!userProfile?.companyId || !newTech.name || !newTech.email) return;
     setAddingTech(true);
+    setTechFeedback(null);
     try {
       const techData: Omit<Technician, "id"> = {
         ...newTech,
@@ -86,22 +93,26 @@ export default function SettingsPage() {
       const ref = await addDoc(collection(db, `companies/${userProfile.companyId}/technicians`), techData);
       setTechs(prev => [...prev, { id: ref.id, ...techData }]);
       setNewTech({ name: "", email: "", maxStopsPerDay: 15 });
+      setTechFeedback({ success: true, message: `${newTech.name} added successfully` });
     } catch {
-      alert("Failed to add technician. Check Firestore connection.");
+      setTechFeedback({ success: false, message: "Failed to add technician. Check Firestore connection." });
     } finally {
       setAddingTech(false);
+      setTimeout(() => setTechFeedback(null), 3000);
     }
   }
 
-  async function deleteTechnician(techId: string) {
+  async function deleteTechnician(techId: string, techName: string) {
     if (!userProfile?.companyId) return;
-    if (!confirm("Remove this technician?")) return;
+    setTechFeedback(null);
     try {
       await deleteDoc(doc(db, `companies/${userProfile.companyId}/technicians`, techId));
       setTechs(prev => prev.filter(t => t.id !== techId));
+      setTechFeedback({ success: true, message: `${techName} removed` });
     } catch {
-      alert("Failed to remove technician.");
+      setTechFeedback({ success: false, message: "Failed to remove technician." });
     }
+    setTimeout(() => setTechFeedback(null), 3000);
   }
 
   async function toggleTechActive(tech: Technician) {
@@ -125,22 +136,22 @@ export default function SettingsPage() {
           </TabsList>
 
           <TabsContent value="api" className="space-y-4">
-            <Card className="border-border/50">
+            <Card className="border-border/40">
               <CardHeader>
-                <CardTitle className="text-base">FieldRoutes Integration</CardTitle>
-                <CardDescription>Connect your FieldRoutes account to sync jobs automatically</CardDescription>
+                <CardTitle className="text-sm font-semibold">FieldRoutes Integration</CardTitle>
+                <CardDescription className="text-xs">Connect your FieldRoutes account to sync jobs automatically</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
-                  <Label>API Key</Label>
-                  <Input value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Enter FieldRoutes API key" type="text" />
+                  <Label className="text-sm">API Key</Label>
+                  <Input value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Enter FieldRoutes API key" type="text" className="h-10" />
                 </div>
                 <div className="space-y-2">
-                  <Label>API Secret</Label>
-                  <Input value={apiSecret} onChange={e => setApiSecret(e.target.value)} placeholder="Enter FieldRoutes API secret" type="password" />
+                  <Label className="text-sm">API Secret</Label>
+                  <Input value={apiSecret} onChange={e => setApiSecret(e.target.value)} placeholder="Enter FieldRoutes API secret" type="password" className="h-10" />
                 </div>
                 {saveResult && (
-                  <div className={`text-sm px-3 py-2 rounded-md border ${saveResult.success ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" : "bg-red-500/10 border-red-500/20 text-red-400"}`}>
+                  <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in ${saveResult.success ? "bg-emerald-500/8 border-emerald-500/15 text-emerald-400" : "bg-red-500/8 border-red-500/15 text-red-400"}`}>
                     {saveResult.message}
                   </div>
                 )}
@@ -153,25 +164,30 @@ export default function SettingsPage() {
           </TabsContent>
 
           <TabsContent value="techs" className="space-y-4">
-            <Card className="border-border/50">
+            <Card className="border-border/40">
               <CardHeader>
-                <CardTitle className="text-base">Add Technician</CardTitle>
+                <CardTitle className="text-sm font-semibold">Add Technician</CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="grid sm:grid-cols-3 gap-3">
-                  <div className="space-y-1">
-                    <Label className="text-xs">Name</Label>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground/60">Name</Label>
                     <Input value={newTech.name} onChange={e => setNewTech(p => ({ ...p, name: e.target.value }))} placeholder="Full name" />
                   </div>
-                  <div className="space-y-1">
-                    <Label className="text-xs">Email</Label>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground/60">Email</Label>
                     <Input value={newTech.email} onChange={e => setNewTech(p => ({ ...p, email: e.target.value }))} placeholder="email@company.com" type="email" />
                   </div>
-                  <div className="space-y-1">
-                    <Label className="text-xs">Max Stops/Day</Label>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground/60">Max Stops/Day</Label>
                     <Input value={newTech.maxStopsPerDay} onChange={e => setNewTech(p => ({ ...p, maxStopsPerDay: parseInt(e.target.value) || 15 }))} type="number" min={1} max={50} />
                   </div>
                 </div>
+                {techFeedback && (
+                  <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in mt-3 ${techFeedback.success ? "bg-emerald-500/8 border-emerald-500/15 text-emerald-400" : "bg-red-500/8 border-red-500/15 text-red-400"}`}>
+                    {techFeedback.message}
+                  </div>
+                )}
                 <Button
                   onClick={addTechnician}
                   disabled={addingTech || !newTech.name || !newTech.email}
@@ -183,46 +199,57 @@ export default function SettingsPage() {
               </CardContent>
             </Card>
 
-            <Card className="border-border/50">
+            <Card className="border-border/40">
               <CardHeader>
-                <CardTitle className="text-base">Technicians ({techs.length})</CardTitle>
+                <CardTitle className="text-sm font-semibold">Technicians ({techs.length})</CardTitle>
               </CardHeader>
               <CardContent className="p-0">
-                <div className="divide-y divide-border/50">
+                <div className="divide-y divide-border/30">
                   {techs.map(tech => (
-                    <div key={tech.id} className="flex items-center gap-3 p-4">
-                      <div className="w-8 h-8 rounded-full bg-blue-500/20 flex items-center justify-center text-blue-400 text-xs font-bold shrink-0">
+                    <div key={tech.id} className="flex items-center gap-3 p-4 hover:bg-accent/15 transition-colors">
+                      <div className="w-8 h-8 rounded-full bg-blue-500/15 flex items-center justify-center text-blue-400 text-xs font-bold shrink-0">
                         {tech.name.split(" ").map(n => n[0]).join("").slice(0, 2)}
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="font-medium text-sm">{tech.name}</p>
-                        <p className="text-xs text-muted-foreground">{tech.email} · Max {tech.maxStopsPerDay} stops/day</p>
+                        <p className="text-xs text-muted-foreground/50">{tech.email} · Max {tech.maxStopsPerDay} stops/day</p>
                       </div>
                       <Switch checked={tech.active} onCheckedChange={() => toggleTechActive(tech)} />
-                      <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-red-400 h-8 w-8" onClick={() => deleteTechnician(tech.id)}>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="text-muted-foreground/30 hover:text-red-400 h-8 w-8 transition-colors"
+                        onClick={() => deleteTechnician(tech.id, tech.name)}
+                      >
                         <Trash2 className="w-4 h-4" />
                       </Button>
                     </div>
                   ))}
-                  {techs.length === 0 && <p className="text-center text-muted-foreground py-8 text-sm">No technicians yet. Add one above.</p>}
+                  {techs.length === 0 && (
+                    <div className="flex flex-col items-center text-center py-12">
+                      <Users className="w-8 h-8 text-muted-foreground/20 mb-3" />
+                      <p className="text-sm text-muted-foreground">No technicians yet</p>
+                      <p className="text-xs text-muted-foreground/50 mt-1">Add one above to start generating routes.</p>
+                    </div>
+                  )}
                 </div>
               </CardContent>
             </Card>
           </TabsContent>
 
           <TabsContent value="billing" className="space-y-4">
-            <Card className="border-border/50">
+            <Card className="border-border/40">
               <CardHeader>
-                <CardTitle className="text-base">Current Plan</CardTitle>
-                <CardDescription>Manage your RouteIQ subscription</CardDescription>
+                <CardTitle className="text-sm font-semibold">Current Plan</CardTitle>
+                <CardDescription className="text-xs">Manage your RouteIQ subscription</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="flex items-center justify-between p-3 bg-accent/30 rounded-lg">
+                <div className="flex items-center justify-between p-4 bg-accent/20 rounded-lg">
                   <div>
-                    <p className="font-medium">Pro Plan</p>
-                    <p className="text-sm text-muted-foreground">Unlimited routes · AI learning · Up to 10 technicians</p>
+                    <p className="font-semibold text-sm">Pro Plan</p>
+                    <p className="text-xs text-muted-foreground/60 mt-0.5">Unlimited routes · AI learning · Up to 10 technicians</p>
                   </div>
-                  <Badge variant="success">Active</Badge>
+                  <Badge variant="success" className="text-[11px]">Active</Badge>
                 </div>
                 <Button variant="outline" className="gap-2">
                   <ExternalLink className="w-4 h-4" />
@@ -233,20 +260,20 @@ export default function SettingsPage() {
           </TabsContent>
 
           <TabsContent value="notifications" className="space-y-4">
-            <Card className="border-border/50">
+            <Card className="border-border/40">
               <CardHeader>
-                <CardTitle className="text-base">Notification Preferences</CardTitle>
+                <CardTitle className="text-sm font-semibold">Notification Preferences</CardTitle>
               </CardHeader>
-              <CardContent className="space-y-4">
+              <CardContent className="space-y-3">
                 {[
-                  { label: "Email Notifications", desc: "Receive daily route summaries by email", value: emailNotifications, onChange: setEmailNotifications },
+                  { id: "email", label: "Email Notifications", desc: "Receive daily route summaries by email", value: emailNotifications, onChange: setEmailNotifications },
                 ].map(pref => (
-                  <div key={pref.label} className="flex items-center justify-between p-3 bg-accent/20 rounded-lg">
+                  <div key={pref.id} className="flex items-center justify-between p-3.5 bg-accent/15 rounded-lg">
                     <div>
-                      <Label className="font-medium">{pref.label}</Label>
-                      <p className="text-xs text-muted-foreground mt-0.5">{pref.desc}</p>
+                      <Label htmlFor={pref.id} className="font-medium text-sm cursor-pointer">{pref.label}</Label>
+                      <p className="text-xs text-muted-foreground/50 mt-0.5">{pref.desc}</p>
                     </div>
-                    <Switch checked={pref.value} onCheckedChange={pref.onChange} />
+                    <Switch id={pref.id} checked={pref.value} onCheckedChange={pref.onChange} />
                   </div>
                 ))}
               </CardContent>
