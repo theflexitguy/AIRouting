@@ -1,26 +1,23 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { collection, query, where, getDocs, orderBy, limit, Timestamp } from "firebase/firestore";
+import { collection, query, where, getDocs, orderBy, limit } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { SkeletonCard, SkeletonChart, SkeletonRow } from "@/components/ui/skeleton";
 import { formatTime, getConfidenceColor, getConfidenceLabel } from "@/lib/utils";
 import {
   Route,
   Briefcase,
   Clock,
-  TrendingUp,
   Brain,
   CheckCircle2,
-  AlertCircle,
   RefreshCw,
 } from "lucide-react";
 import {
-  LineChart,
-  Line,
   BarChart,
   Bar,
   XAxis,
@@ -31,7 +28,7 @@ import {
   Area,
   AreaChart,
 } from "recharts";
-import { format, addDays, startOfDay } from "date-fns";
+import { format, addDays } from "date-fns";
 
 interface DashboardStats {
   todayRoutes: number;
@@ -77,7 +74,6 @@ export default function DashboardPage() {
     try {
       const today = format(new Date(), "yyyy-MM-dd");
 
-      // Today's routes
       const routesQuery = query(
         collection(db, `companies/${companyId}/routes`),
         where("date", "==", today)
@@ -91,7 +87,6 @@ export default function DashboardPage() {
         ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
         : 0;
 
-      // Jobs due in next 7 days
       const jobsDueThisWeek = [];
       for (let i = 0; i < 7; i++) {
         const d = format(addDays(new Date(), i), "yyyy-MM-dd");
@@ -104,7 +99,6 @@ export default function DashboardPage() {
         jobsDueThisWeek.push({ date: format(addDays(new Date(), i), "EEE"), count: jsnap.size });
       }
 
-      // Recent routes for confidence trend
       const recentRoutesQuery = query(
         collection(db, `companies/${companyId}/routes`),
         orderBy("createdAt", "desc"),
@@ -116,7 +110,6 @@ export default function DashboardPage() {
         confidence: Math.round((d.data().confidence || 0) * 100),
       })).reverse();
 
-      // Recent activity (mock + real)
       const activity: DashboardStats["recentActivity"] = todayRoutes.slice(0, 5).map((r, i) => ({
         id: `route-${i}`,
         type: r.generatedBy === "ai" ? "route_generated" : "route_modified",
@@ -138,7 +131,6 @@ export default function DashboardPage() {
       });
     } catch (error) {
       console.error("Dashboard data error:", error);
-      // Provide demo data when Firestore is unavailable
       setStats({
         todayRoutes: 4,
         totalStops: 47,
@@ -174,65 +166,71 @@ export default function DashboardPage() {
     }
   }
 
-  const StatCard = ({ title, value, subtitle, icon: Icon, color = "text-blue-400" }: {
-    title: string; value: string | number; subtitle: string; icon: React.ElementType; color?: string;
-  }) => (
-    <Card className="border-border/50">
-      <CardContent className="p-6">
-        <div className="flex items-start justify-between">
-          <div>
-            <p className="text-sm text-muted-foreground">{title}</p>
-            <p className="text-3xl font-bold text-foreground mt-1">{value}</p>
-            <p className="text-xs text-muted-foreground mt-1">{subtitle}</p>
-          </div>
-          <div className={`p-2 rounded-lg bg-accent ${color}`}>
-            <Icon className="w-5 h-5" />
-          </div>
-        </div>
-      </CardContent>
-    </Card>
-  );
+  const statCards = stats ? [
+    { title: "Today's Routes", value: stats.todayRoutes, subtitle: "Active routes", icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
+    { title: "Total Stops", value: stats.totalStops, subtitle: "Across all techs", icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
+    { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: "Total estimated", icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
+    { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },
+  ] : [];
 
   return (
     <div className="flex flex-col h-full">
       <TopBar title="Dashboard" />
-      <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6 animate-fade-in">
+      <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6">
         {loading ? (
-          <div className="flex items-center justify-center h-64">
-            <div className="w-8 h-8 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
+          /* Skeleton loading state — matches real layout exactly */
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <SkeletonCard key={i} className={`animate-fade-in stagger-${i + 1}`} />
+              ))}
+            </div>
+            <div className="grid lg:grid-cols-2 gap-4">
+              <SkeletonChart className="animate-fade-in stagger-5" />
+              <SkeletonChart className="animate-fade-in stagger-6" />
+            </div>
           </div>
         ) : stats ? (
           <>
             {/* Stat cards */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <StatCard title="Today's Routes" value={stats.todayRoutes} subtitle="Active routes" icon={Route} color="text-blue-400" />
-              <StatCard title="Total Stops" value={stats.totalStops} subtitle="Across all techs" icon={Briefcase} color="text-purple-400" />
-              <StatCard title="Drive Time" value={formatTime(stats.estimatedDriveTime)} subtitle="Total estimated" icon={Clock} color="text-orange-400" />
-              <StatCard
-                title="AI Confidence"
-                value={`${Math.round(stats.avgConfidence * 100)}%`}
-                subtitle={getConfidenceLabel(stats.avgConfidence) + " confidence"}
-                icon={Brain}
-                color={getConfidenceColor(stats.avgConfidence)}
-              />
+              {statCards.map((stat, i) => {
+                const Icon = stat.icon;
+                return (
+                  <Card key={stat.title} className={`border-border/40 animate-fade-in stagger-${i + 1}`}>
+                    <CardContent className="p-5">
+                      <div className="flex items-start justify-between">
+                        <div className="space-y-1">
+                          <p className="text-[13px] text-muted-foreground font-medium">{stat.title}</p>
+                          <p className="text-2xl font-bold text-foreground tracking-tight">{stat.value}</p>
+                          <p className="text-xs text-muted-foreground/70">{stat.subtitle}</p>
+                        </div>
+                        <div className={`p-2 rounded-lg ${stat.bgColor} ${stat.color}`}>
+                          <Icon className="w-4 h-4" />
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
             </div>
 
             {/* Charts row */}
             <div className="grid lg:grid-cols-2 gap-4">
-              <Card className="border-border/50">
+              <Card className="border-border/40 animate-fade-in stagger-5">
                 <CardHeader className="pb-2">
-                  <CardTitle className="text-base">Jobs Due This Week</CardTitle>
-                  <CardDescription>Scheduled jobs per day</CardDescription>
+                  <CardTitle className="text-sm font-semibold">Jobs Due This Week</CardTitle>
+                  <CardDescription className="text-xs">Scheduled jobs per day</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <ResponsiveContainer width="100%" height={200}>
-                    <BarChart data={stats.jobsDueThisWeek} barSize={24}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                    <BarChart data={stats.jobsDueThisWeek} barSize={20}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
                       <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
-                      <YAxis tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} width={30} />
                       <Tooltip
-                        contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))" }}
-                        cursor={{ fill: "hsl(var(--accent))" }}
+                        contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))", fontSize: "13px" }}
+                        cursor={{ fill: "hsl(var(--accent) / 0.3)" }}
                       />
                       <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} />
                     </BarChart>
@@ -240,28 +238,28 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
 
-              <Card className="border-border/50">
+              <Card className="border-border/40 animate-fade-in stagger-6">
                 <CardHeader className="pb-2">
-                  <CardTitle className="text-base">AI Confidence Trend</CardTitle>
-                  <CardDescription>Route confidence over time</CardDescription>
+                  <CardTitle className="text-sm font-semibold">AI Confidence Trend</CardTitle>
+                  <CardDescription className="text-xs">Route confidence over time</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <ResponsiveContainer width="100%" height={200}>
                     <AreaChart data={stats.confidenceTrend}>
                       <defs>
                         <linearGradient id="confidenceGrad" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
+                          <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.25} />
                           <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
                         </linearGradient>
                       </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
                       <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
-                      <YAxis domain={[0, 100]} tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
+                      <YAxis domain={[0, 100]} tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} width={35} unit="%" />
                       <Tooltip
-                        contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))" }}
+                        contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))", fontSize: "13px" }}
                         formatter={(val) => [`${val}%`, "Confidence"]}
                       />
-                      <Area type="monotone" dataKey="confidence" stroke="#3b82f6" strokeWidth={2} fill="url(#confidenceGrad)" dot={{ fill: "#3b82f6", strokeWidth: 0, r: 3 }} />
+                      <Area type="monotone" dataKey="confidence" stroke="#3b82f6" strokeWidth={2} fill="url(#confidenceGrad)" dot={{ fill: "#3b82f6", strokeWidth: 0, r: 3 }} activeDot={{ r: 5, strokeWidth: 2, stroke: "#3b82f6", fill: "hsl(var(--background))" }} />
                     </AreaChart>
                   </ResponsiveContainer>
                 </CardContent>
@@ -269,33 +267,39 @@ export default function DashboardPage() {
             </div>
 
             {/* Activity feed */}
-            <Card className="border-border/50">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-base">Recent Activity</CardTitle>
-                <CardDescription>Latest routing events</CardDescription>
+            <Card className="border-border/40 animate-fade-in stagger-5">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-sm font-semibold">Recent Activity</CardTitle>
+                <CardDescription className="text-xs">Latest routing events</CardDescription>
               </CardHeader>
               <CardContent>
                 {stats.recentActivity.length === 0 ? (
-                  <p className="text-muted-foreground text-sm text-center py-8">No recent activity. Generate your first routes to get started.</p>
+                  <div className="text-center py-10">
+                    <Route className="w-8 h-8 text-muted-foreground/30 mx-auto mb-3" />
+                    <p className="text-muted-foreground text-sm">No recent activity</p>
+                    <p className="text-muted-foreground/60 text-xs mt-1">Generate your first routes to get started.</p>
+                  </div>
                 ) : (
-                  <div className="space-y-3">
-                    {stats.recentActivity.map((item) => {
+                  <div className="space-y-1">
+                    {stats.recentActivity.map((item, i) => {
                       const Icon = activityIcons[item.type];
                       const color = activityColors[item.type];
                       return (
-                        <div key={item.id} className="flex items-start gap-3 py-2 border-b border-border/50 last:border-0">
-                          <div className={`mt-0.5 shrink-0 ${color}`}>
+                        <div key={item.id} className={`flex items-center gap-3 py-2.5 px-2 -mx-2 rounded-lg hover:bg-accent/30 transition-colors animate-fade-in stagger-${i + 1}`}>
+                          <div className={`shrink-0 ${color}`}>
                             <Icon className="w-4 h-4" />
                           </div>
                           <div className="flex-1 min-w-0">
                             <p className="text-sm text-foreground">{item.message}</p>
-                            <p className="text-xs text-muted-foreground mt-0.5">{item.time}</p>
                           </div>
-                          {item.confidence !== undefined && (
-                            <Badge variant={item.confidence >= 0.85 ? "success" : item.confidence >= 0.6 ? "warning" : "destructive"}>
-                              {Math.round(item.confidence * 100)}%
-                            </Badge>
-                          )}
+                          <div className="flex items-center gap-2 shrink-0">
+                            {item.confidence !== undefined && (
+                              <Badge variant={item.confidence >= 0.85 ? "success" : item.confidence >= 0.6 ? "warning" : "destructive"} className="text-[11px]">
+                                {Math.round(item.confidence * 100)}%
+                              </Badge>
+                            )}
+                            <span className="text-xs text-muted-foreground/60 whitespace-nowrap">{item.time}</span>
+                          </div>
                         </div>
                       );
                     })}

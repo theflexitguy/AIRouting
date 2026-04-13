@@ -1,11 +1,16 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { AuthProvider } from "@/contexts/AuthContext";
 
 export const metadata: Metadata = {
   title: "RouteIQ — AI-Powered Routing",
-  description: "Autonomous field service routing powered by AI",
-  viewport: "width=device-width, initial-scale=1, maximum-scale=1",
+  description: "Autonomous field service routing powered by AI. Optimize routes, reduce drive time, and learn from every dispatch.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
 };
 
 export default function RootLayout({

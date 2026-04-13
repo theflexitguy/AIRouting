@@ -1,21 +1,18 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { collection, getDocs, query, where, onSnapshot } from "firebase/firestore";
+import { collection, getDocs, query, where } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Route, Job, Technician } from "@/types";
 import { formatTime, getConfidenceColor, cn } from "@/lib/utils";
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
-  MapPin, Clock, ChevronDown, ChevronUp, Printer, AlertTriangle
+  Clock, ChevronDown, ChevronUp, Printer, AlertTriangle, MapPin
 } from "lucide-react";
 import { format } from "date-fns";
 import {
@@ -54,24 +51,25 @@ function SortableStop({ job, index, color }: { job: Job; index: number; color: s
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 }}
       className={cn(
-        "flex items-center gap-2 p-3 rounded-lg bg-accent/30 border border-border/50 mb-2 cursor-default touch-manipulation",
-        isDragging && "shadow-lg border-blue-500/50"
+        "flex items-center gap-2.5 p-3 rounded-lg bg-accent/20 border border-border/40 mb-1.5 cursor-default touch-manipulation",
+        "transition-shadow duration-150",
+        isDragging && "shadow-lg shadow-blue-500/10 border-blue-500/30"
       )}
     >
-      <div {...attributes} {...listeners} className="text-muted-foreground hover:text-foreground cursor-grab active:cursor-grabbing touch-none">
+      <div {...attributes} {...listeners} className="text-muted-foreground/40 hover:text-muted-foreground cursor-grab active:cursor-grabbing touch-none transition-colors">
         <GripVertical className="w-4 h-4" />
       </div>
       <div
-        className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold text-white shrink-0"
+        className="w-5 h-5 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
         style={{ background: color }}
       >
         {index + 1}
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium text-foreground truncate">{job.customerName}</p>
-        <p className="text-xs text-muted-foreground truncate">{job.address}</p>
+        <p className="text-xs text-muted-foreground/60 truncate">{job.address}</p>
       </div>
-      <div className="text-xs text-muted-foreground shrink-0 flex items-center gap-1">
+      <div className="text-xs text-muted-foreground/50 shrink-0 flex items-center gap-1">
         <Clock className="w-3 h-3" />
         {job.duration}m
       </div>
@@ -109,7 +107,6 @@ export default function RoutesPage() {
   }, [userProfile, selectedDate]);
 
   useEffect(() => {
-    // Load Google Maps
     const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
     if (!key || key === "your-google-maps-api-key") {
       setMapError(true);
@@ -134,7 +131,7 @@ export default function RoutesPage() {
     if (!mapEl || !window.google) return;
 
     const map = new window.google.maps.Map(mapEl, {
-      center: { lat: 30.2672, lng: -97.7431 }, // Austin TX default
+      center: { lat: 30.2672, lng: -97.7431 },
       zoom: 11,
       mapTypeId: "roadmap",
       styles: [
@@ -150,7 +147,7 @@ export default function RoutesPage() {
     const bounds = new window.google.maps.LatLngBounds();
     let hasCoords = false;
 
-    techRoutes.forEach((tr, tidx) => {
+    techRoutes.forEach((tr) => {
       const color = tr.color;
       const path: google.maps.LatLng[] = [];
 
@@ -161,7 +158,6 @@ export default function RoutesPage() {
         bounds.extend(pos);
         hasCoords = true;
 
-        // Numbered marker
         const marker = new window.google.maps.Marker({
           position: pos,
           map,
@@ -183,7 +179,6 @@ export default function RoutesPage() {
         marker.addListener("click", () => infoWindow.open(map, marker));
       });
 
-      // Draw polyline
       if (path.length > 1) {
         new window.google.maps.Polyline({
           path,
@@ -225,9 +220,7 @@ export default function RoutesPage() {
       const jobMap: { [id: string]: Job } = {};
       snap.docs.forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
       setAllJobs(jobMap);
-    } catch {
-      // Use demo jobs embedded in routes
-    }
+    } catch { }
   }
 
   async function loadRoutesForDate(companyId: string, date: string) {
@@ -289,7 +282,6 @@ export default function RoutesPage() {
     };
     setTechRoutes(updatedRoutes);
 
-    // Record feedback
     if (userProfile?.companyId) {
       try {
         await fetch("/api/record-feedback", {
@@ -310,7 +302,6 @@ export default function RoutesPage() {
   const handleApprove = async (techIndex: number, approved: boolean) => {
     const tr = techRoutes[techIndex];
     setApproving(tr.route.id);
-    // In production, update Firestore directly
     const updatedRoutes = [...techRoutes];
     updatedRoutes[techIndex] = { ...tr, route: { ...tr.route, approved } };
     setTechRoutes(updatedRoutes);
@@ -334,14 +325,14 @@ export default function RoutesPage() {
       <TopBar title="Route Builder" />
       <div className="flex-1 overflow-hidden flex flex-col">
         {/* Controls bar */}
-        <div className="p-4 border-b border-border flex flex-wrap gap-3 items-center bg-background/95">
+        <div className="p-3 lg:p-4 border-b border-border/60 flex flex-wrap gap-2.5 items-center bg-background/95 backdrop-blur-sm no-print">
           <input
             type="date"
             value={selectedDate}
             onChange={e => setSelectedDate(e.target.value)}
-            className="h-10 px-3 rounded-md border border-input bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            className="h-9 px-3 rounded-md border border-input bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/50 transition-colors"
           />
-          <div className="flex gap-1 flex-wrap">
+          <div className="flex gap-1.5 flex-wrap">
             {techs.map(tech => (
               <button
                 key={tech.id}
@@ -349,71 +340,75 @@ export default function RoutesPage() {
                   prev.includes(tech.id) ? prev.filter(id => id !== tech.id) : [...prev, tech.id]
                 )}
                 className={cn(
-                  "px-3 py-1.5 rounded-full text-xs font-medium border transition-colors min-h-[36px]",
+                  "px-3 py-1.5 rounded-full text-xs font-medium border min-h-[32px]",
+                  "transition-all duration-150",
                   selectedTechIds.includes(tech.id)
-                    ? "bg-blue-500/20 border-blue-500/40 text-blue-400"
-                    : "border-border text-muted-foreground hover:bg-accent"
+                    ? "bg-blue-500/15 border-blue-500/30 text-blue-400"
+                    : "border-border/60 text-muted-foreground/60 hover:bg-accent/50 hover:text-muted-foreground"
                 )}
               >
                 {tech.name}
               </button>
             ))}
           </div>
-          <Button
-            onClick={generateRoutes}
-            disabled={generating || selectedTechIds.length === 0}
-            className="bg-blue-500 hover:bg-blue-600 text-white ml-auto"
-          >
-            {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
-            Generate Routes
-          </Button>
-          {techRoutes.length > 0 && (
-            <Button variant="outline" size="sm" onClick={handlePrint}>
-              <Printer className="w-4 h-4" />
-              Export
+          <div className="flex items-center gap-2 ml-auto">
+            <Button
+              onClick={generateRoutes}
+              disabled={generating || selectedTechIds.length === 0}
+              className="bg-blue-500 hover:bg-blue-600 text-white h-9 text-sm"
+            >
+              {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+              Generate Routes
             </Button>
-          )}
+            {techRoutes.length > 0 && (
+              <Button variant="outline" size="sm" onClick={handlePrint} className="h-9">
+                <Printer className="w-4 h-4" />
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Main content: sidebar + map */}
         <div className="flex-1 overflow-hidden flex">
           {/* Left panel - stop lists */}
-          <div className="w-80 shrink-0 border-r border-border overflow-y-auto bg-background">
+          <div className="w-80 shrink-0 border-r border-border/60 overflow-y-auto bg-background">
             {techRoutes.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-full text-center p-6">
-                <Wand2 className="w-10 h-10 text-muted-foreground mb-3" />
-                <p className="text-muted-foreground text-sm">No routes for {selectedDate}.</p>
-                <p className="text-xs text-muted-foreground mt-1">Select techs and click Generate Routes.</p>
+              <div className="flex flex-col items-center justify-center h-full text-center p-8">
+                <div className="w-12 h-12 rounded-xl bg-accent/50 flex items-center justify-center mb-4">
+                  <MapPin className="w-5 h-5 text-muted-foreground/40" />
+                </div>
+                <p className="text-sm font-medium text-muted-foreground">No routes for this date</p>
+                <p className="text-xs text-muted-foreground/50 mt-1.5 max-w-[200px]">Select technicians and click Generate Routes to get started.</p>
               </div>
             ) : (
-              <div className="p-3 space-y-3">
+              <div className="p-3 space-y-2.5">
                 {techRoutes.map((tr, tidx) => {
                   const jobs = getJobsForRoute(tr);
                   return (
-                    <Card key={tr.route.id} className="border-border/50">
+                    <Card key={tr.route.id} className={`border-border/40 animate-fade-in stagger-${tidx + 1}`}>
                       <CardHeader className="p-3 pb-2">
                         <div className="flex items-center gap-2">
-                          <div className="w-3 h-3 rounded-full shrink-0" style={{ background: tr.color }} />
+                          <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: tr.color }} />
                           <span className="font-medium text-sm flex-1 truncate">{tr.tech.name}</span>
-                          <Badge variant={tr.route.approved ? "success" : "warning"} className="text-xs">
+                          <Badge variant={tr.route.approved ? "success" : "warning"} className="text-[11px]">
                             {tr.route.approved ? "Approved" : "Pending"}
                           </Badge>
-                          <button onClick={() => toggleTech(tidx)}>
-                            {tr.expanded ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
+                          <button onClick={() => toggleTech(tidx)} className="hover:bg-accent/50 rounded p-0.5 transition-colors">
+                            {tr.expanded ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
                           </button>
                         </div>
-                        <div className="flex items-center gap-3 text-xs text-muted-foreground mt-1">
+                        <div className="flex items-center gap-3 text-xs text-muted-foreground/60 mt-1.5">
                           <span>{tr.route.totalStops} stops</span>
                           <span>{formatTime(tr.route.totalDriveTimeMinutes)}</span>
                           <span className={getConfidenceColor(tr.route.confidence)}>
-                            {Math.round(tr.route.confidence * 100)}% confidence
+                            {Math.round(tr.route.confidence * 100)}%
                           </span>
                         </div>
                         {!tr.route.approved && (
-                          <div className="flex gap-2 mt-2">
+                          <div className="flex gap-1.5 mt-2">
                             <Button
                               size="sm"
-                              className="flex-1 h-8 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20"
+                              className="flex-1 h-7 text-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20"
                               onClick={() => handleApprove(tidx, true)}
                               disabled={approving === tr.route.id}
                             >
@@ -422,7 +417,7 @@ export default function RoutesPage() {
                             <Button
                               size="sm"
                               variant="outline"
-                              className="flex-1 h-8 text-red-400 border-red-500/20 hover:bg-red-500/10"
+                              className="flex-1 h-7 text-xs text-red-400 border-red-500/20 hover:bg-red-500/10"
                               onClick={() => handleApprove(tidx, false)}
                               disabled={approving === tr.route.id}
                             >
@@ -442,7 +437,7 @@ export default function RoutesPage() {
                               {jobs.length > 0 ? jobs.map((job, idx) => (
                                 <SortableStop key={job.id} job={job} index={idx} color={tr.color} />
                               )) : (
-                                <p className="text-xs text-muted-foreground text-center py-4">
+                                <p className="text-xs text-muted-foreground/50 text-center py-4">
                                   {tr.route.stopSequence.length} stops (load jobs to view details)
                                 </p>
                               )}
@@ -458,21 +453,23 @@ export default function RoutesPage() {
           </div>
 
           {/* Map */}
-          <div className="flex-1 relative bg-accent/10">
+          <div className="flex-1 relative bg-accent/5">
             {mapError ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-6">
-                <AlertTriangle className="w-10 h-10 text-yellow-400 mb-3" />
-                <p className="font-medium">Google Maps not configured</p>
-                <p className="text-sm text-muted-foreground mt-1">
-                  Add your <code className="bg-accent px-1 rounded">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</code> to .env.local
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-8">
+                <div className="w-12 h-12 rounded-xl bg-yellow-500/10 flex items-center justify-center mb-4">
+                  <AlertTriangle className="w-5 h-5 text-yellow-400" />
+                </div>
+                <p className="font-medium text-sm">Google Maps not configured</p>
+                <p className="text-sm text-muted-foreground/60 mt-1.5 max-w-xs">
+                  Add your <code className="bg-accent/50 px-1.5 py-0.5 rounded text-xs">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</code> to .env.local
                 </p>
                 {techRoutes.length > 0 && (
-                  <div className="mt-4 text-left w-full max-w-sm">
-                    <p className="text-xs text-muted-foreground mb-2">Stop summary:</p>
+                  <div className="mt-6 text-left w-full max-w-sm space-y-1.5">
+                    <p className="text-xs text-muted-foreground/50 mb-2 font-medium">Route summary</p>
                     {techRoutes.map(tr => (
-                      <div key={tr.route.id} className="flex items-center gap-2 text-sm mb-1">
-                        <div className="w-2.5 h-2.5 rounded-full" style={{ background: tr.color }} />
-                        <span>{tr.tech.name}: {tr.route.totalStops} stops · {formatTime(tr.route.totalDriveTimeMinutes)}</span>
+                      <div key={tr.route.id} className="flex items-center gap-2.5 text-sm">
+                        <div className="w-2 h-2 rounded-full" style={{ background: tr.color }} />
+                        <span className="text-muted-foreground">{tr.tech.name}: {tr.route.totalStops} stops · {formatTime(tr.route.totalDriveTimeMinutes)}</span>
                       </div>
                     ))}
                   </div>
