@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import { Sidebar } from "@/components/layout/Sidebar";
+import { SidebarContext } from "@/contexts/SidebarContext";
+import { CommandPalette } from "@/components/CommandPalette";
 import { Zap } from "lucide-react";
 
 const isDemoMode = !process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ||
@@ -79,8 +81,13 @@ export default function DashboardLayout({
 
         {/* Main content */}
         <main className="flex-1 overflow-y-auto">
-          {children}
+          <SidebarContext.Provider value={{ toggleMobileSidebar: () => setMobileSidebarOpen(prev => !prev) }}>
+            <div className="animate-fade-in">
+              {children}
+            </div>
+          </SidebarContext.Provider>
         </main>
+        <CommandPalette />
       </div>
     </div>
   );

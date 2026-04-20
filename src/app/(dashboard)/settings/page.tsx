@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Technician } from "@/types";
 import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell } from "lucide-react";
+import { toast } from "sonner";
 
 interface FeedbackMessage {
   success: boolean;
@@ -27,16 +28,17 @@ export default function SettingsPage() {
   const [techFeedback, setTechFeedback] = useState<FeedbackMessage | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [techs, setTechs] = useState<Technician[]>([]);
-  const [newTech, setNewTech] = useState({ name: "", email: "", maxStopsPerDay: 15 });
+  const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
   const [addingTech, setAddingTech] = useState(false);
   const [emailNotifications, setEmailNotifications] = useState(true);
 
   useEffect(() => {
-    if (!userProfile?.companyId) return;
+    if (!userProfile?.companyId || settingsLoaded) return;
     loadSettings(userProfile.companyId);
     loadTechs(userProfile.companyId);
-  }, [userProfile]);
+  }, [userProfile, settingsLoaded]);
 
   async function loadSettings(companyId: string) {
     try {
@@ -46,6 +48,7 @@ export default function SettingsPage() {
         setApiKey(data.fieldRoutesApiKey ? "••••••••" + data.fieldRoutesApiKey.slice(-4) : "");
         setApiSecret(data.fieldRoutesApiSecret ? "••••" : "");
       }
+      setSettingsLoaded(true);
     } catch { }
   }
 
@@ -55,9 +58,9 @@ export default function SettingsPage() {
       setTechs(snap.docs.map(d => ({ id: d.id, ...d.data() } as Technician)));
     } catch {
       setTechs([
-        { id: "t1", companyId: "demo", name: "Marcus Johnson", email: "marcus@company.com", active: true, maxStopsPerDay: 15 },
-        { id: "t2", companyId: "demo", name: "Sarah Chen", email: "sarah@company.com", active: true, maxStopsPerDay: 12 },
-        { id: "t3", companyId: "demo", name: "David Torres", email: "david@company.com", active: true, maxStopsPerDay: 18 },
+        { id: "t1", companyId: "demo", name: "Marcus Johnson", employeeId: "EMP-001", active: true, maxStopsPerDay: 15 },
+        { id: "t2", companyId: "demo", name: "Sarah Chen", employeeId: "EMP-002", active: true, maxStopsPerDay: 12 },
+        { id: "t3", companyId: "demo", name: "David Torres", employeeId: "EMP-003", active: true, maxStopsPerDay: 18 },
       ]);
     }
   }
@@ -70,18 +73,24 @@ export default function SettingsPage() {
       const updateData: Record<string, unknown> = {};
       if (apiKey && !apiKey.startsWith("••")) updateData.fieldRoutesApiKey = apiKey;
       if (apiSecret && apiSecret !== "••••") updateData.fieldRoutesApiSecret = apiSecret;
-      await updateDoc(doc(db, "companies", userProfile.companyId), updateData);
-      setSaveResult({ success: true, message: "API credentials saved successfully" });
-    } catch {
-      setSaveResult({ success: false, message: "Failed to save. Check Firestore connection." });
+      if (Object.keys(updateData).length === 0) {
+        toast.error("No changes to save. Clear the field and enter your key.");
+        setSaving(false);
+        return;
+      }
+      await setDoc(doc(db, "companies", userProfile.companyId), updateData, { merge: true });
+      toast.success("API credentials saved successfully");
+      setSettingsLoaded(false);
+    } catch (err) {
+      console.error("Save credentials error:", err);
+      toast.error("Failed to save. Check Firestore connection.");
     } finally {
       setSaving(false);
-      setTimeout(() => setSaveResult(null), 4000);
     }
   }
 
   async function addTechnician() {
-    if (!userProfile?.companyId || !newTech.name || !newTech.email) return;
+    if (!userProfile?.companyId || !newTech.name || !newTech.employeeId) return;
     setAddingTech(true);
     setTechFeedback(null);
     try {
@@ -92,13 +101,12 @@ export default function SettingsPage() {
       };
       const ref = await addDoc(collection(db, `companies/${userProfile.companyId}/technicians`), techData);
       setTechs(prev => [...prev, { id: ref.id, ...techData }]);
-      setNewTech({ name: "", email: "", maxStopsPerDay: 15 });
-      setTechFeedback({ success: true, message: `${newTech.name} added successfully` });
+      setNewTech({ name: "", employeeId: "", maxStopsPerDay: 15 });
+      toast.success(`${newTech.name} added successfully`);
     } catch {
-      setTechFeedback({ success: false, message: "Failed to add technician. Check Firestore connection." });
+      toast.error("Failed to add technician. Check Firestore connection.");
     } finally {
       setAddingTech(false);
-      setTimeout(() => setTechFeedback(null), 3000);
     }
   }
 
@@ -108,11 +116,10 @@ export default function SettingsPage() {
     try {
       await deleteDoc(doc(db, `companies/${userProfile.companyId}/technicians`, techId));
       setTechs(prev => prev.filter(t => t.id !== techId));
-      setTechFeedback({ success: true, message: `${techName} removed` });
+      toast.success(`${techName} removed`);
     } catch {
-      setTechFeedback({ success: false, message: "Failed to remove technician." });
+      toast.error("Failed to remove technician.");
     }
-    setTimeout(() => setTechFeedback(null), 3000);
   }
 
   async function toggleTechActive(tech: Technician) {
@@ -144,17 +151,12 @@ export default function SettingsPage() {
               <CardContent className="space-y-4">
                 <div className="space-y-2">
                   <Label className="text-sm">API Key</Label>
-                  <Input value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="Enter FieldRoutes API key" type="text" className="h-10" />
+                  <Input value={apiKey} onChange={e => setApiKey(e.target.value)} onFocus={() => { if (apiKey.startsWith("••")) setApiKey(""); }} placeholder="Enter FieldRoutes API key" type="text" className="h-10" />
                 </div>
                 <div className="space-y-2">
                   <Label className="text-sm">API Secret</Label>
-                  <Input value={apiSecret} onChange={e => setApiSecret(e.target.value)} placeholder="Enter FieldRoutes API secret" type="password" className="h-10" />
+                  <Input value={apiSecret} onChange={e => setApiSecret(e.target.value)} onFocus={() => { if (apiSecret === "••••") setApiSecret(""); }} placeholder="Enter FieldRoutes API secret" type="password" className="h-10" />
                 </div>
-                {saveResult && (
-                  <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in ${saveResult.success ? "bg-emerald-500/8 border-emerald-500/15 text-emerald-400" : "bg-red-500/8 border-red-500/15 text-red-400"}`}>
-                    {saveResult.message}
-                  </div>
-                )}
                 <Button onClick={saveApiCredentials} disabled={saving} className="bg-blue-500 hover:bg-blue-600 text-white">
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   Save Credentials
@@ -175,22 +177,17 @@ export default function SettingsPage() {
                     <Input value={newTech.name} onChange={e => setNewTech(p => ({ ...p, name: e.target.value }))} placeholder="Full name" />
                   </div>
                   <div className="space-y-1.5">
-                    <Label className="text-xs text-muted-foreground/60">Email</Label>
-                    <Input value={newTech.email} onChange={e => setNewTech(p => ({ ...p, email: e.target.value }))} placeholder="email@company.com" type="email" />
+                    <Label className="text-xs text-muted-foreground/60">Employee ID</Label>
+                    <Input value={newTech.employeeId} onChange={e => setNewTech(p => ({ ...p, employeeId: e.target.value }))} placeholder="EMP-001" />
                   </div>
                   <div className="space-y-1.5">
                     <Label className="text-xs text-muted-foreground/60">Max Stops/Day</Label>
                     <Input value={newTech.maxStopsPerDay} onChange={e => setNewTech(p => ({ ...p, maxStopsPerDay: parseInt(e.target.value) || 15 }))} type="number" min={1} max={50} />
                   </div>
                 </div>
-                {techFeedback && (
-                  <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in mt-3 ${techFeedback.success ? "bg-emerald-500/8 border-emerald-500/15 text-emerald-400" : "bg-red-500/8 border-red-500/15 text-red-400"}`}>
-                    {techFeedback.message}
-                  </div>
-                )}
                 <Button
                   onClick={addTechnician}
-                  disabled={addingTech || !newTech.name || !newTech.email}
+                  disabled={addingTech || !newTech.name || !newTech.employeeId}
                   className="mt-3 bg-blue-500 hover:bg-blue-600 text-white"
                 >
                   {addingTech ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
@@ -212,7 +209,7 @@ export default function SettingsPage() {
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="font-medium text-sm">{tech.name}</p>
-                        <p className="text-xs text-muted-foreground/50">{tech.email} · Max {tech.maxStopsPerDay} stops/day</p>
+                        <p className="text-xs text-muted-foreground/50">ID: {tech.employeeId} · Max {tech.maxStopsPerDay} stops/day</p>
                       </div>
                       <Switch checked={tech.active} onCheckedChange={() => toggleTechActive(tech)} />
                       <Button

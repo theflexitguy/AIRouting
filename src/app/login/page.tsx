@@ -76,7 +76,7 @@ export default function LoginPage() {
                   onChange={(e) => setEmail(e.target.value)}
                   required
                   autoComplete="email"
-                  className="bg-background/50 h-11"
+                  className={`bg-background/50 h-11 ${error ? "border-red-500/50 focus-visible:ring-red-500/40" : ""}`}
                 />
               </div>
               <div className="space-y-2">
@@ -90,7 +90,7 @@ export default function LoginPage() {
                     onChange={(e) => setPassword(e.target.value)}
                     required
                     autoComplete="current-password"
-                    className="bg-background/50 pr-10 h-11"
+                    className={`bg-background/50 pr-10 h-11 ${error ? "border-red-500/50 focus-visible:ring-red-500/40" : ""}`}
                   />
                   <button
                     type="button"

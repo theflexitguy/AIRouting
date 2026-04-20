@@ -103,5 +103,9 @@
 /* Print styles */
 @media print {
   .no-print { display: none !important; }
-  body { background: white; color: black; }
+  body { background: white !important; color: black !important; }
+  .print-only { display: block !important; }
+  nav, aside, header { display: none !important; }
 }
+
+.print-only { display: none; }

@@ -13,7 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Zap, Building2, Plug, Users, RefreshCw, CheckCircle, Loader2, ChevronRight, Plus, Trash2 } from "lucide-react";
 import { generateId } from "@/lib/utils";
 
-interface TechEntry { id: string; name: string; email: string; maxStopsPerDay: number; }
+interface TechEntry { id: string; name: string; employeeId: string; maxStopsPerDay: number; }
 const STEPS = [
   { id: 1, label: "Company", icon: Building2 },
   { id: 2, label: "FieldRoutes", icon: Plug },
@@ -32,7 +32,7 @@ export default function OnboardingPage() {
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
   const [connectionTested, setConnectionTested] = useState<boolean | null>(null);
-  const [techs, setTechs] = useState<TechEntry[]>([{ id: generateId(), name: "", email: "", maxStopsPerDay: 15 }]);
+  const [techs, setTechs] = useState<TechEntry[]>([{ id: generateId(), name: "", employeeId: "", maxStopsPerDay: 15 }]);
   const [syncProgress, setSyncProgress] = useState(0);
   const [syncMessage, setSyncMessage] = useState("");
   const [companyId, setCompanyId] = useState("");
@@ -80,7 +80,7 @@ export default function OnboardingPage() {
     setStep(3);
   }
 
-  function addTech() { setTechs(p => [...p, { id: generateId(), name: "", email: "", maxStopsPerDay: 15 }]); }
+  function addTech() { setTechs(p => [...p, { id: generateId(), name: "", employeeId: "", maxStopsPerDay: 15 }]); }
   function updateTech(id: string, field: keyof TechEntry, value: string | number) {
     setTechs(p => p.map(t => t.id === id ? { ...t, [field]: value } : t));
   }
@@ -91,9 +91,9 @@ export default function OnboardingPage() {
     setError("");
     try {
       if (companyId) {
-        const valid = techs.filter(t => t.name && t.email);
-        if (valid.length === 0) { setError("Add at least one technician with name and email."); setLoading(false); return; }
-        await Promise.all(valid.map(t => addDoc(collection(db, "companies/" + companyId + "/technicians"), { name: t.name, email: t.email, maxStopsPerDay: t.maxStopsPerDay, active: true, companyId })));
+        const valid = techs.filter(t => t.name && t.employeeId);
+        if (valid.length === 0) { setError("Add at least one technician with name and employee ID."); setLoading(false); return; }
+        await Promise.all(valid.map(t => addDoc(collection(db, "companies/" + companyId + "/technicians"), { name: t.name, employeeId: t.employeeId, maxStopsPerDay: t.maxStopsPerDay, active: true, companyId })));
       }
     } catch {
       setError("Failed to save technicians. They can be added later in Settings.");
@@ -102,17 +102,40 @@ export default function OnboardingPage() {
   }
 
   function startSync() {
-    const msgs = ["Connecting to FieldRoutes...", "Fetching jobs (next 60 days)...", "Geocoding addresses...", "Writing to database...", "Setting up AI model...", "Complete!"];
-    let i = 0; setSyncMessage(msgs[0]); setSyncProgress(0);
-    const iv = setInterval(() => {
-      i++;
-      if (i >= msgs.length) { clearInterval(iv); setSyncProgress(100); setSyncMessage("Sync complete!"); setTimeout(() => setStep(5), 800); return; }
-      setSyncProgress(Math.round((i / (msgs.length - 1)) * 100));
-      setSyncMessage(msgs[i]);
-    }, 1200);
-    if (companyId && apiKey) {
-      fetch("/api/sync-jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ companyId }) }).catch(() => {});
+    if (!apiKey || !apiSecret) {
+      // No FieldRoutes credentials — skip sync, go to completion
+      setSyncMessage("No FieldRoutes integration configured.");
+      setSyncProgress(50);
+      setTimeout(() => {
+        setSyncProgress(100);
+        setSyncMessage("Setup complete! Upload jobs from the Jobs page.");
+        setTimeout(() => setStep(5), 1200);
+      }, 1000);
+      return;
     }
+
+    // Real sync attempt with FieldRoutes
+    setSyncMessage("Connecting to FieldRoutes...");
+    setSyncProgress(10);
+
+    fetch("/api/sync-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ companyId }),
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error("Sync failed");
+        const data = await res.json();
+        setSyncProgress(100);
+        setSyncMessage(data.total > 0 ? `Synced ${data.total} jobs!` : "No jobs found — upload a CSV from the Jobs page.");
+        setTimeout(() => setStep(5), 1200);
+      })
+      .catch(() => {
+        // Sync failed — still let them proceed
+        setSyncProgress(100);
+        setSyncMessage("Sync unavailable — you can upload jobs manually from the Jobs page.");
+        setTimeout(() => setStep(5), 1500);
+      });
   }
 
   return (
@@ -230,7 +253,7 @@ export default function OnboardingPage() {
               {techs.map((tech, i) => (
                 <div key={tech.id} className="grid gap-2 items-end animate-fade-in" style={{ gridTemplateColumns: "1fr 1fr 60px 32px" }}>
                   <div className="space-y-1">{i === 0 && <Label className="text-xs text-muted-foreground">Name</Label>}<Input value={tech.name} onChange={e => updateTech(tech.id, "name", e.target.value)} placeholder="Full name" /></div>
-                  <div className="space-y-1">{i === 0 && <Label className="text-xs text-muted-foreground">Email</Label>}<Input value={tech.email} onChange={e => updateTech(tech.id, "email", e.target.value)} placeholder="email@co.com" type="email" /></div>
+                  <div className="space-y-1">{i === 0 && <Label className="text-xs text-muted-foreground">Employee ID</Label>}<Input value={tech.employeeId} onChange={e => updateTech(tech.id, "employeeId", e.target.value)} placeholder="EMP-001" /></div>
                   <div className="space-y-1">{i === 0 && <Label className="text-xs text-muted-foreground">Stops</Label>}<Input value={tech.maxStopsPerDay} onChange={e => updateTech(tech.id, "maxStopsPerDay", parseInt(e.target.value) || 15)} type="number" min={1} max={50} /></div>
                   <Button variant="ghost" size="icon" className="text-muted-foreground hover:text-red-400 h-10 w-8" onClick={() => removeTech(tech.id)} disabled={techs.length === 1}><Trash2 className="w-3.5 h-3.5" /></Button>
                 </div>

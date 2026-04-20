@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
+import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -74,13 +75,13 @@ export default function LearningPage() {
       });
       const data = await res.json();
       if (data.success) {
-        setRetrainResult({ success: true, message: `Model retrained. Accuracy: ${Math.round((data.accuracy || 0) * 100)}%. Learned from ${data.totalRoutesLearned} routes.` });
+        toast.success(`Model retrained. Accuracy: ${Math.round((data.accuracy || 0) * 100)}%. Learned from ${data.totalRoutesLearned} routes.`);
         await loadMetrics(userProfile.companyId);
       } else {
-        setRetrainResult({ success: false, message: data.message || data.error || "Retraining failed" });
+        toast.error(data.message || data.error || "Retraining failed");
       }
     } catch {
-      setRetrainResult({ success: false, message: "Retrain request sent (Python Cloud Run service may need deployment)" });
+      toast.error("Retrain request failed — Python backend may need deployment");
     } finally {
       setRetraining(false);
     }
@@ -167,11 +168,6 @@ export default function LearningPage() {
                     <p className="text-muted-foreground/60 text-xs">Current accuracy: <span className="text-emerald-400 font-medium">{Math.round(metrics.accuracy * 100)}%</span></p>
                     <p className="text-muted-foreground/60 text-xs">Auto-approve threshold: <span className="text-blue-400 font-medium">85%</span></p>
                   </div>
-                  {retrainResult && (
-                    <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in ${retrainResult.success ? "bg-emerald-500/8 border-emerald-500/15 text-emerald-400" : "bg-yellow-500/8 border-yellow-500/15 text-yellow-400"}`}>
-                      {retrainResult.message}
-                    </div>
-                  )}
                   <Button
                     onClick={handleRetrain}
                     disabled={retraining}

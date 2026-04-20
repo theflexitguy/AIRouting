@@ -131,35 +131,15 @@ export default function DashboardPage() {
       });
     } catch (error) {
       console.error("Dashboard data error:", error);
+      // Show empty state when Firestore is unavailable
       setStats({
-        todayRoutes: 4,
-        totalStops: 47,
-        estimatedDriveTime: 312,
-        avgConfidence: 0.88,
-        jobsDueThisWeek: [
-          { date: "Mon", count: 12 },
-          { date: "Tue", count: 18 },
-          { date: "Wed", count: 15 },
-          { date: "Thu", count: 22 },
-          { date: "Fri", count: 19 },
-          { date: "Sat", count: 8 },
-          { date: "Sun", count: 3 },
-        ],
-        confidenceTrend: [
-          { date: "Mar 15", confidence: 72 },
-          { date: "Mar 16", confidence: 75 },
-          { date: "Mar 17", confidence: 78 },
-          { date: "Mar 18", confidence: 82 },
-          { date: "Mar 19", confidence: 80 },
-          { date: "Mar 20", confidence: 85 },
-          { date: "Mar 21", confidence: 88 },
-        ],
-        recentActivity: [
-          { id: "1", type: "route_generated", message: "AI generated 4 routes for today (47 total stops)", time: "2 min ago", confidence: 0.88 },
-          { id: "2", type: "route_approved", message: "Route for Tech #3 auto-approved (confidence 91%)", time: "2 min ago", confidence: 0.91 },
-          { id: "3", type: "sync_complete", message: "FieldRoutes sync: 23 new jobs pulled", time: "6:01 AM" },
-          { id: "4", type: "route_modified", message: "Dispatcher modified Tech #1 route (3 stops reordered)", time: "Yesterday" },
-        ],
+        todayRoutes: 0,
+        totalStops: 0,
+        estimatedDriveTime: 0,
+        avgConfidence: 0,
+        jobsDueThisWeek: [],
+        confidenceTrend: [],
+        recentActivity: [],
       });
     } finally {
       setLoading(false);
