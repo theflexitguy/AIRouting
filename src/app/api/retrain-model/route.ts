@@ -1,6 +1,8 @@
 export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 
+const BACKEND_URL = process.env.BACKEND_URL || "";
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -10,10 +12,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "companyId is required" }, { status: 400 });
     }
 
-    const pythonFunctionUrl = process.env.PYTHON_CLOUD_FUNCTIONS_URL ||
-      `https://us-central1-${process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}.run.app`;
+    if (!BACKEND_URL) {
+      return NextResponse.json({ error: "Routing backend not configured" }, { status: 503 });
+    }
 
-    const response = await fetch(`${pythonFunctionUrl}/train_routing_model`, {
+    const response = await fetch(`${BACKEND_URL}/routeiq/train`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ companyId }),

@@ -49,6 +49,10 @@ app = FastAPI()
 from routeiq_router import router as routeiq_router  # noqa: E402
 app.include_router(routeiq_router)
 
+# --- AI Learning endpoints ---
+from ai_learning import router as ai_learning_router  # noqa: E402
+app.include_router(ai_learning_router)
+
 # --- Logging ---
 LOG_LEVEL = str(os.environ.get("FR_LOG_LEVEL", "INFO")).upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(message)s")
