@@ -12,9 +12,10 @@ export interface Technician {
   id: string;
   companyId: string;
   name: string;
-  email: string;
+  employeeId: string;
   active: boolean;
   maxStopsPerDay: number;
+  workDays?: string[]; // e.g. ["Mon","Tue","Wed","Thu","Fri"]
   serviceArea?: {
     north: number;
     south: number;
@@ -38,6 +39,9 @@ export interface Job {
   status: 'pending' | 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
   completedAt?: string;
   notes?: string;
+  subscriptionId?: string;
+  schedulingRequest?: string;
+  source?: 'csv_upload' | 'api' | 'manual';
   createdAt: string;
   updatedAt: string;
 }

@@ -4,6 +4,7 @@ import { Bell, Menu } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useAuth } from "@/contexts/AuthContext";
+import { useSidebar } from "@/contexts/SidebarContext";
 
 interface TopBarProps {
   title: string;
@@ -12,12 +13,14 @@ interface TopBarProps {
 
 export function TopBar({ title, onMenuToggle }: TopBarProps) {
   const { userProfile } = useAuth();
+  const { toggleMobileSidebar } = useSidebar();
+  const handleMenuToggle = onMenuToggle || toggleMobileSidebar;
   const initials = userProfile?.email?.slice(0, 2).toUpperCase() ?? "RQ";
 
   return (
     <header className="h-14 border-b border-border/60 bg-background/80 backdrop-blur-md flex items-center justify-between px-4 lg:px-6 shrink-0 sticky top-0 z-10">
       <div className="flex items-center gap-3">
-        <Button variant="ghost" size="icon" className="lg:hidden -ml-1" onClick={onMenuToggle}>
+        <Button variant="ghost" size="icon" className="lg:hidden -ml-1" onClick={handleMenuToggle}>
           <Menu className="w-5 h-5" />
         </Button>
         <h1 className="text-base font-semibold text-foreground tracking-tight">{title}</h1>
