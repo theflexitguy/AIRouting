@@ -58,3 +58,12 @@ __pycache__/
 .env
 venv/
 *.pkl
+
+# Claude Code local config
+.claude/
+
+# OSRM map data (large, regenerate locally)
+osrm-data/
+
+# Firebase Functions node_modules
+functions/node_modules/
