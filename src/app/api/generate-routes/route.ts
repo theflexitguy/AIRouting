@@ -1,60 +1,124 @@
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 300; // 5 minutes for large route generation
+export const maxDuration = 300;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 
-const BACKEND_URL = process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
-const MAX_STOPS_PER_ROUTE = 16;
+const BACKEND_URL =
+  process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
-/** Add N days to a YYYY-MM-DD string and return YYYY-MM-DD */
+const DEFAULT_MAX_STOPS = 16;
+const DEFAULT_MAX_DRIVE_MINUTES = 240;
+const JOB_CAP = 500;
+
 function _dateOffset(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
   d.setDate(d.getDate() + days);
   return d.toISOString().slice(0, 10);
 }
 
-/** Count calendar days between two YYYY-MM-DD strings (inclusive) */
 function _daysBetween(start: string, end: string): number {
   const s = new Date(start + "T00:00:00");
   const e = new Date(end + "T00:00:00");
   return Math.max(1, Math.round((e.getTime() - s.getTime()) / 86400000) + 1);
 }
 
+interface JobDoc {
+  docId: string;
+  customerId?: string;
+  customerID?: string;
+  customerName?: string;
+  address?: string;
+  lat?: number | null;
+  lng?: number | null;
+  scheduledDate?: string;
+  serviceType?: string;
+  schedulingRequest?: string;
+  duration?: number;
+  subscriptionId?: string;
+  subscriptionID?: string;
+  assignedTechId?: string;
+  [key: string]: unknown;
+}
+
+interface BackendStop {
+  customerID?: string;
+  id?: string;
+  [key: string]: unknown;
+}
+
+interface BackendRoute {
+  stops?: BackendStop[];
+  totalDriveMinutes?: number;
+  totalWorkMinutes?: number;
+  routeName?: string;
+  [key: string]: unknown;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { companyId, startDate, endDate, date, techIds, runSettings } = body as {
+    const {
+      companyId,
+      startDate,
+      endDate,
+      date,
+      techIds,
+      maxStops: rawMaxStops,
+      maxDriveTime: rawMaxDriveTime,
+      runSettings,
+    } = body as {
       companyId: string;
       startDate?: string;
       endDate?: string;
       date?: string;
       techIds?: string[];
+      maxStops?: number;
+      maxDriveTime?: number;
       runSettings?: Record<string, unknown>;
     };
 
     if (!companyId) {
-      return NextResponse.json({ error: "companyId is required" }, { status: 400 });
+      return NextResponse.json(
+        { error: "companyId is required" },
+        { status: 400 },
+      );
     }
 
     const rangeStart = startDate || date || "";
     const rangeEnd = endDate || date || "";
 
     if (!rangeStart || !rangeEnd) {
-      return NextResponse.json({ error: "startDate and endDate (or date) are required" }, { status: 400 });
+      return NextResponse.json(
+        { error: "startDate and endDate (or date) are required" },
+        { status: 400 },
+      );
     }
+
+    const maxStops =
+      Number.isFinite(rawMaxStops) && (rawMaxStops as number) > 0
+        ? Math.min(30, Math.floor(rawMaxStops as number))
+        : DEFAULT_MAX_STOPS;
+
+    const maxDriveTime =
+      Number.isFinite(rawMaxDriveTime) && (rawMaxDriveTime as number) > 0
+        ? Math.min(600, Math.floor(rawMaxDriveTime as number))
+        : DEFAULT_MAX_DRIVE_MINUTES;
 
     if (!BACKEND_URL) {
       return NextResponse.json(
-        { error: "Routing backend not configured. Run docker-compose up." },
-        { status: 503 }
+        {
+          error:
+            "Routing backend not configured. Set BACKEND_URL and run the Python service.",
+        },
+        { status: 503 },
       );
     }
 
     const db = adminDb();
 
-    // --- Generation lock to prevent double-booking (2 min timeout, auto-cleanup) ---
+    // --- Generation lock (2 min timeout, auto-cleanup) ---
     const lockRef = db.doc(`routeGeneration/${companyId}`);
     const lockSnap = await lockRef.get();
     if (lockSnap.exists) {
@@ -62,11 +126,13 @@ export async function POST(request: NextRequest) {
       const lockTime = new Date(lockData?.startedAt || 0).getTime();
       if (Date.now() - lockTime < 2 * 60 * 1000) {
         return NextResponse.json(
-          { error: "Another route generation is in progress. Please wait a moment and try again." },
-          { status: 409 }
+          {
+            error:
+              "Another route generation is in progress. Please wait and try again.",
+          },
+          { status: 409 },
         );
       }
-      // Lock is stale (>2 min) — clear it and proceed
       await lockRef.delete();
     }
     await lockRef.set({ startedAt: new Date().toISOString(), companyId });
@@ -83,124 +149,157 @@ export async function POST(request: NextRequest) {
         : allTechs;
 
     if (selectedTechs.length === 0) {
+      await lockRef.delete().catch(() => {});
       return NextResponse.json(
         { success: false, error: "No active technicians selected" },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
-    // Build lookup sets for matching jobs to techs.
-    // assignedTechId on jobs may contain the tech's Firestore ID OR their name
-    // (from CSV "Preferred Tech" column), so we match against both.
+    // --- 2. Fetch pending jobs for selected techs (or unassigned) ---
     const selectedTechIdSet = new Set(selectedTechs.map((t) => t.id));
     const selectedTechNameSet = new Set(
-      selectedTechs.map((t) => String((t as Record<string, unknown>).name || "").trim().toLowerCase())
-        .filter(Boolean)
+      selectedTechs
+        .map((t) =>
+          String((t as Record<string, unknown>).name || "")
+            .trim()
+            .toLowerCase(),
+        )
+        .filter(Boolean),
+    );
+    const normalizeName = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/['"]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    const selectedTechNamesNormalized = new Set(
+      [...selectedTechNameSet].map(normalizeName),
     );
 
-    // --- 2. Fetch pending jobs assigned to the selected techs ---
     const allPendingSnap = await db
       .collection(`companies/${companyId}/jobs`)
       .where("status", "==", "pending")
       .get();
 
-    // Normalize a name for matching: lowercase, strip quotes, collapse spaces
-    const normalizeName = (s: string) => s.toLowerCase().replace(/['"]/g, "").replace(/\s+/g, " ").trim();
-    const selectedTechNamesNormalized = new Set(
-      [...selectedTechNameSet].map(normalizeName)
-    );
-
-    const allJobDocs = allPendingSnap.docs
-      .map((doc) => ({ docId: doc.id, ...doc.data() }))
+    const allJobDocs: JobDoc[] = allPendingSnap.docs
+      .map((doc) => ({ docId: doc.id, ...doc.data() }) as JobDoc)
       .filter((d) => {
         const val = String(d.assignedTechId || "").trim();
-        // Include UNASSIGNED jobs — they can be routed by any selected tech
-        if (!val) return true;
-        // Match by Firestore doc ID or by tech name (normalized)
-        return selectedTechIdSet.has(val)
-          || selectedTechNameSet.has(val.toLowerCase())
-          || selectedTechNamesNormalized.has(normalizeName(val));
+        if (!val) return true; // include unassigned
+        return (
+          selectedTechIdSet.has(val) ||
+          selectedTechNameSet.has(val.toLowerCase()) ||
+          selectedTechNamesNormalized.has(normalizeName(val))
+        );
       });
 
-    const unassignedCount = allJobDocs.filter((d) => !String(d.assignedTechId || "").trim()).length;
-    const assignedCount = allJobDocs.length - unassignedCount;
-
-    console.log("ROUTE DEBUG:", JSON.stringify({
-      totalPendingJobs: allPendingSnap.size,
-      matchedJobs: allJobDocs.length,
-      unassignedIncluded: unassignedCount,
-      assignedMatched: assignedCount,
-      selectedTechIds: [...selectedTechIdSet],
-      selectedTechNames: [...selectedTechNameSet],
-    }));
-
     if (allJobDocs.length === 0) {
-      const sampleAssignedTechIds = Array.from(
-        new Set(
-          allPendingSnap.docs
-            .map((doc) => String((doc.data() as { assignedTechId?: unknown }).assignedTechId || "").trim())
-            .filter((v) => v.length > 0)
-        )
-      ).slice(0, 10);
-
+      await lockRef.delete().catch(() => {});
       return NextResponse.json(
         {
           success: false,
           error: "No pending jobs for the selected technician(s)",
-          debug: {
-            totalPendingJobs: allPendingSnap.size,
-            selectedTechIds: [...selectedTechIdSet],
-            selectedTechNames: [...selectedTechNameSet],
-            sampleAssignedTechIds,
-          },
         },
-        { status: 404 }
+        { status: 404 },
       );
     }
 
-    // --- 3. Calculate route capacity ---
+    // --- 3. Tiered selection: overdue → in-window → future ---
+    // scheduledDate is normalized to YYYY-MM-DD, so lexicographic sort equals chronological sort.
+    const overdue: JobDoc[] = [];
+    const inWindow: JobDoc[] = [];
+    const future: JobDoc[] = [];
+    const noDate: JobDoc[] = [];
+
+    for (const j of allJobDocs) {
+      const sd = String(j.scheduledDate || "");
+      if (!sd) {
+        noDate.push(j);
+        continue;
+      }
+      if (sd < rangeStart) overdue.push(j);
+      else if (sd <= rangeEnd) inWindow.push(j);
+      else future.push(j);
+    }
+
+    const byDateAsc = (a: JobDoc, b: JobDoc) =>
+      String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
+    overdue.sort(byDateAsc);
+    inWindow.sort(byDateAsc);
+    future.sort(byDateAsc);
+
+    // Tier order: overdue first (oldest first), then in-window (oldest first),
+    // then future (earliest first), then jobs with no date as last resort.
+    const tieredPool = [...overdue, ...inWindow, ...future, ...noDate];
+
+    // --- 4. Capacity calculation ---
     const numDays = _daysBetween(rangeStart, rangeEnd);
     const totalSlots = selectedTechs.length * numDays;
-    const maxJobsToRoute = totalSlots * MAX_STOPS_PER_ROUTE;
+    const capacity = Math.min(JOB_CAP, totalSlots * maxStops);
 
-    // Cap at 500 jobs per generation to avoid timeouts
-    const JOB_CAP = 500;
+    const jobsToRoute = tieredPool.slice(0, capacity);
+    const jobsDeferred = tieredPool.length - jobsToRoute.length;
 
-    // --- 4. Sort jobs: oldest scheduledDate first ---
-    allJobDocs.sort((a, b) =>
-      String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""))
+    const selectedOverdueCount = jobsToRoute.filter((j) => {
+      const sd = String(j.scheduledDate || "");
+      return sd && sd < rangeStart;
+    }).length;
+    const selectedInWindowCount = jobsToRoute.filter((j) => {
+      const sd = String(j.scheduledDate || "");
+      return sd && sd >= rangeStart && sd <= rangeEnd;
+    }).length;
+    const selectedFutureCount = jobsToRoute.filter((j) => {
+      const sd = String(j.scheduledDate || "");
+      return sd && sd > rangeEnd;
+    }).length;
+
+    console.log(
+      "ROUTE DEBUG:",
+      JSON.stringify({
+        poolTotal: allJobDocs.length,
+        tierTotals: {
+          overdue: overdue.length,
+          inWindow: inWindow.length,
+          future: future.length,
+          noDate: noDate.length,
+        },
+        selected: {
+          overdue: selectedOverdueCount,
+          inWindow: selectedInWindowCount,
+          future: selectedFutureCount,
+          noDate: jobsToRoute.length
+            - selectedOverdueCount
+            - selectedInWindowCount
+            - selectedFutureCount,
+        },
+        capacity,
+        deferred: jobsDeferred,
+        params: { maxStops, maxDriveTime, numDays, numTechs: selectedTechs.length },
+      }),
     );
 
-    const jobsToRoute = allJobDocs.slice(0, Math.min(maxJobsToRoute, JOB_CAP));
-    const jobsDeferred = allJobDocs.length - jobsToRoute.length;
-
-    // --- 5. Build jobs payload ---
-    const docIdMap = new Map<string, string>();
-    const jobs = jobsToRoute.map((d) => {
-      const customerId = String(d.customerId || d.customerID || d.docId);
-      const docId = d.docId as string;
-      docIdMap.set(customerId, docId);
-
-      return {
-        id: docId,
-        customerID: customerId,
-        subscriptionID: String(d.subscriptionId || d.subscriptionID || docId),
-        address: String(d.address || ""),
-        lat: d.lat ?? null,
-        lng: d.lng ?? null,
-        serviceDue: String(d.scheduledDate || rangeStart),
-        schedulingRequest: String(d.schedulingRequest || ""),
-        duration: Number(d.duration || 25),
-        serviceType: String(d.serviceType || ""),
-        customerName: String(d.customerName || ""),
-      };
-    });
+    // --- 5. Build backend payload.
+    // Use docId as customerID so the backend's echoed customerID maps 1:1 to Firestore docs.
+    const jobs = jobsToRoute.map((d) => ({
+      id: d.docId,
+      customerID: d.docId,
+      subscriptionID: String(d.subscriptionId || d.subscriptionID || d.docId),
+      address: String(d.address || ""),
+      lat: d.lat ?? null,
+      lng: d.lng ?? null,
+      serviceDue: String(d.scheduledDate || rangeStart),
+      schedulingRequest: String(d.schedulingRequest || ""),
+      duration: Number(d.duration || 25),
+      serviceType: String(d.serviceType || ""),
+      customerName: String(d.customerName || ""),
+    }));
 
     // --- 6. Call Python routing backend ---
-    // Tell the engine exactly how many routes we want (= totalSlots)
     const mergedSettings: Record<string, unknown> = {
       ...runSettings,
-      maxStopsPerRoute: MAX_STOPS_PER_ROUTE,
+      maxStopsPerRoute: maxStops,
+      maxDriveMinutesPerRoute: maxDriveTime,
       numRoutes: totalSlots,
     };
 
@@ -213,64 +312,61 @@ export async function POST(request: NextRequest) {
 
     if (!backendRes.ok) {
       const text = await backendRes.text();
+      await lockRef.delete().catch(() => {});
       return NextResponse.json(
-        { success: false, error: `Routing engine returned ${backendRes.status}: ${text}` },
-        { status: 502 }
+        {
+          success: false,
+          error: `Routing engine returned ${backendRes.status}: ${text}`,
+        },
+        { status: 502 },
       );
     }
 
-    const result = await backendRes.json();
+    const result = (await backendRes.json()) as {
+      runId?: string;
+      routes?: BackendRoute[];
+      warnings?: string[];
+      summary?: Record<string, unknown>;
+      deferredJobIds?: string[];
+    };
 
-    // --- 7. Save routes to Firestore and mark jobs as scheduled ---
-    const routes = (result.routes || []) as Array<Record<string, unknown>>;
+    const routes = result.routes || [];
+
     if (routes.length === 0) {
+      await lockRef.delete().catch(() => {});
       return NextResponse.json({
         success: true,
         runId: result.runId,
         routeCount: 0,
         stopCount: 0,
+        tiers: {
+          overdueAvailable: overdue.length,
+          inWindowAvailable: inWindow.length,
+          futureAvailable: future.length,
+          overdueSelected: selectedOverdueCount,
+          inWindowSelected: selectedInWindowCount,
+          futureSelected: selectedFutureCount,
+        },
         warnings: result.warnings || [
           "No routes generated — check if jobs have valid coordinates",
         ],
       });
     }
 
-    // --- 7a. Get AI confidence predictions (fallback to 0.85) ---
-    let confidenceScores: number[] = [];
-    try {
-      const predRes = await fetch(`${BACKEND_URL}/routeiq/predict-confidence`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ companyId, routes }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (predRes.ok) {
-        const predData = await predRes.json();
-        confidenceScores = (predData.predictions || []).map(
-          (p: { confidence?: number }) => p.confidence ?? 0.85
-        );
-      }
-    } catch {
-      // Prediction service unavailable — use default
-    }
-
+    // --- 7. Save routes + mark jobs scheduled ---
     const now = new Date().toISOString();
     const scheduledJobIds = new Set<string>();
     let batch = db.batch();
     let batchOps = 0;
 
-    // Build date list for the range
     const dates: string[] = [];
     for (let d = 0; d < numDays; d++) {
       dates.push(_dateOffset(rangeStart, d));
     }
 
-    // Distribute routes evenly: cycle through dates, then techs
-    // So route 0 → day 0 tech 0, route 1 → day 0 tech 1, ...
-    // route numTechs → day 1 tech 0, etc.
     for (let i = 0; i < routes.length; i++) {
       const route = routes[i];
-      const stops = (route.stops as Array<Record<string, unknown>>) || [];
+      const stops = route.stops || [];
 
       const dayIndex = Math.floor(i / selectedTechs.length) % numDays;
       const techIndex = i % selectedTechs.length;
@@ -282,13 +378,8 @@ export async function POST(request: NextRequest) {
         route.routeName ||
         `Route ${i + 1}`;
 
-      // Build stop sequence using Firestore doc IDs
-      const stopIds = stops.map((s) => {
-        const cid = String(s.customerID || "");
-        return docIdMap.get(cid) || cid;
-      });
-
-      stopIds.forEach((id) => scheduledJobIds.add(id));
+      const stopIds = stops.map((s) => String(s.id || s.customerID || ""));
+      stopIds.forEach((id) => id && scheduledJobIds.add(id));
 
       const routeRef = db
         .collection(`companies/${companyId}/routes`)
@@ -300,13 +391,15 @@ export async function POST(request: NextRequest) {
         techName,
         stopSequence: stopIds,
         totalStops: stops.length,
-        totalDriveTimeMinutes: Math.round(
-          Number(route.totalDriveMinutes) || 0
-        ),
+        totalDriveTimeMinutes: Math.round(Number(route.totalDriveMinutes) || 0),
         totalWorkMinutes: Math.round(
-          Number(route.totalWorkMinutes) || Number(route.totalDriveMinutes) || 0
+          Number(route.totalWorkMinutes) ||
+            Number(route.totalDriveMinutes) ||
+            0,
         ),
-        confidence: confidenceScores[i] ?? 0.85,
+        maxStopsParam: maxStops,
+        maxDriveTimeParam: maxDriveTime,
+        confidence: 0.85,
         generatedBy: "ai",
         approved: false,
         stops,
@@ -323,12 +416,10 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Mark all scheduled jobs
     for (const jobId of scheduledJobIds) {
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       batch.update(jobRef, { status: "scheduled", updatedAt: now });
       batchOps++;
-
       if (batchOps >= 450) {
         await batch.commit();
         batch = db.batch();
@@ -340,8 +431,10 @@ export async function POST(request: NextRequest) {
       await batch.commit();
     }
 
-    // Release generation lock
     await lockRef.delete().catch(() => {});
+
+    const backendDeferred = new Set(result.deferredJobIds || []);
+    const totalDeferred = jobsDeferred + backendDeferred.size;
 
     return NextResponse.json({
       success: true,
@@ -349,20 +442,43 @@ export async function POST(request: NextRequest) {
       routeCount: routes.length,
       stopCount: scheduledJobIds.size,
       jobsInPool: allJobDocs.length,
+      tiers: {
+        overdueAvailable: overdue.length,
+        inWindowAvailable: inWindow.length,
+        futureAvailable: future.length,
+        overdueSelected: selectedOverdueCount,
+        inWindowSelected: selectedInWindowCount,
+        futureSelected: selectedFutureCount,
+      },
+      params: { maxStops, maxDriveTime },
+      deferredCount: totalDeferred,
       warnings: [
         ...(result.warnings || []),
-        ...(unassignedCount > 0 ? [`${unassignedCount} unassigned job(s) included in routing pool`] : []),
-        ...(jobsDeferred > 0 ? [`${jobsDeferred} job(s) deferred — run Generate again to route the next batch`] : []),
+        ...(jobsDeferred > 0
+          ? [
+              `${jobsDeferred} job(s) deferred — capacity limit reached. Re-generate to include them.`,
+            ]
+          : []),
+        ...(backendDeferred.size > 0
+          ? [
+              `${backendDeferred.size} stop(s) dropped to stay within ${maxDriveTime}-min drive-time cap.`,
+            ]
+          : []),
       ],
       summary: result.summary,
     });
   } catch (error) {
-    // Always release lock on failure
     try {
       const cleanupDb = adminDb();
-      const body2 = await request.clone().json().catch(() => ({}));
-      if (body2.companyId) await cleanupDb.doc(`routeGeneration/${body2.companyId}`).delete();
-    } catch { /* best effort */ }
+      const body2 = await request
+        .clone()
+        .json()
+        .catch(() => ({}) as { companyId?: string });
+      if (body2.companyId)
+        await cleanupDb.doc(`routeGeneration/${body2.companyId}`).delete();
+    } catch {
+      // best effort
+    }
 
     console.error("Generate routes API error:", error);
     return NextResponse.json(
@@ -371,7 +487,7 @@ export async function POST(request: NextRequest) {
         error:
           error instanceof Error ? error.message : "Failed to generate routes",
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

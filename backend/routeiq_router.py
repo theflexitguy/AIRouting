@@ -323,6 +323,7 @@ def _cluster_and_build_routes(
         stops = []
         for seq, job in enumerate(ordered_jobs):
             stop = {
+                "id": job.get("id", job.get("customerID", "")),
                 "customerID": job["customerID"],
                 "subscriptionID": job.get("subscriptionID", ""),
                 "sequence": seq + 1,
@@ -361,6 +362,114 @@ def _cluster_and_build_routes(
         route["routeName"] = f"Route {i + 1}"
 
     return routes
+
+
+def _enforce_drive_time_cap(
+    routes: list[dict],
+    cap_minutes: float,
+) -> tuple[list[dict], list[str]]:
+    """
+    For each route whose totalDriveMinutes exceeds the cap, iteratively drop
+    the single stop whose removal produces the largest drive-time savings,
+    re-optimize the remainder, and repeat until the route is within the cap
+    (or only one stop remains).
+
+    Returns (routes, deferred_ids).
+    """
+    if cap_minutes <= 0 or not routes:
+        return routes, []
+
+    deferred_ids: list[str] = []
+
+    for route in routes:
+        stops = route.get("stops", [])
+        total = float(route.get("totalDriveMinutes", 0.0))
+
+        while total > cap_minutes and len(stops) > 1:
+            # Rebuild job dicts from stops for matrix recomputation
+            cluster_jobs = [
+                {
+                    "id": s.get("id", s.get("customerID", "")),
+                    "customerID": s.get("customerID", ""),
+                    "subscriptionID": s.get("subscriptionID", ""),
+                    "lat": s["lat"],
+                    "lng": s["lng"],
+                    "duration": s.get("duration", 25),
+                    "customerName": s.get("customerName", ""),
+                    "address": s.get("address", ""),
+                    "serviceType": s.get("serviceType", ""),
+                    "serviceDue": s.get("serviceDue", ""),
+                }
+                for s in stops
+            ]
+            matrix = _build_distance_matrix(cluster_jobs)
+
+            best_idx = -1
+            best_savings = -1.0
+            n = len(cluster_jobs)
+            for i in range(n):
+                if i == 0:
+                    savings = matrix[0][1]
+                elif i == n - 1:
+                    savings = matrix[n - 2][n - 1]
+                else:
+                    savings = (
+                        matrix[i - 1][i]
+                        + matrix[i][i + 1]
+                        - matrix[i - 1][i + 1]
+                    )
+                if savings > best_savings:
+                    best_savings = savings
+                    best_idx = i
+
+            if best_idx < 0:
+                break
+
+            dropped = cluster_jobs.pop(best_idx)
+            deferred_ids.append(str(dropped["id"]))
+
+            # Re-optimize remaining stops
+            ordered = _nearest_neighbor_order(cluster_jobs)
+            m2 = _build_distance_matrix(ordered)
+            ordered = _two_opt_improve(ordered, matrix=m2)
+            ordered = _or_opt_improve(ordered, matrix=m2)
+
+            # Rebuild stops + recompute drive time
+            new_stops = []
+            new_total = 0.0
+            for seq, job in enumerate(ordered):
+                stop = {
+                    "id": job.get("id", ""),
+                    "customerID": job.get("customerID", ""),
+                    "subscriptionID": job.get("subscriptionID", ""),
+                    "sequence": seq + 1,
+                    "duration": job.get("duration", 25),
+                    "lat": job["lat"],
+                    "lng": job["lng"],
+                    "customerName": job.get("customerName", ""),
+                    "address": job.get("address", ""),
+                    "serviceType": job.get("serviceType", ""),
+                    "serviceDue": job.get("serviceDue", ""),
+                }
+                if seq > 0:
+                    prev = ordered[seq - 1]
+                    drive = _drive_minutes(
+                        prev["lat"], prev["lng"], job["lat"], job["lng"]
+                    )
+                    stop["driveMinutesFromPrev"] = round(drive, 1)
+                    new_total += drive
+                new_stops.append(stop)
+
+            stops = new_stops
+            total = new_total
+
+        route["stops"] = stops
+        route["totalDriveMinutes"] = round(total, 1)
+        service_minutes = sum(s.get("duration", 25) for s in stops)
+        route["totalServiceMinutes"] = round(service_minutes, 1)
+        route["totalWorkMinutes"] = round(total + service_minutes, 1)
+
+    return routes, deferred_ids
 
 
 def _enrich_routes_with_google(
@@ -517,6 +626,16 @@ def generate_routes(body: GenerateRequest):
     # ── Step 4: Cluster + optimize ────────────────────────────────────────
     routes = _cluster_and_build_routes(valid_jobs, max_stops=max_stops, num_routes=num_routes)
 
+    # ── Step 4a: Enforce drive-time cap (hard) ───────────────────────────
+    max_drive_minutes = float(settings.get("maxDriveMinutesPerRoute", 0))
+    deferred_from_cap: list[str] = []
+    if max_drive_minutes > 0:
+        routes, deferred_from_cap = _enforce_drive_time_cap(routes, max_drive_minutes)
+        if deferred_from_cap:
+            warnings.append(
+                f"{len(deferred_from_cap)} stop(s) dropped to respect {int(max_drive_minutes)}-min drive-time cap."
+            )
+
     # ── Step 4b: Output quality gate ────────────────────────────────────
     jobs_placed = sum(len(r["stops"]) for r in routes)
     jobs_requested = len(valid_jobs)
@@ -576,4 +695,5 @@ def generate_routes(body: GenerateRequest):
         "routes": routes,
         "summary": summary,
         "warnings": warnings,
+        "deferredJobIds": deferred_from_cap,
     }

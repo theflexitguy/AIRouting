@@ -27,5 +27,5 @@ export function RoleGate({
 }) {
   const { allowed } = useRequireRole(roles);
   if (!allowed) return fallback ?? null;
-  return <>{children}</>;
+  return children;
 }

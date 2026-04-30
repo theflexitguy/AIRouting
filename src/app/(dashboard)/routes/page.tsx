@@ -20,6 +20,7 @@ import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
 import { DatePicker } from "@/components/ui/date-picker";
+import { Input } from "@/components/ui/input";
 import {
   DndContext,
   closestCenter,
@@ -152,6 +153,33 @@ export default function RoutesPage() {
   const { userProfile } = useAuth();
   const [startDate, setStartDate] = useState(format(new Date(), "yyyy-MM-dd"));
   const [endDate, setEndDate] = useState(format(addDays(new Date(), 6), "yyyy-MM-dd"));
+  const [maxStops, setMaxStops] = useState<number>(16);
+  const [maxDriveTime, setMaxDriveTime] = useState<number>(240);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = localStorage.getItem("routeiq.generateSettings.v1");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { maxStops?: number; maxDriveTime?: number };
+      if (typeof parsed.maxStops === "number" && parsed.maxStops > 0) {
+        setMaxStops(parsed.maxStops);
+      }
+      if (typeof parsed.maxDriveTime === "number" && parsed.maxDriveTime > 0) {
+        setMaxDriveTime(parsed.maxDriveTime);
+      }
+    } catch {
+      // ignore malformed localStorage
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(
+      "routeiq.generateSettings.v1",
+      JSON.stringify({ maxStops, maxDriveTime }),
+    );
+  }, [maxStops, maxDriveTime]);
   const [selectedDates, setSelectedDates] = useState<string[]>([]); // which days to show (multi-select)
   const [techs, setTechs] = useState<Technician[]>([]);
   const [selectedTechIds, setSelectedTechIds] = useState<string[]>([]);
@@ -578,6 +606,8 @@ export default function RoutesPage() {
           startDate,
           endDate,
           techIds: selectedTechIds,
+          maxStops,
+          maxDriveTime,
         }),
       });
       timers.forEach(clearTimeout);
@@ -915,6 +945,31 @@ export default function RoutesPage() {
             <DatePicker value={startDate} onChange={setStartDate} placeholder="Start date" className="h-9" />
             <span className="text-muted-foreground text-sm">to</span>
             <DatePicker value={endDate} onChange={setEndDate} placeholder="End date" className="h-9" />
+          </div>
+          <div className="flex items-center gap-3 border-l border-border/60 pl-3">
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              Max stops
+              <Input
+                type="number"
+                min={1}
+                max={30}
+                value={maxStops}
+                onChange={(e) => setMaxStops(Math.max(1, parseInt(e.target.value) || 16))}
+                className="h-9 w-16 text-sm"
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              Max drive (min)
+              <Input
+                type="number"
+                min={30}
+                max={600}
+                step={15}
+                value={maxDriveTime}
+                onChange={(e) => setMaxDriveTime(Math.max(30, parseInt(e.target.value) || 240))}
+                className="h-9 w-20 text-sm"
+              />
+            </label>
           </div>
           <div className="flex gap-1.5 flex-wrap">
             {techs.map(tech => (
