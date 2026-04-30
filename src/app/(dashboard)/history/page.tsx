@@ -140,7 +140,7 @@ export default function HistoryPage() {
               </CardHeader>
               <CardContent className="p-0">
                 <div className="divide-y divide-border/30">
-                  {history.map((item, i) => {
+                  {history.map((item) => {
                     const saved = driveTimeSaved(item);
                     const date = item.originalRoute?.date || "";
                     const nMoved = item.deltaStops.moved.length;

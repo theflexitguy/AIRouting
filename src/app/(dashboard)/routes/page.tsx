@@ -5,16 +5,13 @@ import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatc
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Route, Job, Technician } from "@/types";
-import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
-import { formatTime, getConfidenceColor, cn } from "@/lib/utils";
+import { formatTime, cn } from "@/lib/utils";
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
-  Clock, ChevronDown, ChevronUp, AlertTriangle, Calendar,
-  Printer, Download, Share2, Pencil, MoreVertical, ArrowRight, Merge
+  Clock, AlertTriangle, Calendar,
+  Printer, Share2, Pencil, MoreVertical, ArrowRight
 } from "lucide-react";
 import { format, addDays } from "date-fns";
 import { toast } from "sonner";
@@ -43,6 +40,7 @@ import { useEditHistory } from "@/hooks/useEditHistory";
 import { Undo2, Redo2 } from "lucide-react";
 
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
+const NW_ARK = { lat: 36.07, lng: -94.17 };
 
 interface TechRoute {
   route: Route;
@@ -89,7 +87,7 @@ function SortableStop({ job, index, color, onRemove, moveTargets, onMoveTo, onHo
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium text-foreground truncate">{job.customerName}</p>
         <p className="text-xs text-muted-foreground/60 truncate">{job.address}</p>
-        <ConstraintBadges schedulingRequest={(job as Record<string, unknown>).schedulingRequest as string} />
+        <ConstraintBadges schedulingRequest={(job as unknown as Record<string, unknown>).schedulingRequest as string} />
       </div>
       <div className="flex items-center gap-0.5 shrink-0">
         <span className="text-xs text-muted-foreground/50 flex items-center gap-1">
@@ -254,7 +252,7 @@ export default function RoutesPage() {
     }).catch(() => {});
   };
 
-  const { pushEdit, undo, redo, canUndo, canRedo } = useEditHistory();
+  const { undo, redo, canUndo, canRedo } = useEditHistory();
 
   // Undo/redo keyboard shortcuts
   useEffect(() => {
@@ -321,7 +319,7 @@ export default function RoutesPage() {
 
   useEffect(() => {
     if (!userProfile?.companyId || !startDate || !endDate) return;
-    loadJobsForRange(userProfile.companyId, startDate, endDate);
+    loadJobsForRange(userProfile.companyId);
 
     // Real-time listener for routes
     const routesQuery = query(
@@ -377,8 +375,6 @@ export default function RoutesPage() {
   }, []);
 
   // NW Arkansas anchor — always start here
-  const NW_ARK = { lat: 36.07, lng: -94.17 };
-
   // Create map instance ONCE — anchored to NW Arkansas
   useEffect(() => {
     if (!mapLoaded || mapInstanceRef.current) return;
@@ -400,6 +396,62 @@ export default function RoutesPage() {
     });
     hasFittedBounds.current = false;
   }, [mapLoaded]);
+
+  const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
+    return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
+  }, [allJobs]);
+
+  const markerOriginalColors = useRef<Map<string, string>>(new Map());
+
+  // Direct DOM + Maps API hover — no React re-renders
+  const setHoveredStop = useCallback((jobId: string | null) => {
+    const prev = hoveredStopIdRef.current;
+    if (prev === jobId) return;
+
+    // Un-highlight previous sidebar stop
+    if (prev) {
+      const prevEl = document.querySelector(`[data-job-id="${prev}"]`);
+      if (prevEl) prevEl.classList.remove("ring-2", "ring-blue-400/50", "bg-blue-500/10", "border-blue-500/30");
+
+      // Restore previous map marker
+      if (window.google) {
+        const marker = mapMarkerByJobId.current.get(prev);
+        const origColor = markerOriginalColors.current.get(prev) || "#3b82f6";
+        if (marker) {
+          marker.setIcon({
+            path: window.google.maps.SymbolPath.CIRCLE,
+            fillColor: origColor, fillOpacity: 1,
+            strokeColor: "white", strokeWeight: 2, scale: 14,
+          });
+          marker.setZIndex(0);
+        }
+      }
+    }
+
+    // Highlight new sidebar stop
+    if (jobId) {
+      const newEl = document.querySelector(`[data-job-id="${jobId}"]`);
+      if (newEl) {
+        newEl.classList.add("ring-2", "ring-blue-400/50", "bg-blue-500/10", "border-blue-500/30");
+        newEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+
+      // Highlight new map marker
+      if (window.google) {
+        const marker = mapMarkerByJobId.current.get(jobId);
+        if (marker) {
+          marker.setIcon({
+            path: window.google.maps.SymbolPath.CIRCLE,
+            fillColor: "#facc15", fillOpacity: 1,
+            strokeColor: "#facc15", strokeWeight: 3, scale: 20,
+          });
+          marker.setZIndex(9999);
+        }
+      }
+    }
+
+    hoveredStopIdRef.current = jobId;
+  }, []);
 
   // Update markers and polylines when routes/jobs change (without recreating the map)
   useEffect(() => {
@@ -496,60 +548,7 @@ export default function RoutesPage() {
       map.fitBounds(bounds, 50);
       hasFittedBounds.current = true;
     }
-  }, [visibleRoutes, allJobs]);
-
-  const markerOriginalColors = useRef<Map<string, string>>(new Map());
-
-  // Direct DOM + Maps API hover — no React re-renders
-  const setHoveredStop = useCallback((jobId: string | null) => {
-    const prev = hoveredStopIdRef.current;
-    if (prev === jobId) return;
-
-    // Un-highlight previous sidebar stop
-    if (prev) {
-      const prevEl = document.querySelector(`[data-job-id="${prev}"]`);
-      if (prevEl) prevEl.classList.remove("ring-2", "ring-blue-400/50", "bg-blue-500/10", "border-blue-500/30");
-
-      // Restore previous map marker
-      if (window.google) {
-        const marker = mapMarkerByJobId.current.get(prev);
-        const origColor = markerOriginalColors.current.get(prev) || "#3b82f6";
-        if (marker) {
-          marker.setIcon({
-            path: window.google.maps.SymbolPath.CIRCLE,
-            fillColor: origColor, fillOpacity: 1,
-            strokeColor: "white", strokeWeight: 2, scale: 14,
-          });
-          marker.setZIndex(0);
-        }
-      }
-    }
-
-    // Highlight new sidebar stop
-    if (jobId) {
-      const newEl = document.querySelector(`[data-job-id="${jobId}"]`);
-      if (newEl) {
-        newEl.classList.add("ring-2", "ring-blue-400/50", "bg-blue-500/10", "border-blue-500/30");
-        // Scroll into view if needed
-        newEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      }
-
-      // Highlight new map marker
-      if (window.google) {
-        const marker = mapMarkerByJobId.current.get(jobId);
-        if (marker) {
-          marker.setIcon({
-            path: window.google.maps.SymbolPath.CIRCLE,
-            fillColor: "#facc15", fillOpacity: 1,
-            strokeColor: "#facc15", strokeWeight: 3, scale: 20,
-          });
-          marker.setZIndex(9999);
-        }
-      }
-    }
-
-    hoveredStopIdRef.current = jobId;
-  }, []);
+  }, [visibleRoutes, getJobsForRoute, setHoveredStop]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -563,7 +562,7 @@ export default function RoutesPage() {
     }
   }
 
-  async function loadJobsForRange(companyId: string, start: string, end: string) {
+  async function loadJobsForRange(companyId: string) {
     try {
       // Load all jobs that could appear in routes (pending + scheduled in range, plus past-due)
       const snap = await getDocs(collection(db, `companies/${companyId}/jobs`));
@@ -618,7 +617,7 @@ export default function RoutesPage() {
         setGenResult(null);
         const warnings = data.warnings as string[] || [];
         warnings.forEach((w: string) => toast.warning(w, { duration: 8000 }));
-        await loadJobsForRange(userProfile.companyId, startDate, endDate);
+        await loadJobsForRange(userProfile.companyId);
       } else {
         toast.error(data.error || "Route generation failed");
         setGenResult(null);
@@ -766,49 +765,6 @@ export default function RoutesPage() {
     }
   };
 
-  const handleMergeRoute = async (fromRouteId: string, toRouteId: string) => {
-    if (!userProfile?.companyId) return;
-    const fromRoute = allRoutes.find(r => r.route.id === fromRouteId);
-    const toRoute = allRoutes.find(r => r.route.id === toRouteId);
-    if (!fromRoute || !toRoute) return;
-
-    const newToSeq = [...toRoute.route.stopSequence, ...fromRoute.route.stopSequence];
-
-    // Optimistic update — remove source route, update target
-    setAllRoutes(allRoutes
-      .filter(r => r.route.id !== fromRouteId)
-      .map(r => r.route.id === toRouteId
-        ? { ...r, route: { ...r.route, stopSequence: newToSeq, totalStops: newToSeq.length, generatedBy: "human" as const } }
-        : r
-      )
-    );
-
-    try {
-      const batch = writeBatch(db);
-      // Update target route
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
-        stopSequence: newToSeq, totalStops: newToSeq.length, generatedBy: "human", updatedAt: new Date().toISOString(),
-      });
-      // Update all moved jobs' tech assignment
-      for (const jobId of fromRoute.route.stopSequence) {
-        batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
-          assignedTechId: toRoute.tech.id, updatedAt: new Date().toISOString(),
-        });
-      }
-      await batch.commit();
-      // Delete source route after batch (can't delete + update in same batch easily)
-      await deleteDoc(doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId));
-      toast.success(`Merged ${fromRoute.tech.name}'s ${fromRoute.route.totalStops} stops into ${toRoute.tech.name}`);
-    } catch (e) {
-      console.error("Merge route error:", e);
-      toast.error("Failed to merge routes");
-    }
-  };
-
-  const getJobsForRoute = (tr: TechRoute): Job[] => {
-    return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
-  };
-
   const handleRemoveStop = async (tr: TechRoute, jobId: string) => {
     if (!userProfile?.companyId) return;
     const job = allJobs[jobId];
@@ -843,38 +799,6 @@ export default function RoutesPage() {
     }
   };
 
-  const handleChangeRouteDate = async (tr: TechRoute, newDate: string) => {
-    if (!userProfile?.companyId || !newDate) return;
-
-    // Optimistic update
-    const updated = allRoutes.map(r =>
-      r.route.id === tr.route.id
-        ? { ...r, route: { ...r.route, date: newDate } }
-        : r
-    );
-    setAllRoutes(updated);
-
-    try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
-        date: newDate,
-        updatedAt: new Date().toISOString(),
-      });
-      // Update all jobs in this route
-      for (const jobId of tr.route.stopSequence) {
-        batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
-          scheduledDate: newDate,
-          updatedAt: new Date().toISOString(),
-        });
-      }
-      await batch.commit();
-      toast.success(`Route moved to ${newDate}`);
-    } catch (e) {
-      console.error("Change date error:", e);
-      toast.error("Failed to change route date");
-    }
-  };
-
   const handlePrint = (tr: TechRoute) => {
     const jobs = getJobsForRoute(tr);
     const w = window.open("", "_blank");
@@ -888,11 +812,6 @@ export default function RoutesPage() {
       <div class="footer">Generated by RouteIQ · ${new Date().toLocaleDateString()}</div></body></html>`);
     w.document.close();
     w.print();
-  };
-
-  const handleDownload = (tr: TechRoute) => {
-    if (!userProfile?.companyId) return;
-    window.open(`/api/export-route?companyId=${userProfile.companyId}&routeId=${tr.route.id}&format=html`, "_blank");
   };
 
   const handleShare = async (tr: TechRoute) => {
@@ -929,11 +848,6 @@ export default function RoutesPage() {
       toast.error("Failed to create share link.");
     }
   };
-
-  // Summary stats
-  const totalRoutes = allRoutes.length;
-  const totalStops = allRoutes.reduce((sum, tr) => sum + tr.route.totalStops, 0);
-  const approvedCount = allRoutes.filter((tr) => tr.route.approved).length;
 
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)] overflow-hidden">

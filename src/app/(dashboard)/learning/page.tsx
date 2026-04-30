@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { toast } from "sonner";
@@ -23,14 +23,8 @@ export default function LearningPage() {
   const [loading, setLoading] = useState(true);
   const [retraining, setRetraining] = useState(false);
   const [shadowMode, setShadowMode] = useState(false);
-  const [retrainResult, setRetrainResult] = useState<{ success: boolean; message: string } | null>(null);
 
-  useEffect(() => {
-    if (!userProfile?.companyId) return;
-    loadMetrics(userProfile.companyId);
-  }, [userProfile]);
-
-  async function loadMetrics(companyId: string) {
+  const loadMetrics = useCallback(async (companyId: string) => {
     try {
       const docRef = doc(db, `companies/${companyId}/modelMetrics/current`);
       const snap = await getDoc(docRef);
@@ -44,7 +38,12 @@ export default function LearningPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    if (!userProfile?.companyId) return;
+    loadMetrics(userProfile.companyId);
+  }, [userProfile, loadMetrics]);
 
   function getDemoMetrics(): ModelMetrics {
     return {
@@ -66,7 +65,6 @@ export default function LearningPage() {
   async function handleRetrain() {
     if (!userProfile?.companyId) return;
     setRetraining(true);
-    setRetrainResult(null);
     try {
       const res = await fetch("/api/retrain-model", {
         method: "POST",

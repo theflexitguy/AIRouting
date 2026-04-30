@@ -73,7 +73,7 @@ export default function DashboardLayout({
         {/* Sidebar - hidden on mobile unless open */}
         <div className={`
           lg:relative fixed inset-y-0 left-0 z-30
-          transition-transform duration-300 ease-[cubic-bezier(0.25,0.1,0.25,1)]
+          transition-transform duration-300 ease-out
           ${mobileSidebarOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}
         `}>
           <Sidebar />

@@ -16,16 +16,9 @@ import { Technician } from "@/types";
 import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell } from "lucide-react";
 import { toast } from "sonner";
 
-interface FeedbackMessage {
-  success: boolean;
-  message: string;
-}
-
 export default function SettingsPage() {
   const { userProfile } = useAuth();
   const [saving, setSaving] = useState(false);
-  const [saveResult, setSaveResult] = useState<FeedbackMessage | null>(null);
-  const [techFeedback, setTechFeedback] = useState<FeedbackMessage | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -68,7 +61,6 @@ export default function SettingsPage() {
   async function saveApiCredentials() {
     if (!userProfile?.companyId) return;
     setSaving(true);
-    setSaveResult(null);
     try {
       const updateData: Record<string, unknown> = {};
       if (apiKey && !apiKey.startsWith("••")) updateData.fieldRoutesApiKey = apiKey;
@@ -92,7 +84,6 @@ export default function SettingsPage() {
   async function addTechnician() {
     if (!userProfile?.companyId || !newTech.name || !newTech.employeeId) return;
     setAddingTech(true);
-    setTechFeedback(null);
     try {
       const techData: Omit<Technician, "id"> = {
         ...newTech,
@@ -112,7 +103,6 @@ export default function SettingsPage() {
 
   async function deleteTechnician(techId: string, techName: string) {
     if (!userProfile?.companyId) return;
-    setTechFeedback(null);
     try {
       await deleteDoc(doc(db, `companies/${userProfile.companyId}/technicians`, techId));
       setTechs(prev => prev.filter(t => t.id !== techId));

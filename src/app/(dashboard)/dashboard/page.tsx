@@ -7,7 +7,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { SkeletonCard, SkeletonChart, SkeletonRow } from "@/components/ui/skeleton";
+import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
 import { formatTime, getConfidenceColor, getConfidenceLabel } from "@/lib/utils";
 import {
   Route,

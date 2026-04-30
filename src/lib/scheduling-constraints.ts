@@ -65,7 +65,7 @@ function extractWeekdayIndices(text: string): Set<number> {
 }
 
 function serializeWeekdays(values: Set<number>): string {
-  return [...values]
+  return Array.from(values)
     .filter(v => v >= 0 && v <= 6)
     .sort((a, b) => a - b)
     .map(v => WEEKDAY_LABELS[v])
@@ -97,17 +97,17 @@ export function parseSchedulingRequest(value: string | undefined | null): Schedu
   BLOCKED_WEEKDAY.lastIndex = 0;
   let match;
   while ((match = BLOCKED_WEEKDAY.exec(lowered)) !== null) {
-    for (const idx of extractWeekdayIndices(match[2])) {
+    for (const idx of Array.from(extractWeekdayIndices(match[2]))) {
       blocked.add(idx);
     }
   }
 
   // Extract allowed weekdays
   if (ONLY_WEEKDAY.test(lowered) && allWeekdays.size > 0) {
-    for (const idx of allWeekdays) allowed.add(idx);
+    for (const idx of Array.from(allWeekdays)) allowed.add(idx);
   }
   if (lowered.includes("only") && allWeekdays.size > 0 && allowed.size === 0) {
-    for (const idx of allWeekdays) allowed.add(idx);
+    for (const idx of Array.from(allWeekdays)) allowed.add(idx);
   }
 
   const requiresPhone = PHONE_CONFIRM.test(raw);

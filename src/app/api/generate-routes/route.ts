@@ -174,7 +174,7 @@ export async function POST(request: NextRequest) {
         .replace(/\s+/g, " ")
         .trim();
     const selectedTechNamesNormalized = new Set(
-      [...selectedTechNameSet].map(normalizeName),
+      Array.from(selectedTechNameSet).map(normalizeName),
     );
 
     const allPendingSnap = await db
@@ -416,7 +416,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    for (const jobId of scheduledJobIds) {
+    for (const jobId of Array.from(scheduledJobIds)) {
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       batch.update(jobRef, { status: "scheduled", updatedAt: now });
       batchOps++;

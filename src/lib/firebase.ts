@@ -11,7 +11,7 @@ const isConfigured = !!apiKey && apiKey !== 'your-firebase-api-key';
 
 let app: FirebaseApp | null = null;
 let auth: Auth | null = null;
-let db: Firestore | null = null;
+let dbInstance: Firestore | null = null;
 let storage: FirebaseStorage | null = null;
 
 if (isConfigured) {
@@ -25,9 +25,11 @@ if (isConfigured) {
   };
   app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
   auth = getAuth(app);
-  db = getFirestore(app);
+  dbInstance = getFirestore(app);
   storage = getStorage(app);
 }
+
+const db = dbInstance as Firestore;
 
 export { auth, db, storage };
 export default app;

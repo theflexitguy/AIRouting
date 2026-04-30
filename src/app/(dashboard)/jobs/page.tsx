@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { collection, query, where, getDocs, orderBy, doc, deleteDoc, writeBatch, updateDoc } from "firebase/firestore";
+import { collection, query, where, getDocs, orderBy, doc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -12,7 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SkeletonRow } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/utils";
-import { Upload, Search, MapPin, Calendar, User, Loader2, FileSpreadsheet, Clock, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw } from "lucide-react";
+import { Upload, Search, MapPin, Calendar, User, Loader2, FileSpreadsheet, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
@@ -399,7 +399,7 @@ export default function JobsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredJobs.map((job, i) => {
+                    {filteredJobs.map((job) => {
                       const sc = statusConfig[job.status] || statusConfig.pending;
                       const pastDue = isPastDue(job);
                       return (
