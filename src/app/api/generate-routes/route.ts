@@ -4,6 +4,7 @@ export const maxDuration = 300;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -15,6 +16,8 @@ const GOOGLE_MAPS_API_KEY =
   process.env.GOOGLE_MAPS_API_KEY ||
   process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
   "";
+const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+const ROUTE_SPREAD_WEIGHT = 1.35;
 
 function _dateOffset(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
@@ -94,13 +97,54 @@ function serviceFrequencyDays(job: JobDoc) {
   return 999;
 }
 
-function serviceFrequencyUrgency(job: JobDoc) {
+function dateMovePenaltyPerDay(job: JobDoc) {
   const days = serviceFrequencyDays(job);
-  if (days <= 31) return 9;
-  if (days <= 60) return 6;
-  if (days <= 100) return 3;
-  if (days <= 190) return 2;
-  return 1;
+  if (days <= 31) return 30;
+  if (days <= 60) return 18;
+  if (days <= 100) return 7;
+  if (days <= 190) return 4;
+  return 2;
+}
+
+function weekdayLabelForDate(dateStr: string) {
+  const date = new Date(`${dateStr}T00:00:00Z`);
+  const day = date.getUTCDay();
+  return WEEKDAY_LABEL_BY_JS_DAY[Number.isFinite(day) ? day : 0];
+}
+
+function weekdaySet(value: string) {
+  return new Set(
+    value
+      .split(",")
+      .map((part) => part.trim().toUpperCase())
+      .filter(Boolean),
+  );
+}
+
+function jobScheduleBlockReason(job: JobDoc, slotDate: string) {
+  const parsed = parseSchedulingRequest(String(job.schedulingRequest || ""));
+  if (!parsed.schedulingRequestClass) return "";
+
+  if (CRITICAL_CLASSES.has(parsed.schedulingRequestClass)) {
+    return parsed.schedulingConstraintNote || parsed.schedulingRequestClass;
+  }
+
+  const weekday = weekdayLabelForDate(slotDate);
+  const allowed = weekdaySet(parsed.schedulingAllowedWeekdays);
+  if (allowed.size > 0 && !allowed.has(weekday)) {
+    return `requires ${parsed.schedulingAllowedWeekdays}`;
+  }
+
+  const blocked = weekdaySet(parsed.schedulingBlockedWeekdays);
+  if (blocked.has(weekday)) {
+    return `no ${weekday}`;
+  }
+
+  return "";
+}
+
+function canScheduleJobOnDate(job: JobDoc, slotDate: string) {
+  return !jobScheduleBlockReason(job, slotDate);
 }
 
 function dateTier(job: JobDoc, rangeStart: string, rangeEnd: string) {
@@ -130,17 +174,17 @@ function dateAssignmentPenalty(job: JobDoc, slotDate: string, rangeStart: string
   const sd = String(job.scheduledDate || "");
   if (!sd) return 25;
 
-  const urgency = serviceFrequencyUrgency(job);
+  const perDay = dateMovePenaltyPerDay(job);
   const tier = dateTier(job, rangeStart, rangeEnd);
 
   if (tier === 0) {
-    return Math.max(0, daysBetweenDates(slotDate, rangeStart)) * urgency * 18;
+    return Math.max(0, daysBetweenDates(slotDate, rangeStart)) * perDay * 0.75;
   }
   if (tier === 1) {
-    return Math.abs(daysBetweenDates(slotDate, sd)) * urgency * 20;
+    return Math.abs(daysBetweenDates(slotDate, sd)) * perDay;
   }
   if (tier === 2) {
-    return Math.abs(daysBetweenDates(slotDate, rangeEnd)) * urgency * 8;
+    return Math.abs(daysBetweenDates(slotDate, rangeEnd)) * perDay * 0.5;
   }
   return 25;
 }
@@ -189,6 +233,12 @@ interface RouteSlot {
 interface SlotAssignment {
   slot: RouteSlot;
   jobs: JobDoc[];
+}
+
+interface FastRouteBuildResult {
+  routes: BackendRoute[];
+  deferredJobIds: string[];
+  warnings: string[];
 }
 
 type DriveMatrixResult = {
@@ -537,9 +587,37 @@ function distanceToCentroid(job: JobDoc, point: { lat: number; lng: number }) {
   return haversineMiles(Number(job.lat), Number(job.lng), point.lat, point.lng);
 }
 
+function routeSpreadMinutes(jobs: JobDoc[]) {
+  const withCoords = jobs.filter(
+    (job) => typeof job.lat === "number" && typeof job.lng === "number",
+  );
+  if (withCoords.length <= 1) return 0;
+
+  const center = centroid(withCoords);
+  const distances = withCoords.map((job) => distanceToCentroid(job, center) * 2);
+  const avgDistance = distances.reduce((sum, distance) => sum + distance, 0) / distances.length;
+  const maxDistance = Math.max(...distances);
+  const minLat = Math.min(...withCoords.map((job) => Number(job.lat)));
+  const maxLat = Math.max(...withCoords.map((job) => Number(job.lat)));
+  const minLng = Math.min(...withCoords.map((job) => Number(job.lng)));
+  const maxLng = Math.max(...withCoords.map((job) => Number(job.lng)));
+  const diagonalMinutes = haversineMiles(minLat, minLng, maxLat, maxLng) * 2;
+
+  return avgDistance * 1.8 + maxDistance * 1.2 + diagonalMinutes * 0.8;
+}
+
 function routeClusterCost(jobs: JobDoc[]) {
   if (jobs.length <= 1) return 0;
-  return routeDriveMinutes(orderRoute(jobs));
+  return routeDriveMinutes(orderRoute(jobs)) + routeSpreadMinutes(jobs) * ROUTE_SPREAD_WEIGHT;
+}
+
+function incrementalClusterCost(job: JobDoc, slotJobs: JobDoc[]) {
+  if (slotJobs.length === 0) return 0;
+  return Math.max(
+    0,
+    (routeSpreadMinutes([...slotJobs, job]) - routeSpreadMinutes(slotJobs)) *
+      ROUTE_SPREAD_WEIGHT,
+  );
 }
 
 function slotAssignmentCost(
@@ -549,14 +627,16 @@ function slotAssignmentCost(
   rangeStart: string,
   rangeEnd: string,
 ) {
+  if (!canScheduleJobOnDate(job, slotDate)) return Number.POSITIVE_INFINITY;
   const datePenalty = dateAssignmentPenalty(job, slotDate, rangeStart, rangeEnd);
   if (slotJobs.length === 0) return datePenalty;
 
   const nearestStopCost = Math.min(
     ...slotJobs.map((existing) => estimateDriveMinutes(job, existing)),
   );
+  const clusterCost = incrementalClusterCost(job, slotJobs);
   const balancePenalty = slotJobs.length * 1.5;
-  return datePenalty + nearestStopCost + balancePenalty;
+  return datePenalty + clusterCost + nearestStopCost * 0.35 + balancePenalty;
 }
 
 function assignmentCost(
@@ -564,6 +644,9 @@ function assignmentCost(
   rangeStart: string,
   rangeEnd: string,
 ) {
+  if (assignment.jobs.some((job) => !canScheduleJobOnDate(job, assignment.slot.date))) {
+    return Number.POSITIVE_INFINITY;
+  }
   const driveCost = routeClusterCost(assignment.jobs);
   const dateCost = assignment.jobs.reduce(
     (sum, job) => sum + dateAssignmentPenalty(job, assignment.slot.date, rangeStart, rangeEnd),
@@ -586,20 +669,39 @@ function assignJobsToTechSlots({
   rangeEnd: string;
 }) {
   const assignments: SlotAssignment[] = slots.map((slot) => ({ slot, jobs: [] }));
+  const unassignedJobs: Array<{ job: JobDoc; reason: string }> = [];
   const sortedJobs = [...jobs].sort(jobPriorityComparator(rangeStart, rangeEnd));
 
   for (const job of sortedJobs) {
     const target = assignments
-      .filter((assignment) => assignment.jobs.length < maxStops)
+      .filter((assignment) =>
+        assignment.jobs.length < maxStops &&
+        canScheduleJobOnDate(job, assignment.slot.date),
+      )
       .map((assignment) => ({
         assignment,
         cost: slotAssignmentCost(job, assignment.jobs, assignment.slot.date, rangeStart, rangeEnd),
       }))
       .sort((a, b) => a.cost - b.cost)[0]?.assignment;
-    if (target) target.jobs.push(job);
+    if (target) {
+      target.jobs.push(job);
+    } else {
+      const blockedDates = slots
+        .map((slot) => `${slot.date}: ${jobScheduleBlockReason(job, slot.date)}`)
+        .filter((entry) => !entry.endsWith(": "));
+      unassignedJobs.push({
+        job,
+        reason: blockedDates.length > 0
+          ? blockedDates.join("; ")
+          : "no route capacity",
+      });
+    }
   }
 
-  return optimizeSlotAssignments(assignments, maxStops, rangeStart, rangeEnd);
+  return {
+    assignments: optimizeSlotAssignments(assignments, maxStops, rangeStart, rangeEnd),
+    unassignedJobs,
+  };
 }
 
 function optimizeSlotAssignments(
@@ -638,7 +740,11 @@ function optimizeSlotAssignments(
         const currentCost = costs[aIdx] + costs[bIdx];
 
         for (let i = 0; i < routeA.jobs.length; i++) {
-          if (routeB.jobs.length < maxStops && routeA.jobs.length > 1) {
+          if (
+            routeB.jobs.length < maxStops &&
+            routeA.jobs.length > 1 &&
+            canScheduleJobOnDate(routeA.jobs[i], routeB.slot.date)
+          ) {
             const nextAJobs = routeA.jobs.filter((_, idx) => idx !== i);
             const nextBJobs = [...routeB.jobs, routeA.jobs[i]];
             const nextA = { slot: routeA.slot, jobs: nextAJobs };
@@ -653,6 +759,12 @@ function optimizeSlotAssignments(
           }
 
           for (let j = 0; j < routeB.jobs.length; j++) {
+            if (
+              !canScheduleJobOnDate(routeB.jobs[j], routeA.slot.date) ||
+              !canScheduleJobOnDate(routeA.jobs[i], routeB.slot.date)
+            ) {
+              continue;
+            }
             const nextAJobs = routeA.jobs.map((job, idx) => (idx === i ? routeB.jobs[j] : job));
             const nextBJobs = routeB.jobs.map((job, idx) => (idx === j ? routeA.jobs[i] : job));
             const nextA = { slot: routeA.slot, jobs: nextAJobs };
@@ -671,6 +783,9 @@ function optimizeSlotAssignments(
 
         if (routeA.jobs.length < maxStops && routeB.jobs.length > 1) {
           for (let j = 0; j < routeB.jobs.length; j++) {
+            if (!canScheduleJobOnDate(routeB.jobs[j], routeA.slot.date)) {
+              continue;
+            }
             const nextAJobs = [...routeA.jobs, routeB.jobs[j]];
             const nextBJobs = routeB.jobs.filter((_, idx) => idx !== j);
             const nextA = { slot: routeA.slot, jobs: nextAJobs };
@@ -723,8 +838,10 @@ async function buildFastFallbackRoutes({
   maxDriveTime: number;
   rangeStart: string;
   rangeEnd: string;
-}): Promise<BackendRoute[]> {
+}): Promise<FastRouteBuildResult> {
   const routes: BackendRoute[] = [];
+  const deferredJobIds = new Set<string>();
+  const constraintDeferrals: Array<{ job: JobDoc; reason: string }> = [];
   let slotIndex = 0;
 
   for (const tech of selectedTechs) {
@@ -741,12 +858,17 @@ async function buildFastFallbackRoutes({
     }));
     slotIndex += dates.length;
 
-    const assignments = assignJobsToTechSlots({
+    const assignmentResult = assignJobsToTechSlots({
       jobs: techJobs,
       slots: techSlots,
       maxStops,
       rangeStart,
       rangeEnd,
+    });
+    const assignments = assignmentResult.assignments;
+    assignmentResult.unassignedJobs.forEach((entry) => {
+      deferredJobIds.add(entry.job.docId);
+      constraintDeferrals.push(entry);
     });
 
     for (const assignment of assignments) {
@@ -811,7 +933,18 @@ async function buildFastFallbackRoutes({
     }
   }
 
-  return routes;
+  const warnings =
+    constraintDeferrals.length > 0
+      ? [
+          `${constraintDeferrals.length} job(s) deferred because scheduling notes or route capacity block the available dates. Example: ${String(constraintDeferrals[0].job.customerName || constraintDeferrals[0].job.docId)} (${constraintDeferrals[0].reason}).`,
+        ]
+      : [];
+
+  return {
+    routes,
+    deferredJobIds: Array.from(deferredJobIds),
+    warnings,
+  };
 }
 
 export async function POST(request: NextRequest) {
@@ -1173,9 +1306,16 @@ export async function POST(request: NextRequest) {
       deferredJobIds?: string[];
     };
 
-    const shouldUseFastFallback = selectedTechs.length > 1 || jobsToRoute.length > 24 || numDays > 1;
+    const hasSchedulingBlocks = jobsToRoute.some((job) =>
+      dates.some((routeDate) => !canScheduleJobOnDate(job, routeDate)),
+    );
+    const shouldUseFastFallback =
+      selectedTechs.length > 1 ||
+      jobsToRoute.length > 24 ||
+      numDays > 1 ||
+      hasSchedulingBlocks;
     if (shouldUseFastFallback) {
-      const fastRoutes = await buildFastFallbackRoutes({
+      const fastResult = await buildFastFallbackRoutes({
         jobsToRoute,
         selectedTechs,
         dates,
@@ -1186,11 +1326,13 @@ export async function POST(request: NextRequest) {
       });
       result = {
         runId: `fast-${Date.now()}`,
-        routes: fastRoutes,
+        routes: fastResult.routes,
+        deferredJobIds: fastResult.deferredJobIds,
         warnings: [
           GOOGLE_MAPS_API_KEY
             ? "Used hard tech/date route generation with Google traffic drive times where available."
             : "Used hard tech/date route generation. Add GOOGLE_MAPS_API_KEY for live traffic drive times.",
+          ...fastResult.warnings,
         ],
         summary: {
           driveTimeSource: GOOGLE_MAPS_API_KEY ? "google_traffic" : "fast_estimate",
@@ -1207,7 +1349,7 @@ export async function POST(request: NextRequest) {
 
       if (!backendRes.ok) {
         const text = await backendRes.text();
-        const fastRoutes = await buildFastFallbackRoutes({
+        const fastResult = await buildFastFallbackRoutes({
           jobsToRoute,
           selectedTechs,
           dates,
@@ -1218,9 +1360,11 @@ export async function POST(request: NextRequest) {
         });
         result = {
           runId: `fast-${Date.now()}`,
-          routes: fastRoutes,
+          routes: fastResult.routes,
+          deferredJobIds: fastResult.deferredJobIds,
           warnings: [
             `Routing engine returned ${backendRes.status}; used fast route generation instead.`,
+            ...fastResult.warnings,
             text.slice(0, 300),
           ].filter(Boolean),
           summary: {
