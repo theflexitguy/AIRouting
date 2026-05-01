@@ -74,6 +74,36 @@ function col(row: CsvRow, ...names: string[]): string {
   return "";
 }
 
+function safeCsvColumnKey(name: string, fallbackIndex: number) {
+  const cleaned = String(name || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return cleaned || `column_${fallbackIndex + 1}`;
+}
+
+function buildCsvSnapshot(row: CsvRow) {
+  const fields = Object.entries(row).map(([name, value]) => ({
+    name,
+    value: String(value ?? ""),
+  }));
+  const raw: Record<string, string> = {};
+  const keyCounts = new Map<string, number>();
+
+  fields.forEach(({ name, value }, index) => {
+    const baseKey = safeCsvColumnKey(name, index);
+    const count = keyCounts.get(baseKey) || 0;
+    keyCounts.set(baseKey, count + 1);
+    raw[count === 0 ? baseKey : `${baseKey}_${count + 1}`] = value;
+  });
+
+  return {
+    csvColumns: fields.map((field) => field.name),
+    csvFields: fields,
+    rawCsv: raw,
+  };
+}
+
 interface InvalidRow {
   rowNumber: number;
   reason: string;
@@ -148,7 +178,7 @@ export async function POST(request: NextRequest) {
     const db = adminDb();
 
     let newCount = 0;
-    let duplicateCount = 0;
+    let updatedCount = 0;
     const invalidRows: InvalidRow[] = [];
 
     const batchId = randomUUID();
@@ -248,11 +278,6 @@ export async function POST(request: NextRequest) {
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       const existing = await jobRef.get();
 
-      if (existing.exists) {
-        duplicateCount++;
-        continue;
-      }
-
       const lat =
         parseFloat(col(row, "Latitude", "lat", "latitude", "Lat")) || null;
       const lng =
@@ -268,7 +293,15 @@ export async function POST(request: NextRequest) {
           ? `${firstName} ${lastName}`
           : firstName || lastName || customerId);
 
-      const jobData = {
+      const csvSnapshot = buildCsvSnapshot(row);
+      const assignedTechId = col(
+        row,
+        "Preferred Tech",
+        "preferredTech",
+        "assigned_tech",
+        "Tech",
+      );
+      const baseJobData = {
         jobId,
         customerId,
         customerName,
@@ -283,13 +316,7 @@ export async function POST(request: NextRequest) {
           parseInt(
             col(row, "duration", "Duration", "estimated_duration") || "25",
           ) || 25,
-        assignedTechId: col(
-          row,
-          "Preferred Tech",
-          "preferredTech",
-          "assigned_tech",
-          "Tech",
-        ),
+        assignedTechId,
         subscriptionId: col(
           row,
           "Subscription ID",
@@ -317,17 +344,42 @@ export async function POST(request: NextRequest) {
           "Subscription Status",
           "subscriptionStatus",
         ),
+        subscriptionBalance: col(row, "Subscription Balance", "subscriptionBalance"),
+        subscriptionOnHold: col(row, "Subscription On Hold", "subscriptionOnHold"),
+        initialServiceDate: col(row, "Initial Service", "initialService", "initialServiceDate"),
+        revenue: col(row, "Revenue", "revenue"),
+        productionValue: col(row, "Production Value", "productionValue"),
+        subscriptionCategory: col(row, "Subscription Category", "subscriptionCategory"),
+        ...csvSnapshot,
+        csvSourceColumns: csvSnapshot.csvColumns,
         status: "pending" as const,
         companyId,
         source: "csv_upload" as const,
         uploadBatchId: batchId,
-        createdAt: uploadedAt,
         updatedAt: uploadedAt,
       };
 
-      batch.create(jobRef, jobData);
+      if (existing.exists) {
+        const existingData = existing.data() || {};
+        const existingStatus = String(existingData.status || "").toLowerCase();
+        const updateData = {
+          ...baseJobData,
+          status: existingData.status || "pending",
+          ...(existingStatus && existingStatus !== "pending"
+            ? { assignedTechId: existingData.assignedTechId || assignedTechId }
+            : { assignedTechId }),
+          lastUploadBatchId: batchId,
+        };
+        batch.set(jobRef, updateData, { merge: true });
+        updatedCount++;
+      } else {
+        batch.create(jobRef, {
+          ...baseJobData,
+          createdAt: uploadedAt,
+        });
+        newCount++;
+      }
       batchOps++;
-      newCount++;
 
       if (batchOps >= 450) {
         await batch.commit();
@@ -349,7 +401,7 @@ export async function POST(request: NextRequest) {
       filename: file.name,
       totalRows: rows.length,
       newJobs: newCount,
-      duplicatesSkipped: duplicateCount,
+      updatedJobs: updatedCount,
       invalidRows: invalidRows.length,
       invalidRowsSample: invalidRows.slice(0, 20),
     });
@@ -360,10 +412,12 @@ export async function POST(request: NextRequest) {
       batchId,
       total,
       new: newCount,
-      duplicatesSkipped: duplicateCount,
+      updated: updatedCount,
+      skipped: 0,
+      duplicatesSkipped: 0,
       invalid: invalidRows.length,
       invalidSample: invalidRows.slice(0, 10),
-      message: `${total} rows: ${newCount} new, ${duplicateCount} duplicates skipped${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
+      message: `${total} rows: ${newCount} new, ${updatedCount} updated${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
     });
   } catch (error) {
     console.error("Upload jobs error:", error);

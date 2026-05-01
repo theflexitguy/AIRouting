@@ -103,6 +103,59 @@ function estimateRouteMetrics(stopSequence: string[], jobsById: Record<string, J
   };
 }
 
+type RouteWithMetrics = Route;
+
+function getRouteServiceMinutes(stopSequence: string[], jobsById: Record<string, Job>) {
+  return stopSequence.reduce((total, jobId) => {
+    const job = jobsById[jobId];
+    return total + Number(job?.duration || 25);
+  }, 0);
+}
+
+function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
+  const routeWithMetrics = route as RouteWithMetrics;
+  const estimated = estimateRouteMetrics(route.stopSequence, jobsById);
+  const driveMinutes = Number.isFinite(Number(route.totalDriveTimeMinutes))
+    ? Math.round(Number(route.totalDriveTimeMinutes))
+    : estimated.totalDriveTimeMinutes;
+  const serviceMinutes = getRouteServiceMinutes(route.stopSequence, jobsById);
+  const workMinutes = Number.isFinite(Number(routeWithMetrics.totalWorkMinutes))
+    ? Math.round(Number(routeWithMetrics.totalWorkMinutes))
+    : driveMinutes + serviceMinutes;
+
+  return {
+    stops: route.stopSequence.length,
+    driveMinutes,
+    serviceMinutes,
+    workMinutes,
+  };
+}
+
+function escapeHtml(value: unknown) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>) {
+  const stats = getRouteDisplayMetrics(tr.route, jobsById);
+  return `<div style="color:#111;padding:8px;min-width:220px;max-width:280px">
+    <div style="font-weight:700;margin-bottom:2px">${escapeHtml(tr.tech.name)}</div>
+    <div style="color:#666;font-size:12px;margin-bottom:8px">${escapeHtml(tr.route.date)} · ${stats.stops} stops</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">
+      <div><div style="color:#777">Drive</div><div style="font-weight:700">${formatTime(stats.driveMinutes)}</div></div>
+      <div><div style="color:#777">At stops</div><div style="font-weight:700">${formatTime(stats.serviceMinutes)}</div></div>
+      <div style="grid-column:1 / -1;border-top:1px solid #e5e7eb;padding-top:7px">
+        <div style="color:#777">Estimated working day</div>
+        <div style="font-size:18px;font-weight:800">${formatTime(stats.workMinutes)}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
 interface TechRoute {
   route: Route;
   tech: Technician;
@@ -112,6 +165,36 @@ interface TechRoute {
 }
 
 interface StopMenuTarget { routeId: string; techName: string; color: string; date: string; }
+
+function RoutePanelStats({ route, jobsById }: {
+  route: Route;
+  jobsById: Record<string, Job>;
+}) {
+  const stats = getRouteDisplayMetrics(route, jobsById);
+  const routeWithMetrics = route as RouteWithMetrics;
+
+  return (
+    <div className="grid grid-cols-3 gap-1.5 p-2 border-b border-border/40 bg-accent/10">
+      <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
+        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Drive</p>
+        <p className="text-xs font-semibold text-foreground">{formatTime(stats.driveMinutes)}</p>
+      </div>
+      <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
+        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Service</p>
+        <p className="text-xs font-semibold text-foreground">{formatTime(stats.serviceMinutes)}</p>
+      </div>
+      <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
+        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Day</p>
+        <p className="text-xs font-semibold text-foreground">{formatTime(stats.workMinutes)}</p>
+      </div>
+      {routeWithMetrics.fieldRoutesSync?.uploadedAt && (
+        <p className="col-span-3 text-[10px] text-emerald-400/80 truncate">
+          FieldRoutes uploaded · {new Date(routeWithMetrics.fieldRoutesSync.uploadedAt).toLocaleString()}
+        </p>
+      )}
+    </div>
+  );
+}
 
 function SortableStop({ job, index, color, dragDisabled, clickOrderActive, clickOrderRank, onClick, onRemove, moveTargets, onMoveTo, onHoverStart, onHoverEnd }: {
   job: Job; index: number; color: string;
@@ -898,6 +981,7 @@ export default function RoutesPage() {
             ? clickReorderSequence.indexOf(job.id) + 1
             : 0;
         const clickOrderActive = clickReorderRouteId === routeId;
+        const routeStats = getRouteDisplayMetrics(tr.route, allJobs);
 
         const marker = new window.google.maps.Marker({
           position: pos,
@@ -922,9 +1006,31 @@ export default function RoutesPage() {
             : `${idx + 1}. ${job.customerName} — ${tr.tech.name}`,
         });
 
+        const infoWindow = new window.google.maps.InfoWindow({
+          content: `<div style="color:#111;padding:8px;max-width:270px">
+            <div style="font-weight:700;margin-bottom:2px">${idx + 1}. ${escapeHtml(job.customerName)}</div>
+            <div style="color:#666;font-size:12px;margin-bottom:6px">${escapeHtml(job.address)}</div>
+            <div style="font-size:12px;margin-bottom:8px">
+              ${job.serviceType ? `${escapeHtml(job.serviceType)} · ` : ""}${Number(job.duration || 25)} min at stop
+            </div>
+            <div style="border-top:1px solid #e5e7eb;padding-top:7px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+              <div><div style="color:#777">Route drive</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>
+              <div><div style="color:#777">Full day</div><div style="font-weight:700">${formatTime(routeStats.workMinutes)}</div></div>
+            </div>
+            <div style="color:${color};font-weight:700;font-size:12px;margin-top:8px">${escapeHtml(tr.tech.name)} · ${escapeHtml(tr.route.date)}</div>
+            <div style="color:#999;font-size:11px;margin-top:5px">L+click = left panel · R+click = right panel</div>
+          </div>`,
+        });
+
         // Hover sync: map → sidebar
-        marker.addListener("mouseover", () => setHoveredStop(job.id));
-        marker.addListener("mouseout", () => setHoveredStop(null));
+        marker.addListener("mouseover", () => {
+          setHoveredStop(job.id);
+          infoWindow.open(map, marker);
+        });
+        marker.addListener("mouseout", () => {
+          setHoveredStop(null);
+          infoWindow.close();
+        });
 
         marker.addListener("dragstart", () => setHoveredStop(job.id));
         marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
@@ -942,15 +1048,6 @@ export default function RoutesPage() {
             return;
           }
           await handleMoveStop(job.id, routeId, target.routeId, target.jobId);
-        });
-        const infoWindow = new window.google.maps.InfoWindow({
-          content: `<div style="color:#000;padding:6px;max-width:240px">
-            <b>${job.customerName}</b><br/>
-            <span style="color:#666">${job.address}</span><br/>
-            ${job.serviceType ? `${job.serviceType} · ` : ""}${job.duration}min<br/>
-            <span style="color:${color};font-weight:600">${tr.tech.name}</span> · ${tr.route.date}<br/>
-            <span style="color:#999;font-size:11px">L+click = left panel · R+click = right panel</span>
-          </div>`,
         });
         marker.addListener("click", () => {
           if (clickReorderRouteId) {
@@ -990,6 +1087,18 @@ export default function RoutesPage() {
           strokeWeight: 3,
           map,
         });
+        const routeInfoWindow = new window.google.maps.InfoWindow({
+          content: routeStatsHtml(tr, allJobs),
+        });
+        polyline.addListener("click", (event: google.maps.MapMouseEvent) => {
+          if (heldKeyRef.current === "r") {
+            setRightPanelRouteId(tr.route.id);
+          } else {
+            setLeftPanelRouteId(tr.route.id);
+          }
+          routeInfoWindow.setPosition(event.latLng || path[Math.floor(path.length / 2)]);
+          routeInfoWindow.open(map);
+        });
         mapPolylinesRef.current.push(polyline);
       }
     });
@@ -999,7 +1108,7 @@ export default function RoutesPage() {
       map.fitBounds(bounds, 50);
       hasFittedBounds.current = true;
     }
-  }, [clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleClickOrderPick, handleMoveStop, setHoveredStop, visibleRoutes]);
+  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleClickOrderPick, handleMoveStop, setHoveredStop, visibleRoutes]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -1092,6 +1201,36 @@ export default function RoutesPage() {
     );
   };
 
+  const formatApproveError = (data: { error?: string; details?: unknown }) => {
+    const base = data.error || "Failed to approve route";
+    const details = data.details as { errors?: Array<{ customerName?: string; reason?: string }> } | undefined;
+    const stopErrors = Array.isArray(details?.errors) ? details.errors : [];
+    if (stopErrors.length === 0) return base;
+    const preview = stopErrors
+      .slice(0, 3)
+      .map((err) => `${err.customerName || "Stop"}: ${err.reason || "upload blocked"}`)
+      .join("; ");
+    return `${base}: ${preview}${stopErrors.length > 3 ? `; +${stopErrors.length - 3} more` : ""}`;
+  };
+
+  const approveRouteInFieldRoutes = async (tr: TechRoute) => {
+    if (!userProfile?.companyId) throw new Error("Missing company profile");
+    const res = await fetch("/api/approve-route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        companyId: userProfile.companyId,
+        routeId: tr.route.id,
+        approvedBy: userProfile.email,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) {
+      throw new Error(formatApproveError(data));
+    }
+    return data.sync as RouteWithMetrics["fieldRoutesSync"];
+  };
+
   const handleApprove = async (techIndex: number, approved: boolean) => {
     if (!userProfile?.companyId) return;
     const visRoute = visibleRoutes[techIndex];
@@ -1124,15 +1263,25 @@ export default function RoutesPage() {
         // Remove from local state
         setAllRoutes(allRoutes.filter((_, i) => i !== allIdx));
       } else {
-        // Approving: update the route
-        await updateDoc(routeRef, { approved: true, updatedAt: new Date().toISOString() });
+        const sync = await approveRouteInFieldRoutes(tr);
+        const now = new Date().toISOString();
 
         const updatedRoutes = [...allRoutes];
-        updatedRoutes[allIdx] = { ...tr, route: { ...tr.route, approved: true } };
+        updatedRoutes[allIdx] = {
+          ...tr,
+          route: {
+            ...tr.route,
+            approved: true,
+            updatedAt: now,
+            fieldRoutesSync: sync ? { uploadedAt: now, ...sync } : undefined,
+          } as RouteWithMetrics,
+        };
         setAllRoutes(updatedRoutes);
+        toast.success(`Approved and uploaded ${tr.tech.name}'s route to FieldRoutes`);
       }
     } catch (e) {
       console.error("Approve/reject error:", e);
+      toast.error(e instanceof Error ? e.message : "Failed to approve route");
     } finally {
       setApproving(null);
     }
@@ -1145,20 +1294,39 @@ export default function RoutesPage() {
 
     setApproving("bulk");
     try {
-      const batch = writeBatch(db);
+      const approvedIds = new Map<string, RouteWithMetrics["fieldRoutesSync"]>();
+      const errors: string[] = [];
       for (const tr of pending) {
-        const routeRef = doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id);
-        batch.update(routeRef, { approved: true, updatedAt: new Date().toISOString() });
+        try {
+          approvedIds.set(tr.route.id, await approveRouteInFieldRoutes(tr));
+        } catch (error) {
+          errors.push(`${tr.tech.name} ${tr.route.date}: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
-      await batch.commit();
 
+      const now = new Date().toISOString();
       const updatedRoutes = allRoutes.map(tr =>
-        pending.some(p => p.route.id === tr.route.id)
-          ? { ...tr, route: { ...tr.route, approved: true } }
+        approvedIds.has(tr.route.id)
+          ? {
+              ...tr,
+              route: {
+                ...tr.route,
+                approved: true,
+                updatedAt: now,
+                fieldRoutesSync: approvedIds.get(tr.route.id)
+                  ? { uploadedAt: now, ...approvedIds.get(tr.route.id) }
+                  : undefined,
+              } as RouteWithMetrics,
+            }
           : tr
       );
       setAllRoutes(updatedRoutes);
-      toast.success(`Approved ${pending.length} route(s)`);
+      if (approvedIds.size > 0) {
+        toast.success(`Approved and uploaded ${approvedIds.size} route(s) to FieldRoutes`);
+      }
+      if (errors.length > 0) {
+        toast.error(`Failed ${errors.length} route(s). ${errors[0]}`, { duration: 12000 });
+      }
     } catch (e) {
       console.error("Bulk approve error:", e);
       toast.error("Failed to approve routes");
@@ -1497,6 +1665,7 @@ export default function RoutesPage() {
                     <Pencil className="w-2.5 h-2.5" /> Edit mode active
                   </div>
                 )}
+                <RoutePanelStats route={tr.route} jobsById={allJobs} />
                 <DroppableStopList routeId={tr.route.id} enabled={editMode}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {
@@ -1622,6 +1791,7 @@ export default function RoutesPage() {
                     <Pencil className="w-2.5 h-2.5" /> Edit mode active
                   </div>
                 )}
+                <RoutePanelStats route={tr.route} jobsById={allJobs} />
                 <DroppableStopList routeId={tr.route.id} enabled={editMode}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {

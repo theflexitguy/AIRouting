@@ -41,6 +41,20 @@ export interface Job {
   notes?: string;
   subscriptionId?: string;
   schedulingRequest?: string;
+  billingFrequency?: string;
+  billingPrice?: string;
+  recurringFrequency?: string;
+  recurringPrice?: string;
+  subscriptionStatus?: string;
+  subscriptionBalance?: string;
+  subscriptionOnHold?: string;
+  initialServiceDate?: string;
+  revenue?: string;
+  productionValue?: string;
+  subscriptionCategory?: string;
+  csvColumns?: string[];
+  csvFields?: Array<{ name: string; value: string }>;
+  rawCsv?: Record<string, string>;
   source?: 'csv_upload' | 'api' | 'manual';
   createdAt: string;
   updatedAt: string;
@@ -53,10 +67,24 @@ export interface Route {
   techId: string;
   stopSequence: string[]; // array of jobIds in order
   totalDriveTimeMinutes: number;
+  totalWorkMinutes?: number;
   totalStops: number;
   generatedBy: 'human' | 'ai';
   confidence: number; // 0-1
   approved: boolean;
+  approvedAt?: string;
+  approvedBy?: string;
+  fieldRoutesSync?: {
+    uploadedAt?: string;
+    routeId?: string;
+    updated?: number;
+    created?: number;
+    unchanged?: number;
+    total?: number;
+    assignedTech?: string;
+    routeStatus?: string;
+    dateInputUsed?: string;
+  };
   createdAt: string;
   updatedAt?: string;
 }

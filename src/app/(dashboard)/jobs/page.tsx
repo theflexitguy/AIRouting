@@ -25,6 +25,16 @@ const statusConfig: Record<string, { label: string; variant: "warning" | "defaul
   cancelled: { label: "Cancelled", variant: "destructive" },
 };
 
+const normalizeText = (value: unknown) => String(value ?? "").trim().toLowerCase();
+
+function normalizeStatus(value: unknown) {
+  const normalized = normalizeText(value).replace(/[\s-]+/g, "_");
+  if (normalized === "inprogress") return "in_progress";
+  return normalized;
+}
+
+type TechOption = { id: string; name: string; employeeId?: string };
+
 // Extended job type for all CSV fields
 interface JobRow {
   id: string;
@@ -42,17 +52,26 @@ interface JobRow {
   subscriptionId?: string;
   schedulingRequest?: string;
   billingFrequency?: string;
+  billingPrice?: string;
   recurringFrequency?: string;
   recurringPrice?: string;
   subscriptionStatus?: string;
+  subscriptionBalance?: string;
+  subscriptionOnHold?: string;
+  initialServiceDate?: string;
+  revenue?: string;
+  productionValue?: string;
+  subscriptionCategory?: string;
   source?: string;
+  rawCsv?: Record<string, unknown>;
+  csvFields?: Array<{ name?: string; value?: unknown }>;
 }
 
 export default function JobsPage() {
   const { userProfile } = useAuth();
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [filteredJobs, setFilteredJobs] = useState<JobRow[]>([]);
-  const [techs, setTechs] = useState<Array<{ id: string; name: string }>>([]);
+  const [techs, setTechs] = useState<TechOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [search, setSearch] = useState("");
@@ -111,7 +130,8 @@ export default function JobsPage() {
     if (!userProfile?.companyId || selectedIds.size === 0) return;
     const scheduledSelected = [...selectedIds].filter(id => {
       const job = jobs.find(j => j.id === id);
-      return job && (job.status === "scheduled" || job.status === "in_progress");
+      const status = normalizeStatus(job?.status);
+      return job && (status === "scheduled" || status === "in_progress");
     });
     if (scheduledSelected.length === 0) {
       toast.error("No scheduled jobs selected");
@@ -159,7 +179,14 @@ export default function JobsPage() {
       setJobs(jobData);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
-      setTechs(techSnap.docs.map(d => ({ id: d.id, name: d.data().name })));
+      setTechs(techSnap.docs.map(d => {
+        const data = d.data();
+        return {
+          id: d.id,
+          name: String(data.name || d.id),
+          employeeId: data.employeeId ? String(data.employeeId) : undefined,
+        };
+      }));
     } catch (error: unknown) {
       console.error("Load jobs error:", error);
       const msg = error instanceof Error ? error.message : String(error);
@@ -177,23 +204,65 @@ export default function JobsPage() {
 
   useEffect(() => {
     let filtered = [...jobs];
-    if (search) {
-      const s = search.toLowerCase();
-      filtered = filtered.filter(j =>
-        j.customerName?.toLowerCase().includes(s) ||
-        j.address?.toLowerCase().includes(s) ||
-        j.serviceType?.toLowerCase().includes(s) ||
-        j.customerId?.toLowerCase().includes(s) ||
-        j.assignedTechId?.toLowerCase().includes(s) ||
-        j.subscriptionId?.toLowerCase().includes(s)
-      );
+    const techByAssignment = new Map<string, TechOption>();
+    techs.forEach((tech) => {
+      [tech.id, tech.name, tech.employeeId].forEach((value) => {
+        const key = normalizeText(value);
+        if (key) techByAssignment.set(key, tech);
+      });
+    });
+
+    if (search.trim()) {
+      const s = normalizeText(search);
+      filtered = filtered.filter((j) => {
+        const assignedTech = techByAssignment.get(normalizeText(j.assignedTechId));
+        const searchableValues = [
+          j.customerName,
+          j.address,
+          j.serviceType,
+          j.customerId,
+          j.assignedTechId,
+          assignedTech?.name,
+          assignedTech?.employeeId,
+          j.subscriptionId,
+          j.schedulingRequest,
+          j.billingFrequency,
+          j.billingPrice,
+          j.recurringFrequency,
+          j.recurringPrice,
+          j.subscriptionStatus,
+          j.subscriptionBalance,
+          j.subscriptionOnHold,
+          j.initialServiceDate,
+          j.revenue,
+          j.productionValue,
+          j.subscriptionCategory,
+          j.scheduledDate,
+          j.status,
+          ...Object.values(j.rawCsv || {}),
+          ...(j.csvFields || []).flatMap((field) => [field.name, field.value]),
+        ];
+        return searchableValues.some((value) => normalizeText(value).includes(s));
+      });
     }
-    if (filterStatus !== "all") filtered = filtered.filter(j => j.status === filterStatus);
+    if (filterStatus !== "all") {
+      filtered = filtered.filter(j => normalizeStatus(j.status) === filterStatus);
+    }
     if (filterTech !== "all") {
-      filtered = filtered.filter(j => filterTech === "unassigned" ? !j.assignedTechId : j.assignedTechId === filterTech);
+      const selectedTech = techs.find((tech) => tech.id === filterTech);
+      const selectedKeys = new Set(
+        [selectedTech?.id, selectedTech?.name, selectedTech?.employeeId]
+          .map(normalizeText)
+          .filter(Boolean),
+      );
+      filtered = filtered.filter((j) => {
+        const assigned = normalizeText(j.assignedTechId);
+        if (filterTech === "unassigned") return !assigned;
+        return selectedKeys.has(assigned);
+      });
     }
     setFilteredJobs(filtered);
-  }, [jobs, search, filterStatus, filterTech]);
+  }, [jobs, search, filterStatus, filterTech, techs]);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -212,7 +281,7 @@ export default function JobsPage() {
       });
       const data = await res.json();
       if (data.success) {
-        setUploadResult(`${data.new} new, ${data.updated} updated, ${data.skipped} skipped`);
+        setUploadResult(data.message || `${data.new} new, ${data.updated} updated`);
         await loadJobs();
       } else {
         setUploadResult(`Upload failed: ${data.error}`);
@@ -225,10 +294,19 @@ export default function JobsPage() {
     }
   };
 
-  const isPastDue = (job: JobRow) => job.scheduledDate < today && job.status === "pending";
+  const getTechLabel = (assignedTechId?: string) => {
+    const assigned = normalizeText(assignedTechId);
+    if (!assigned) return "Unassigned";
+    const tech = techs.find((t) =>
+      [t.id, t.name, t.employeeId].some((value) => normalizeText(value) === assigned),
+    );
+    return tech?.name || assignedTechId || "Unassigned";
+  };
 
-  const pendingCount = jobs.filter(j => j.status === "pending").length;
-  const scheduledCount = jobs.filter(j => j.status === "scheduled").length;
+  const isPastDue = (job: JobRow) => job.scheduledDate < today && normalizeStatus(job.status) === "pending";
+
+  const pendingCount = jobs.filter(j => normalizeStatus(j.status) === "pending").length;
+  const scheduledCount = jobs.filter(j => normalizeStatus(j.status) === "scheduled").length;
   const pastDueCount = jobs.filter(isPastDue).length;
 
   return (
@@ -275,6 +353,7 @@ export default function JobsPage() {
               <SelectItem value="scheduled">Scheduled</SelectItem>
               <SelectItem value="in_progress">In Progress</SelectItem>
               <SelectItem value="completed">Completed</SelectItem>
+              <SelectItem value="cancelled">Cancelled</SelectItem>
             </SelectContent>
           </Select>
           <Select value={filterTech} onValueChange={setFilterTech}>
@@ -400,7 +479,8 @@ export default function JobsPage() {
                   </thead>
                   <tbody>
                     {filteredJobs.map((job) => {
-                      const sc = statusConfig[job.status] || statusConfig.pending;
+                      const status = normalizeStatus(job.status);
+                      const sc = statusConfig[status] || statusConfig.pending;
                       const pastDue = isPastDue(job);
                       return (
                         <tr key={job.id} className={`border-b border-border/30 last:border-0 hover:bg-accent/20 transition-colors ${pastDue ? "bg-red-500/5" : ""} ${selectedIds.has(job.id) ? "bg-blue-500/5" : ""}`}>
@@ -437,20 +517,20 @@ export default function JobsPage() {
                           <td className="p-4 text-muted-foreground/70">
                             <div className="flex items-center gap-1.5">
                               <User className="w-3 h-3 text-muted-foreground/40" />
-                              <span className="truncate max-w-[120px]">{job.assignedTechId || "Unassigned"}</span>
+                              <span className="truncate max-w-[120px]">{getTechLabel(job.assignedTechId)}</span>
                             </div>
                           </td>
                           <td className="p-4 text-muted-foreground/70">
                             <div className="flex items-center gap-1.5">
                               <Repeat className="w-3 h-3 text-muted-foreground/40" />
-                              <span className="truncate max-w-[100px]">{job.recurringFrequency || "—"}</span>
+                              <span className="truncate max-w-[100px]">{job.recurringFrequency || job.billingFrequency || "—"}</span>
                             </div>
                           </td>
                           <td className="p-4 text-muted-foreground/70">
-                            {job.recurringPrice ? (
+                            {job.recurringPrice || job.billingPrice ? (
                               <div className="flex items-center gap-1">
                                 <DollarSign className="w-3 h-3 text-muted-foreground/40" />
-                                {job.recurringPrice}
+                                {job.recurringPrice || job.billingPrice}
                               </div>
                             ) : "—"}
                           </td>
@@ -485,7 +565,8 @@ export default function JobsPage() {
               {/* Mobile/iPad cards */}
               <div className="lg:hidden divide-y divide-border/30">
                 {filteredJobs.map(job => {
-                  const sc = statusConfig[job.status] || statusConfig.pending;
+                  const status = normalizeStatus(job.status);
+                  const sc = statusConfig[status] || statusConfig.pending;
                   const pastDue = isPastDue(job);
                   return (
                     <div key={job.id} className={`p-4 hover:bg-accent/20 active:bg-accent/30 transition-colors ${pastDue ? "bg-red-500/5" : ""} ${selectedIds.has(job.id) ? "bg-blue-500/5" : ""}`}>
@@ -510,10 +591,10 @@ export default function JobsPage() {
                       <div className="space-y-1 text-sm text-muted-foreground/60">
                         <div className="flex items-center gap-1.5"><MapPin className="w-3 h-3" />{job.address}</div>
                         <div className="flex items-center gap-1.5"><Calendar className="w-3 h-3" /><span className={pastDue ? "text-red-400" : ""}>{formatDate(job.scheduledDate)}</span> · {job.serviceType}</div>
-                        <div className="flex items-center gap-1.5"><User className="w-3 h-3" />{job.assignedTechId || "Unassigned"}</div>
+                        <div className="flex items-center gap-1.5"><User className="w-3 h-3" />{getTechLabel(job.assignedTechId)}</div>
                         <div className="flex items-center gap-3">
-                          {job.recurringFrequency && <span><Repeat className="w-3 h-3 inline mr-1" />{job.recurringFrequency}</span>}
-                          {job.recurringPrice && <span><DollarSign className="w-3 h-3 inline mr-1" />{job.recurringPrice}</span>}
+                          {(job.recurringFrequency || job.billingFrequency) && <span><Repeat className="w-3 h-3 inline mr-1" />{job.recurringFrequency || job.billingFrequency}</span>}
+                          {(job.recurringPrice || job.billingPrice) && <span><DollarSign className="w-3 h-3 inline mr-1" />{job.recurringPrice || job.billingPrice}</span>}
                           {job.subscriptionStatus && <Badge variant={job.subscriptionStatus === "Active" ? "success" : "secondary"} className="text-[10px]">{job.subscriptionStatus}</Badge>}
                         </div>
                       </div>
