@@ -44,6 +44,7 @@ import { Undo2, Redo2 } from "lucide-react";
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
+const MAX_DIRECTIONS_STOPS = 25;
 
 function routeDropId(routeId: string) {
   return `${ROUTE_DROP_PREFIX}${routeId}`;
@@ -101,6 +102,100 @@ function estimateRouteMetrics(stopSequence: string[], jobsById: Record<string, J
     totalStops: stopSequence.length,
     totalDriveTimeMinutes: roundedDrive,
     totalWorkMinutes: roundedDrive + totalServiceMinutes,
+  };
+}
+
+type RouteMetricSummary = ReturnType<typeof estimateRouteMetrics>;
+
+function getOrderedJobsWithCoordinates(stopSequence: string[], jobsById: Record<string, Job>) {
+  const jobs = stopSequence.map((jobId) => jobsById[jobId]).filter(Boolean) as Job[];
+  if (
+    jobs.length !== stopSequence.length ||
+    jobs.some((job) => typeof job.lat !== "number" || typeof job.lng !== "number")
+  ) {
+    return null;
+  }
+  return jobs;
+}
+
+function directionsRequestForJobs(jobs: Job[]): google.maps.DirectionsRequest | null {
+  if (jobs.length < 2 || jobs.length > MAX_DIRECTIONS_STOPS) return null;
+  const origin = jobs[0];
+  const destination = jobs[jobs.length - 1];
+  if (
+    typeof origin.lat !== "number" ||
+    typeof origin.lng !== "number" ||
+    typeof destination.lat !== "number" ||
+    typeof destination.lng !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    origin: new window.google.maps.LatLng(origin.lat, origin.lng),
+    destination: new window.google.maps.LatLng(destination.lat, destination.lng),
+    waypoints: jobs.slice(1, -1).map((job) => ({
+      location: new window.google.maps.LatLng(Number(job.lat), Number(job.lng)),
+      stopover: true,
+    })),
+    optimizeWaypoints: false,
+    travelMode: window.google.maps.TravelMode.DRIVING,
+    drivingOptions: {
+      departureTime: new Date(),
+      trafficModel: window.google.maps.TrafficModel.BEST_GUESS,
+    },
+  };
+}
+
+function getDirectionsForJobs(jobs: Job[]) {
+  if (!window.google?.maps?.DirectionsService) {
+    return Promise.resolve<google.maps.DirectionsResult | null>(null);
+  }
+  const request = directionsRequestForJobs(jobs);
+  if (!request) return Promise.resolve<google.maps.DirectionsResult | null>(null);
+
+  return new Promise<google.maps.DirectionsResult | null>((resolve) => {
+    const service = new window.google.maps.DirectionsService();
+    service.route(request, (result, status) => {
+      if (status === window.google.maps.DirectionsStatus.OK && result?.routes?.[0]) {
+        resolve(result);
+        return;
+      }
+      resolve(null);
+    });
+  });
+}
+
+function driveMinutesFromDirections(result: google.maps.DirectionsResult) {
+  const route = result.routes[0];
+  return route.legs.reduce((total, leg) => {
+    const legWithTraffic = leg as google.maps.DirectionsLeg & {
+      duration_in_traffic?: google.maps.Duration;
+    };
+    const seconds =
+      legWithTraffic.duration_in_traffic?.value ??
+      leg.duration?.value ??
+      0;
+    return total + seconds / 60;
+  }, 0);
+}
+
+async function calculateRouteMetricsFromRoads(
+  stopSequence: string[],
+  jobsById: Record<string, Job>,
+): Promise<RouteMetricSummary> {
+  const estimated = estimateRouteMetrics(stopSequence, jobsById);
+  const jobs = getOrderedJobsWithCoordinates(stopSequence, jobsById);
+  if (!jobs || jobs.length < 2) return estimated;
+
+  const directions = await getDirectionsForJobs(jobs);
+  if (!directions) return estimated;
+
+  const roundedDrive = Math.round(driveMinutesFromDirections(directions));
+  return {
+    totalStops: stopSequence.length,
+    totalDriveTimeMinutes: roundedDrive,
+    totalWorkMinutes: roundedDrive + getRouteServiceMinutes(stopSequence, jobsById),
   };
 }
 
@@ -438,6 +533,11 @@ export default function RoutesPage() {
     return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
   }, [allJobs]);
 
+  const calculateRouteMetrics = useCallback(
+    (stopSequence: string[]) => calculateRouteMetricsFromRoads(stopSequence, allJobs),
+    [allJobs],
+  );
+
   const handleMoveStop = useCallback(async (
     jobId: string,
     fromRouteId: string,
@@ -458,8 +558,10 @@ export default function RoutesPage() {
       newToSeq.push(jobId);
     }
 
-    const fromMetrics = estimateRouteMetrics(newFromSeq, allJobs);
-    const toMetrics = estimateRouteMetrics(newToSeq, allJobs);
+    const [fromMetrics, toMetrics] = await Promise.all([
+      calculateRouteMetrics(newFromSeq),
+      calculateRouteMetrics(newToSeq),
+    ]);
     const previousRoutes = allRoutes;
 
     setAllRoutes(allRoutes.map(r => {
@@ -471,6 +573,7 @@ export default function RoutesPage() {
             stopSequence: newFromSeq,
             totalStops: fromMetrics.totalStops,
             totalDriveTimeMinutes: fromMetrics.totalDriveTimeMinutes,
+            totalWorkMinutes: fromMetrics.totalWorkMinutes,
             generatedBy: "human" as const,
           },
         };
@@ -483,6 +586,7 @@ export default function RoutesPage() {
             stopSequence: newToSeq,
             totalStops: toMetrics.totalStops,
             totalDriveTimeMinutes: toMetrics.totalDriveTimeMinutes,
+            totalWorkMinutes: toMetrics.totalWorkMinutes,
             generatedBy: "human" as const,
           },
         };
@@ -545,7 +649,7 @@ export default function RoutesPage() {
       setAllRoutes(previousRoutes);
       toast.error("Failed to move stop");
     }
-  }, [allJobs, allRoutes, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, calculateRouteMetrics, userProfile?.companyId, userProfile?.email]);
 
   const handlePanelDragEnd = useCallback(async (event: DragEndEvent) => {
     const { active, over } = event;
@@ -578,7 +682,7 @@ export default function RoutesPage() {
     if (oldIdx === -1 || newIdx === -1 || oldIdx === newIdx) return;
 
     const newSeq = arrayMove(oldSeq, oldIdx, newIdx);
-    const metrics = estimateRouteMetrics(newSeq, allJobs);
+    const metrics = await calculateRouteMetrics(newSeq);
     const previousRoutes = allRoutes;
 
     setAllRoutes(allRoutes.map(r =>
@@ -590,6 +694,7 @@ export default function RoutesPage() {
               stopSequence: newSeq,
               totalStops: metrics.totalStops,
               totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+              totalWorkMinutes: metrics.totalWorkMinutes,
               generatedBy: "human" as const,
             },
           }
@@ -628,7 +733,7 @@ export default function RoutesPage() {
       setAllRoutes(previousRoutes);
       toast.error("Failed to reorder route");
     }
-  }, [allJobs, allRoutes, clickReorderRouteId, editMode, handleMoveStop, pushEdit, userProfile?.companyId, userProfile?.email]);
+  }, [allRoutes, calculateRouteMetrics, clickReorderRouteId, editMode, handleMoveStop, pushEdit, userProfile?.companyId, userProfile?.email]);
 
   const startClickReorder = useCallback((routeId: string) => {
     setClickReorderRouteId(routeId);
@@ -667,7 +772,7 @@ export default function RoutesPage() {
       return;
     }
 
-    const metrics = estimateRouteMetrics(newSeq, allJobs);
+    const metrics = await calculateRouteMetrics(newSeq);
     const previousRoutes = allRoutes;
     setAllRoutes(allRoutes.map((route) =>
       route.route.id === routeId
@@ -678,6 +783,7 @@ export default function RoutesPage() {
               stopSequence: newSeq,
               totalStops: metrics.totalStops,
               totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+              totalWorkMinutes: metrics.totalWorkMinutes,
               generatedBy: "human" as const,
             },
           }
@@ -718,7 +824,7 @@ export default function RoutesPage() {
       setAllRoutes(previousRoutes);
       toast.error("Failed to reorder route");
     }
-  }, [allJobs, allRoutes, cancelClickReorder, clickReorderSequence, pushEdit, userProfile?.companyId, userProfile?.email]);
+  }, [allRoutes, calculateRouteMetrics, cancelClickReorder, clickReorderSequence, pushEdit, userProfile?.companyId, userProfile?.email]);
 
   const handleClickOrderPick = useCallback((routeId: string, jobId: string) => {
     if (clickReorderRouteId !== routeId) return;
@@ -768,7 +874,7 @@ export default function RoutesPage() {
     if (!op || !userProfile?.companyId) return;
     // Revert all routes in this operation to their "before" state
     for (const snap of op.before) {
-      const metrics = estimateRouteMetrics(snap.stopSequence, allJobs);
+      const metrics = await calculateRouteMetrics(snap.stopSequence);
       try {
         await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, snap.routeId), {
           stopSequence: snap.stopSequence,
@@ -787,7 +893,7 @@ export default function RoutesPage() {
     const op = redo();
     if (!op || !userProfile?.companyId) return;
     for (const snap of op.after) {
-      const metrics = estimateRouteMetrics(snap.stopSequence, allJobs);
+      const metrics = await calculateRouteMetrics(snap.stopSequence);
       try {
         await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, snap.routeId), {
           stopSequence: snap.stopSequence,
@@ -975,6 +1081,7 @@ export default function RoutesPage() {
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map || !window.google) return;
+    let cancelled = false;
 
     // Clear old overlays
     mapMarkersRef.current.forEach(m => m.setMap(null));
@@ -1106,7 +1213,7 @@ export default function RoutesPage() {
       if (path.length > 1) {
         const polyline = new window.google.maps.Polyline({
           path,
-          geodesic: true,
+          geodesic: false,
           strokeColor: color,
           strokeOpacity: 0.8,
           strokeWeight: 3,
@@ -1125,6 +1232,15 @@ export default function RoutesPage() {
           routeInfoWindow.open(map);
         });
         mapPolylinesRef.current.push(polyline);
+
+        const roadJobs = getOrderedJobsWithCoordinates(tr.route.stopSequence, allJobs);
+        if (roadJobs) {
+          void getDirectionsForJobs(roadJobs).then((directions) => {
+            const roadPath = directions?.routes?.[0]?.overview_path;
+            if (cancelled || !roadPath || roadPath.length === 0) return;
+            polyline.setPath(roadPath);
+          });
+        }
       }
     });
 
@@ -1133,6 +1249,9 @@ export default function RoutesPage() {
       map.fitBounds(bounds, 50);
       hasFittedBounds.current = true;
     }
+    return () => {
+      cancelled = true;
+    };
   }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleClickOrderPick, handleMoveStop, setHoveredStop, visibleRoutes]);
 
   async function loadTechs(companyId: string) {
@@ -1400,7 +1519,7 @@ export default function RoutesPage() {
     if (!userProfile?.companyId) return;
     const job = allJobs[jobId];
     const newSeq = tr.route.stopSequence.filter(id => id !== jobId);
-    const metrics = estimateRouteMetrics(newSeq, allJobs);
+    const metrics = await calculateRouteMetrics(newSeq);
     const previousRoutes = allRoutes;
 
     // Optimistic update
@@ -1413,6 +1532,7 @@ export default function RoutesPage() {
               stopSequence: newSeq,
               totalStops: metrics.totalStops,
               totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+              totalWorkMinutes: metrics.totalWorkMinutes,
               generatedBy: "human" as const,
             },
           }
