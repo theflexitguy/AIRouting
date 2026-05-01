@@ -11,7 +11,7 @@ import { formatTime, cn } from "@/lib/utils";
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
   Clock, AlertTriangle, Calendar,
-  Printer, Share2, Pencil, MoreVertical, ArrowRight
+  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick
 } from "lucide-react";
 import { format, addDays } from "date-fns";
 import { toast } from "sonner";
@@ -113,9 +113,12 @@ interface TechRoute {
 
 interface StopMenuTarget { routeId: string; techName: string; color: string; date: string; }
 
-function SortableStop({ job, index, color, dragDisabled, onRemove, moveTargets, onMoveTo, onHoverStart, onHoverEnd }: {
+function SortableStop({ job, index, color, dragDisabled, clickOrderActive, clickOrderRank, onClick, onRemove, moveTargets, onMoveTo, onHoverStart, onHoverEnd }: {
   job: Job; index: number; color: string;
   dragDisabled?: boolean;
+  clickOrderActive?: boolean;
+  clickOrderRank?: number;
+  onClick?: () => void;
   onRemove?: () => void;
   moveTargets?: StopMenuTarget[];
   onMoveTo?: (targetRouteId: string) => void;
@@ -132,8 +135,11 @@ function SortableStop({ job, index, color, dragDisabled, onRemove, moveTargets, 
       className={cn(
         "group/stop flex items-center gap-2.5 p-3 rounded-lg bg-accent/20 border border-border/40 mb-1.5 cursor-default touch-manipulation relative",
         "transition-[box-shadow,background,border-color] duration-200",
+        clickOrderActive && "cursor-pointer hover:bg-blue-500/10 hover:border-blue-500/30",
+        clickOrderRank && "ring-2 ring-amber-400/60 bg-amber-500/10 border-amber-400/30",
         isDragging && "shadow-xl shadow-blue-500/15 border-blue-500/30 ring-2 ring-blue-500/20 scale-[1.02]",
       )}
+      onClick={onClick}
       onMouseEnter={onHoverStart}
       onMouseLeave={onHoverEnd}
     >
@@ -149,9 +155,9 @@ function SortableStop({ job, index, color, dragDisabled, onRemove, moveTargets, 
       </div>
       <div
         className="w-5 h-5 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
-        style={{ background: color }}
+        style={{ background: clickOrderRank ? "#f59e0b" : color }}
       >
-        {index + 1}
+        {clickOrderRank || index + 1}
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium text-foreground truncate">{job.customerName}</p>
@@ -286,6 +292,8 @@ export default function RoutesPage() {
   const hoveredStopIdRef = useRef<string | null>(null);
   const [leftPanelRouteId, setLeftPanelRouteId] = useState<string | null>(null);
   const [rightPanelRouteId, setRightPanelRouteId] = useState<string | null>(null);
+  const [clickReorderRouteId, setClickReorderRouteId] = useState<string | null>(null);
+  const [clickReorderSequence, setClickReorderSequence] = useState<string[]>([]);
   const heldKeyRef = useRef<string | null>(null);
 
   // Track L/R key hold state for map click assignment
@@ -436,7 +444,7 @@ export default function RoutesPage() {
 
   const handlePanelDragEnd = useCallback(async (event: DragEndEvent) => {
     const { active, over } = event;
-    if (!editMode || !over || active.id === over.id || !userProfile?.companyId) return;
+    if (!editMode || clickReorderRouteId || !over || active.id === over.id || !userProfile?.companyId) return;
 
     const activeId = String(active.id);
     const overId = String(over.id);
@@ -515,7 +523,123 @@ export default function RoutesPage() {
       setAllRoutes(previousRoutes);
       toast.error("Failed to reorder route");
     }
-  }, [allJobs, allRoutes, editMode, handleMoveStop, pushEdit, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, clickReorderRouteId, editMode, handleMoveStop, pushEdit, userProfile?.companyId, userProfile?.email]);
+
+  const startClickReorder = useCallback((routeId: string) => {
+    setClickReorderRouteId(routeId);
+    setClickReorderSequence([]);
+    toast.info("Click stops or map dots in the order this route should run.");
+  }, []);
+
+  const cancelClickReorder = useCallback(() => {
+    setClickReorderRouteId(null);
+    setClickReorderSequence([]);
+  }, []);
+
+  const applyClickReorder = useCallback(async (
+    routeId: string,
+    pickedSequence = clickReorderSequence,
+  ) => {
+    if (!userProfile?.companyId) return;
+    const tr = allRoutes.find((route) => route.route.id === routeId);
+    if (!tr) return;
+
+    const oldSeq = tr.route.stopSequence;
+    const picked = pickedSequence.filter(
+      (jobId, index) =>
+        oldSeq.includes(jobId) && pickedSequence.indexOf(jobId) === index,
+    );
+    if (picked.length === 0) {
+      toast.info("Click at least one stop to set the route order.");
+      return;
+    }
+
+    const pickedSet = new Set(picked);
+    const newSeq = [...picked, ...oldSeq.filter((jobId) => !pickedSet.has(jobId))];
+    if (newSeq.join("|") === oldSeq.join("|")) {
+      cancelClickReorder();
+      toast.info("Route order unchanged.");
+      return;
+    }
+
+    const metrics = estimateRouteMetrics(newSeq, allJobs);
+    const previousRoutes = allRoutes;
+    setAllRoutes(allRoutes.map((route) =>
+      route.route.id === routeId
+        ? {
+            ...route,
+            route: {
+              ...route.route,
+              stopSequence: newSeq,
+              totalStops: metrics.totalStops,
+              totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+              generatedBy: "human" as const,
+            },
+          }
+        : route,
+    ));
+
+    try {
+      await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, routeId), {
+        stopSequence: newSeq,
+        totalStops: metrics.totalStops,
+        totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+        totalWorkMinutes: metrics.totalWorkMinutes,
+        generatedBy: "human",
+        updatedAt: new Date().toISOString(),
+      });
+      pushEdit({
+        type: "reorder",
+        timestamp: Date.now(),
+        description: "Click-reordered route stops",
+        before: [{ routeId, stopSequence: oldSeq, date: tr.route.date }],
+        after: [{ routeId, stopSequence: newSeq, date: tr.route.date }],
+      });
+      fetch("/api/record-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId,
+          originalRoute: tr.route,
+          modifiedRoute: { ...tr.route, stopSequence: newSeq },
+          modifiedBy: userProfile.email,
+        }),
+      }).catch(() => {});
+      cancelClickReorder();
+      toast.success("Route reordered");
+    } catch (e) {
+      console.error("Click reorder error:", e);
+      setAllRoutes(previousRoutes);
+      toast.error("Failed to reorder route");
+    }
+  }, [allJobs, allRoutes, cancelClickReorder, clickReorderSequence, pushEdit, userProfile?.companyId, userProfile?.email]);
+
+  const handleClickOrderPick = useCallback((routeId: string, jobId: string) => {
+    if (clickReorderRouteId !== routeId) return;
+    const tr = allRoutes.find((route) => route.route.id === routeId);
+    if (!tr || !tr.route.stopSequence.includes(jobId)) return;
+
+    const alreadyPicked = clickReorderSequence.includes(jobId);
+    const next = alreadyPicked
+      ? clickReorderSequence.filter((id) => id !== jobId)
+      : [...clickReorderSequence, jobId];
+    setClickReorderSequence(next);
+
+    if (!alreadyPicked && next.length === tr.route.stopSequence.length) {
+      void applyClickReorder(routeId, next);
+    }
+  }, [allRoutes, applyClickReorder, clickReorderRouteId, clickReorderSequence]);
+
+  useEffect(() => {
+    if (!editMode || !clickReorderRouteId) {
+      if (!editMode) cancelClickReorder();
+      return;
+    }
+    if (!allRoutes.some((route) => route.route.id === clickReorderRouteId)) {
+      cancelClickReorder();
+    }
+  }, [allRoutes, cancelClickReorder, clickReorderRouteId, editMode]);
 
   // Undo/redo keyboard shortcuts
   useEffect(() => {
@@ -768,28 +892,40 @@ export default function RoutesPage() {
         path.push(pos);
         bounds.extend(pos);
         hasCoords = true;
+        const routeId = tr.route.id;
+        const clickOrderRank =
+          clickReorderRouteId === routeId
+            ? clickReorderSequence.indexOf(job.id) + 1
+            : 0;
+        const clickOrderActive = clickReorderRouteId === routeId;
 
         const marker = new window.google.maps.Marker({
           position: pos,
           map,
-          draggable: editMode,
-          label: { text: String(idx + 1), color: "white", fontSize: "11px", fontWeight: "bold" },
+          draggable: editMode && !clickReorderRouteId,
+          label: {
+            text: String(clickOrderRank || idx + 1),
+            color: "white",
+            fontSize: "11px",
+            fontWeight: "bold",
+          },
           icon: {
             path: window.google.maps.SymbolPath.CIRCLE,
-            fillColor: color,
+            fillColor: clickOrderRank ? "#f59e0b" : color,
             fillOpacity: 1,
-            strokeColor: "white",
-            strokeWeight: 2,
-            scale: 14,
+            strokeColor: clickOrderActive ? "#fbbf24" : "white",
+            strokeWeight: clickOrderActive ? 3 : 2,
+            scale: clickOrderActive ? 16 : 14,
           },
-          title: `${idx + 1}. ${job.customerName} — ${tr.tech.name}`,
+          title: clickOrderActive
+            ? `Click to set order: ${job.customerName}`
+            : `${idx + 1}. ${job.customerName} — ${tr.tech.name}`,
         });
 
         // Hover sync: map → sidebar
         marker.addListener("mouseover", () => setHoveredStop(job.id));
         marker.addListener("mouseout", () => setHoveredStop(null));
 
-        const routeId = tr.route.id;
         marker.addListener("dragstart", () => setHoveredStop(job.id));
         marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
           marker.setPosition(pos);
@@ -817,6 +953,14 @@ export default function RoutesPage() {
           </div>`,
         });
         marker.addListener("click", () => {
+          if (clickReorderRouteId) {
+            if (clickReorderRouteId === routeId) {
+              handleClickOrderPick(routeId, job.id);
+              return;
+            }
+            toast.info("Click stops from the route currently in click-order mode.");
+            return;
+          }
           if (heldKeyRef.current === "l") {
             setLeftPanelRouteId(routeId);
             toast.info(`${tr.tech.name} → left panel`);
@@ -855,7 +999,7 @@ export default function RoutesPage() {
       map.fitBounds(bounds, 50);
       hasFittedBounds.current = true;
     }
-  }, [editMode, findNearestRouteDropTarget, getJobsForRoute, handleMoveStop, setHoveredStop, visibleRoutes]);
+  }, [clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleClickOrderPick, handleMoveStop, setHoveredStop, visibleRoutes]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -1355,22 +1499,41 @@ export default function RoutesPage() {
                 )}
                 <DroppableStopList routeId={tr.route.id} enabled={editMode}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
-                    {panelJobs.map((job, idx) => (
-                      <SortableStop
-                        key={job.id} job={job} index={idx} color={tr.color}
-                        dragDisabled={!editMode}
-                        onHoverStart={() => setHoveredStop(job.id)}
-                        onHoverEnd={() => setHoveredStop(null)}
-                        onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
-                        moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
-                        onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
-                      />
-                    ))}
+                    {panelJobs.map((job, idx) => {
+                      const clickOrderRank =
+                        clickReorderRouteId === tr.route.id
+                          ? clickReorderSequence.indexOf(job.id) + 1
+                          : 0;
+                      return (
+                        <SortableStop
+                          key={job.id} job={job} index={idx} color={tr.color}
+                          dragDisabled={!editMode || clickReorderRouteId === tr.route.id}
+                          clickOrderActive={clickReorderRouteId === tr.route.id}
+                          clickOrderRank={clickOrderRank || undefined}
+                          onClick={clickReorderRouteId === tr.route.id ? () => handleClickOrderPick(tr.route.id, job.id) : undefined}
+                          onHoverStart={() => setHoveredStop(job.id)}
+                          onHoverEnd={() => setHoveredStop(null)}
+                          onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
+                          moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                          onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
+                        />
+                      );
+                    })}
                   </SortableContext>
                   {panelJobs.length === 0 && <p className="text-xs text-muted-foreground/50 text-center py-4">{tr.route.stopSequence.length} stops</p>}
                 </DroppableStopList>
                 {/* Route actions */}
                 <div className="p-2 border-t border-border/40 flex flex-wrap gap-1">
+                  {editMode && (
+                    clickReorderRouteId === tr.route.id ? (
+                      <>
+                        <Button size="sm" className="h-6 text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20" onClick={() => applyClickReorder(tr.route.id)}><CheckCircle className="w-3 h-3" /> Apply ({clickReorderSequence.length}/{tr.route.stopSequence.length})</Button>
+                        <Button size="sm" variant="ghost" className="h-6 text-[10px] text-muted-foreground/60" onClick={cancelClickReorder}><XCircle className="w-3 h-3" /> Cancel</Button>
+                      </>
+                    ) : (
+                      <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => startClickReorder(tr.route.id)}><MousePointerClick className="w-3 h-3" /> Click Order</Button>
+                    )
+                  )}
                   {!editMode && (
                     <>
                       <Button size="sm" variant="ghost" className="h-6 text-[10px] text-muted-foreground/60" onClick={() => handlePrint(tr)}><Printer className="w-3 h-3" /> Print</Button>
@@ -1461,21 +1624,40 @@ export default function RoutesPage() {
                 )}
                 <DroppableStopList routeId={tr.route.id} enabled={editMode}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
-                    {panelJobs.map((job, idx) => (
-                      <SortableStop
-                        key={job.id} job={job} index={idx} color={tr.color}
-                        dragDisabled={!editMode}
-                        onHoverStart={() => setHoveredStop(job.id)}
-                        onHoverEnd={() => setHoveredStop(null)}
-                        onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
-                        moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
-                        onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
-                      />
-                    ))}
+                    {panelJobs.map((job, idx) => {
+                      const clickOrderRank =
+                        clickReorderRouteId === tr.route.id
+                          ? clickReorderSequence.indexOf(job.id) + 1
+                          : 0;
+                      return (
+                        <SortableStop
+                          key={job.id} job={job} index={idx} color={tr.color}
+                          dragDisabled={!editMode || clickReorderRouteId === tr.route.id}
+                          clickOrderActive={clickReorderRouteId === tr.route.id}
+                          clickOrderRank={clickOrderRank || undefined}
+                          onClick={clickReorderRouteId === tr.route.id ? () => handleClickOrderPick(tr.route.id, job.id) : undefined}
+                          onHoverStart={() => setHoveredStop(job.id)}
+                          onHoverEnd={() => setHoveredStop(null)}
+                          onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
+                          moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                          onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
+                        />
+                      );
+                    })}
                   </SortableContext>
                   {panelJobs.length === 0 && <p className="text-xs text-muted-foreground/50 text-center py-4">{tr.route.stopSequence.length} stops</p>}
                 </DroppableStopList>
                 <div className="p-2 border-t border-border/40 flex flex-wrap gap-1">
+                  {editMode && (
+                    clickReorderRouteId === tr.route.id ? (
+                      <>
+                        <Button size="sm" className="h-6 text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20" onClick={() => applyClickReorder(tr.route.id)}><CheckCircle className="w-3 h-3" /> Apply ({clickReorderSequence.length}/{tr.route.stopSequence.length})</Button>
+                        <Button size="sm" variant="ghost" className="h-6 text-[10px] text-muted-foreground/60" onClick={cancelClickReorder}><XCircle className="w-3 h-3" /> Cancel</Button>
+                      </>
+                    ) : (
+                      <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => startClickReorder(tr.route.id)}><MousePointerClick className="w-3 h-3" /> Click Order</Button>
+                    )
+                  )}
                   {!editMode && (
                     <>
                       <Button size="sm" variant="ghost" className="h-6 text-[10px] text-muted-foreground/60" onClick={() => handlePrint(tr)}><Printer className="w-3 h-3" /> Print</Button>

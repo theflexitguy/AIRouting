@@ -169,6 +169,63 @@ function twoOptImprove(jobs: JobDoc[]) {
   return best;
 }
 
+function orderNearestNeighborFrom(jobs: JobDoc[], startIdx: number) {
+  if (jobs.length <= 2) return jobs;
+
+  const remaining = [...jobs];
+  const ordered: JobDoc[] = [remaining.splice(startIdx, 1)[0]];
+
+  while (remaining.length > 0) {
+    const last = ordered[ordered.length - 1];
+    const currentIdx = remaining.reduce((bestIdx, job, idx) => {
+      const best = remaining[bestIdx];
+      return estimateDriveMinutes(last, job) < estimateDriveMinutes(last, best)
+        ? idx
+        : bestIdx;
+    }, 0);
+    ordered.push(remaining.splice(currentIdx, 1)[0]);
+  }
+
+  return ordered;
+}
+
+function orderRoute(jobs: JobDoc[]) {
+  if (jobs.length <= 2) return jobs;
+
+  const center = centroid(jobs);
+  const starts = new Set<number>();
+  const centroidStart = jobs.reduce((bestIdx, job, idx) => {
+    const best = jobs[bestIdx];
+    return distanceToCentroid(job, center) < distanceToCentroid(best, center)
+      ? idx
+      : bestIdx;
+  }, 0);
+  starts.add(centroidStart);
+
+  if (jobs.length <= 22) {
+    jobs.forEach((_, idx) => starts.add(idx));
+  } else {
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lat) < Number(jobs[bestIdx].lat) ? idx : bestIdx, 0));
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lat) > Number(jobs[bestIdx].lat) ? idx : bestIdx, 0));
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lng) < Number(jobs[bestIdx].lng) ? idx : bestIdx, 0));
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lng) > Number(jobs[bestIdx].lng) ? idx : bestIdx, 0));
+  }
+
+  let bestRoute = twoOptImprove(orderNearestNeighbor(jobs));
+  let bestCost = routeDriveMinutes(bestRoute);
+
+  for (const startIdx of starts) {
+    const candidate = twoOptImprove(orderNearestNeighborFrom(jobs, startIdx));
+    const cost = routeDriveMinutes(candidate);
+    if (cost + 0.01 < bestCost) {
+      bestRoute = candidate;
+      bestCost = cost;
+    }
+  }
+
+  return bestRoute;
+}
+
 function centroid(jobs: JobDoc[]) {
   return {
     lat:
@@ -205,7 +262,7 @@ function splitBySizes(jobs: JobDoc[], sizes: number[]) {
 
 function routeClusterCost(jobs: JobDoc[]) {
   if (jobs.length <= 1) return 0;
-  return routeDriveMinutes(twoOptImprove(orderNearestNeighbor(jobs)));
+  return routeDriveMinutes(orderRoute(jobs));
 }
 
 function partitionCost(clusters: JobDoc[][]) {
@@ -253,6 +310,110 @@ function addSpatialSweepCandidates(
     candidates.push(splitBySizes(asc, sizes));
     candidates.push(splitBySizes([...asc].reverse(), sizes));
   }
+}
+
+function optimizeRoutePartition(clusters: JobDoc[][], maxStops: number) {
+  let optimized = clusters.map((cluster) => [...cluster]);
+  const costCache = new Map<string, number>();
+  const clusterCost = (cluster: JobDoc[]) => {
+    const key = cluster
+      .map((job) => job.docId)
+      .sort()
+      .join("|");
+    const cached = costCache.get(key);
+    if (cached !== undefined) return cached;
+    const cost = routeClusterCost(cluster);
+    costCache.set(key, cost);
+    return cost;
+  };
+
+  let costs = optimized.map(clusterCost);
+  const totalJobs = optimized.reduce((sum, cluster) => sum + cluster.length, 0);
+  const maxPasses = totalJobs <= 120 ? 16 : totalJobs <= 240 ? 8 : 4;
+  const maxEvaluations = totalJobs <= 120 ? 80000 : totalJobs <= 240 ? 45000 : 18000;
+
+  for (let pass = 0; pass < maxPasses; pass++) {
+    let best:
+      | {
+          delta: number;
+          aIdx: number;
+          bIdx: number;
+          nextA: JobDoc[];
+          nextB: JobDoc[];
+          nextACost: number;
+          nextBCost: number;
+        }
+      | null = null;
+    let evaluations = 0;
+
+    for (let aIdx = 0; aIdx < optimized.length; aIdx++) {
+      for (let bIdx = aIdx + 1; bIdx < optimized.length; bIdx++) {
+        const routeA = optimized[aIdx];
+        const routeB = optimized[bIdx];
+        const currentCost = costs[aIdx] + costs[bIdx];
+
+        for (let i = 0; i < routeA.length; i++) {
+          if (routeB.length < maxStops && routeA.length > 1) {
+            const nextA = routeA.filter((_, idx) => idx !== i);
+            const nextB = [...routeB, routeA[i]];
+            const nextACost = clusterCost(nextA);
+            const nextBCost = clusterCost(nextB);
+            const delta = currentCost - nextACost - nextBCost;
+            evaluations++;
+            if (delta > (best?.delta ?? 0)) {
+              best = { delta, aIdx, bIdx, nextA, nextB, nextACost, nextBCost };
+            }
+          }
+
+          for (let j = 0; j < routeB.length; j++) {
+            const nextA = routeA.map((job, idx) => (idx === i ? routeB[j] : job));
+            const nextB = routeB.map((job, idx) => (idx === j ? routeA[i] : job));
+            const nextACost = clusterCost(nextA);
+            const nextBCost = clusterCost(nextB);
+            const delta = currentCost - nextACost - nextBCost;
+            evaluations++;
+            if (delta > (best?.delta ?? 0)) {
+              best = { delta, aIdx, bIdx, nextA, nextB, nextACost, nextBCost };
+            }
+            if (evaluations >= maxEvaluations) break;
+          }
+          if (evaluations >= maxEvaluations) break;
+        }
+
+        if (routeA.length < maxStops && routeB.length > 1) {
+          for (let j = 0; j < routeB.length; j++) {
+            const nextA = [...routeA, routeB[j]];
+            const nextB = routeB.filter((_, idx) => idx !== j);
+            const nextACost = clusterCost(nextA);
+            const nextBCost = clusterCost(nextB);
+            const delta = currentCost - nextACost - nextBCost;
+            evaluations++;
+            if (delta > (best?.delta ?? 0)) {
+              best = { delta, aIdx, bIdx, nextA, nextB, nextACost, nextBCost };
+            }
+            if (evaluations >= maxEvaluations) break;
+          }
+        }
+
+        if (evaluations >= maxEvaluations) break;
+      }
+      if (evaluations >= maxEvaluations) break;
+    }
+
+    if (!best || best.delta < 0.25) break;
+    optimized = optimized.map((cluster, idx) => {
+      if (idx === best.aIdx) return best.nextA;
+      if (idx === best.bIdx) return best.nextB;
+      return cluster;
+    });
+    costs = costs.map((cost, idx) => {
+      if (idx === best.aIdx) return best.nextACost;
+      if (idx === best.bIdx) return best.nextBCost;
+      return cost;
+    });
+  }
+
+  return optimized.filter((cluster) => cluster.length > 0);
 }
 
 function clusterJobsForRoutes(
@@ -328,10 +489,12 @@ function clusterJobsForRoutes(
   const candidates = [seededClusters];
   addSpatialSweepCandidates(candidates, jobs, targetSizes);
 
-  return candidates
+  const bestCandidate = candidates
     .reduce((best, candidate) =>
       partitionCost(candidate) < partitionCost(best) ? candidate : best,
-    )
+    );
+
+  return optimizeRoutePartition(bestCandidate, maxStops)
     .sort((a, b) => {
       const ca = centroid(a);
       const cb = centroid(b);
@@ -369,7 +532,7 @@ function buildFastFallbackRoutes({
     if (!slot) return;
     if (picked.length === 0) return;
 
-    const ordered = twoOptImprove(orderNearestNeighbor(picked));
+    const ordered = orderRoute(picked);
     const totalDriveMinutes = routeDriveMinutes(ordered);
 
     const stops = ordered.map((job, idx) => {
