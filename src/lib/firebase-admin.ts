@@ -1,33 +1,77 @@
-import { initializeApp, getApps, cert, App } from 'firebase-admin/app';
+import { initializeApp, getApps, cert, App, ServiceAccount } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
 import { getAuth } from 'firebase-admin/auth';
 
 let adminApp: App;
 
+type ServiceAccountJson = ServiceAccount & {
+  project_id?: string;
+  client_email?: string;
+  private_key?: string;
+};
+
 function parseServiceAccount(raw: string) {
-  // Try plain JSON first, then base64url, then standard base64
-  try { return JSON.parse(raw); } catch { /* not plain JSON */ }
-  try { return JSON.parse(Buffer.from(raw, 'base64url').toString('utf-8')); } catch { /* not base64url */ }
-  try { return JSON.parse(Buffer.from(raw, 'base64').toString('utf-8')); } catch { /* not base64 */ }
+  const trimmed = raw.trim();
+  const candidates = [
+    trimmed,
+    trimmed.replace(/^['"]|['"]$/g, ''),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      return normalizeServiceAccount(JSON.parse(candidate));
+    } catch {
+      // not plain JSON
+    }
+  }
+
+  for (const encoding of ['base64url', 'base64'] as const) {
+    try {
+      const decoded = Buffer.from(trimmed, encoding).toString('utf-8');
+      return normalizeServiceAccount(JSON.parse(decoded));
+    } catch {
+      // not this base64 variant
+    }
+  }
+
   return null;
+}
+
+function normalizeServiceAccount(value: ServiceAccountJson | null) {
+  if (!value || typeof value !== 'object') return null;
+  if (typeof value.private_key === 'string') {
+    value.private_key = value.private_key.replace(/\\n/g, '\n');
+  }
+  return value;
+}
+
+function serviceAccountFromEnv() {
+  const raw =
+    process.env.FIREBASE_SERVICE_ACCOUNT ||
+    process.env.FIREBASE_ADMIN_SERVICE_ACCOUNT ||
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON ||
+    process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+
+  if (!raw || raw === '{}' || raw === 'undefined') return null;
+  return parseServiceAccount(raw);
 }
 
 function getAdminApp(): App {
   if (getApps().length === 0) {
-    const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_ADMIN_SERVICE_ACCOUNT;
-    const serviceAccount = raw && raw !== '{}' && raw !== 'undefined' ? parseServiceAccount(raw) : null;
+    const serviceAccount = serviceAccountFromEnv();
 
     if (!serviceAccount) {
-      adminApp = initializeApp({
-        projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID || 'routeiq-dev',
-      });
-    } else {
-      adminApp = initializeApp({
-        credential: cert(serviceAccount),
-        storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-      });
+      throw new Error(
+        'Firebase Admin credentials are not configured. Set FIREBASE_SERVICE_ACCOUNT to the Firebase service account JSON, base64, or base64url value in the server runtime environment.',
+      );
     }
+
+    adminApp = initializeApp({
+      credential: cert(serviceAccount),
+      storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+    });
   } else {
     adminApp = getApps()[0];
   }
