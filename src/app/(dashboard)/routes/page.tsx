@@ -45,18 +45,15 @@ const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
 
-interface RoadLegResult {
-  path: google.maps.LatLng[];
-  durationMinutes: number;
-}
-
 interface RoadRouteResult {
   path: google.maps.LatLng[];
   totalDriveMinutes: number;
   failedLegs: number;
+  status: string;
 }
 
-const roadLegCache = new Map<string, Promise<RoadLegResult | null>>();
+const MAX_DIRECTIONS_STOPS_PER_REQUEST = 25;
+const roadRouteCache = new Map<string, Promise<RoadRouteResult>>();
 
 function routeDropId(routeId: string) {
   return `${ROUTE_DROP_PREFIX}${routeId}`;
@@ -135,91 +132,136 @@ function jobLatLng(job: Job) {
   return new window.google.maps.LatLng(job.lat, job.lng);
 }
 
-function roadLegCacheKey(from: Job, to: Job) {
-  return [
-    Number(from.lat).toFixed(6),
-    Number(from.lng).toFixed(6),
-    Number(to.lat).toFixed(6),
-    Number(to.lng).toFixed(6),
-  ].join(":");
+function roadRouteCacheKey(jobs: Job[]) {
+  return jobs
+    .map((job) => `${Number(job.lat).toFixed(6)},${Number(job.lng).toFixed(6)}`)
+    .join("|");
 }
 
-function getRoadLeg(from: Job, to: Job) {
-  if (!window.google?.maps?.DirectionsService) {
-    return Promise.resolve<RoadLegResult | null>(null);
-  }
-  const origin = jobLatLng(from);
-  const destination = jobLatLng(to);
-  if (!origin || !destination) return Promise.resolve<RoadLegResult | null>(null);
+function directionsRequestForChunk(jobs: Job[]): google.maps.DirectionsRequest | null {
+  if (jobs.length < 2) return null;
+  const origin = jobLatLng(jobs[0]);
+  const destination = jobLatLng(jobs[jobs.length - 1]);
+  if (!origin || !destination) return null;
 
-  const key = roadLegCacheKey(from, to);
-  const cached = roadLegCache.get(key);
-  if (cached) return cached;
-
-  const request: google.maps.DirectionsRequest = {
+  return {
     origin,
     destination,
+    waypoints: jobs.slice(1, -1).map((job) => ({
+      location: new window.google.maps.LatLng(Number(job.lat), Number(job.lng)),
+      stopover: true,
+    })),
+    optimizeWaypoints: false,
     travelMode: window.google.maps.TravelMode.DRIVING,
-    drivingOptions: {
-      departureTime: new Date(),
-      trafficModel: window.google.maps.TrafficModel.BEST_GUESS,
-    },
   };
+}
 
-  const promise = new Promise<RoadLegResult | null>((resolve) => {
+function routeResultToPath(result: google.maps.DirectionsResult) {
+  const route = result.routes[0];
+  const path: google.maps.LatLng[] = [];
+  let totalDriveMinutes = 0;
+
+  route.legs.forEach((leg) => {
+    const stepPath = (leg.steps || []).flatMap((step) => step.path || []);
+    const legPath = stepPath.length > 0 ? stepPath : route.overview_path || [];
+    if (path.length > 0 && legPath.length > 0) {
+      path.push(...legPath.slice(1));
+    } else {
+      path.push(...legPath);
+    }
+    totalDriveMinutes += (leg.duration?.value || 0) / 60;
+  });
+
+  return { path, totalDriveMinutes };
+}
+
+function requestDirectionsChunk(jobs: Job[]) {
+  if (!window.google?.maps?.DirectionsService) {
+    return Promise.resolve<RoadRouteResult>({
+      path: [],
+      totalDriveMinutes: 0,
+      failedLegs: Math.max(0, jobs.length - 1),
+      status: "DIRECTIONS_SERVICE_UNAVAILABLE",
+    });
+  }
+
+  const request = directionsRequestForChunk(jobs);
+  if (!request) {
+    return Promise.resolve<RoadRouteResult>({
+      path: [],
+      totalDriveMinutes: 0,
+      failedLegs: Math.max(0, jobs.length - 1),
+      status: "INVALID_COORDINATES",
+    });
+  }
+
+  return new Promise<RoadRouteResult>((resolve) => {
     const service = new window.google.maps.DirectionsService();
     service.route(request, (result, status) => {
-      const route = result?.routes?.[0];
-      const leg = route?.legs?.[0];
-      if (status !== window.google.maps.DirectionsStatus.OK || !route || !leg) {
-        resolve(null);
+      if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) {
+        resolve({
+          path: [],
+          totalDriveMinutes: 0,
+          failedLegs: Math.max(0, jobs.length - 1),
+          status: String(status || "UNKNOWN"),
+        });
         return;
       }
 
-      const stepPath = (leg.steps || []).flatMap((step) => step.path || []);
-      const path = stepPath.length > 0 ? stepPath : route.overview_path || [];
-      const legWithTraffic = leg as google.maps.DirectionsLeg & {
-        duration_in_traffic?: google.maps.Duration;
-      };
-      const seconds =
-        legWithTraffic.duration_in_traffic?.value ??
-        leg.duration?.value ??
-        0;
-
+      const routePath = routeResultToPath(result);
       resolve({
-        path,
-        durationMinutes: seconds / 60,
+        ...routePath,
+        failedLegs: routePath.path.length > 0 ? 0 : Math.max(0, jobs.length - 1),
+        status: routePath.path.length > 0 ? "OK" : "NO_GEOMETRY",
       });
     });
   });
-
-  roadLegCache.set(key, promise);
-  return promise;
 }
 
-async function getRoadRouteForJobs(jobs: Job[]): Promise<RoadRouteResult | null> {
-  if (jobs.length < 2) return null;
-  const path: google.maps.LatLng[] = [];
-  let totalDriveMinutes = 0;
-  let failedLegs = 0;
-
-  for (let index = 1; index < jobs.length; index++) {
-    const leg = await getRoadLeg(jobs[index - 1], jobs[index]);
-    if (!leg || leg.path.length === 0) {
-      failedLegs++;
-      continue;
-    }
-
-    totalDriveMinutes += leg.durationMinutes;
-    if (path.length > 0 && leg.path.length > 0) {
-      path.push(...leg.path.slice(1));
-    } else {
-      path.push(...leg.path);
-    }
+async function getRoadRouteForJobs(jobs: Job[]): Promise<RoadRouteResult> {
+  if (jobs.length < 2) {
+    return { path: [], totalDriveMinutes: 0, failedLegs: 0, status: "NO_STOPS" };
   }
 
-  if (path.length === 0) return null;
-  return { path, totalDriveMinutes, failedLegs };
+  const cacheKey = roadRouteCacheKey(jobs);
+  const cached = roadRouteCache.get(cacheKey);
+  if (cached) return cached;
+
+  const promise = (async () => {
+    const path: google.maps.LatLng[] = [];
+    let totalDriveMinutes = 0;
+    let failedLegs = 0;
+    let lastStatus = "OK";
+
+    for (let start = 0; start < jobs.length - 1; start += MAX_DIRECTIONS_STOPS_PER_REQUEST - 1) {
+      const chunk = jobs.slice(start, start + MAX_DIRECTIONS_STOPS_PER_REQUEST);
+      if (chunk.length < 2) break;
+
+      const chunkResult = await requestDirectionsChunk(chunk);
+      if (chunkResult.status !== "OK") {
+        failedLegs += chunkResult.failedLegs;
+        lastStatus = chunkResult.status;
+        continue;
+      }
+
+      totalDriveMinutes += chunkResult.totalDriveMinutes;
+      if (path.length > 0 && chunkResult.path.length > 0) {
+        path.push(...chunkResult.path.slice(1));
+      } else {
+        path.push(...chunkResult.path);
+      }
+    }
+
+    return {
+      path,
+      totalDriveMinutes,
+      failedLegs,
+      status: failedLegs > 0 ? lastStatus : "OK",
+    };
+  })();
+
+  roadRouteCache.set(cacheKey, promise);
+  return promise;
 }
 
 async function calculateRouteMetricsFromRoads(
@@ -231,7 +273,7 @@ async function calculateRouteMetricsFromRoads(
   if (!jobs || jobs.length < 2) return estimated;
 
   const roadRoute = await getRoadRouteForJobs(jobs);
-  if (!roadRoute || roadRoute.failedLegs > 0) return estimated;
+  if (roadRoute.failedLegs > 0 || roadRoute.path.length === 0) return estimated;
 
   const roundedDrive = Math.round(roadRoute.totalDriveMinutes);
   return {
@@ -276,6 +318,25 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
     workMinutes,
     productionValue: getRouteProductionValue(route.stopSequence, jobsById),
   };
+}
+
+function describeDirectionsStatus(status?: string) {
+  if (status === "REQUEST_DENIED") {
+    return "Google rejected the Directions request. Check that the API key has Directions enabled, billing active, and browser referrer restrictions include this domain.";
+  }
+  if (status === "OVER_QUERY_LIMIT") {
+    return "Google rate-limited the Directions request. Try again after a moment or increase the Directions quota.";
+  }
+  if (status === "ZERO_RESULTS") {
+    return "Google could not find a drivable route for at least one stop pair.";
+  }
+  if (status === "INVALID_REQUEST" || status === "INVALID_COORDINATES") {
+    return "One or more stops have invalid coordinates for Directions.";
+  }
+  if (status === "DIRECTIONS_SERVICE_UNAVAILABLE") {
+    return "Google Directions is not available from the loaded Maps JavaScript API.";
+  }
+  return "Google Directions did not return road geometry for this route.";
 }
 
 function escapeHtml(value: unknown) {
@@ -1286,13 +1347,11 @@ export default function RoutesPage() {
         if (roadJobs) {
           void getRoadRouteForJobs(roadJobs).then((roadRoute) => {
             if (cancelled) return;
-            if (!roadRoute || roadRoute.path.length === 0 || roadRoute.failedLegs > 0) {
+            if (roadRoute.path.length === 0 || roadRoute.failedLegs > 0) {
               polyline.setMap(null);
               warnRoadSnapFailure(
                 tr.route.id,
-                roadRoute?.failedLegs
-                  ? `${tr.tech.name}'s ${tr.route.date} route has ${roadRoute.failedLegs} segment(s) that could not be snapped to roads, so the route line is hidden instead of drawing a straight connection.`
-                  : `Could not snap ${tr.tech.name}'s ${tr.route.date} route to roads. Check that Google Directions is enabled for the Maps API key.`,
+                `Could not snap ${tr.tech.name}'s ${tr.route.date} route to roads (${roadRoute.status}). ${describeDirectionsStatus(roadRoute.status)}`,
               );
               return;
             }
