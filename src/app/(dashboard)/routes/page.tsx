@@ -8,10 +8,11 @@ import { TopBar } from "@/components/layout/TopBar";
 import { Button } from "@/components/ui/button";
 import { Route, Job, Technician } from "@/types";
 import { formatTime, cn } from "@/lib/utils";
+import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
   Clock, AlertTriangle, Calendar,
-  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick
+  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick, DollarSign
 } from "lucide-react";
 import { format, addDays } from "date-fns";
 import { toast } from "sonner";
@@ -112,6 +113,14 @@ function getRouteServiceMinutes(stopSequence: string[], jobsById: Record<string,
   }, 0);
 }
 
+function getRouteProductionValue(stopSequence: string[], jobsById: Record<string, Job>) {
+  return stopSequence.reduce((total, jobId) => {
+    const job = jobsById[jobId];
+    const stopValue = job ? calculateStopProductionValue(job).value : null;
+    return total + (stopValue ?? 0);
+  }, 0);
+}
+
 function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
   const routeWithMetrics = route as RouteWithMetrics;
   const estimated = estimateRouteMetrics(route.stopSequence, jobsById);
@@ -128,6 +137,7 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
     driveMinutes,
     serviceMinutes,
     workMinutes,
+    productionValue: getRouteProductionValue(route.stopSequence, jobsById),
   };
 }
 
@@ -148,6 +158,7 @@ function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>) {
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">
       <div><div style="color:#777">Drive</div><div style="font-weight:700">${formatTime(stats.driveMinutes)}</div></div>
       <div><div style="color:#777">At stops</div><div style="font-weight:700">${formatTime(stats.serviceMinutes)}</div></div>
+      <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(stats.productionValue)}</div></div>
       <div style="grid-column:1 / -1;border-top:1px solid #e5e7eb;padding-top:7px">
         <div style="color:#777">Estimated working day</div>
         <div style="font-size:18px;font-weight:800">${formatTime(stats.workMinutes)}</div>
@@ -174,7 +185,7 @@ function RoutePanelStats({ route, jobsById }: {
   const routeWithMetrics = route as RouteWithMetrics;
 
   return (
-    <div className="grid grid-cols-3 gap-1.5 p-2 border-b border-border/40 bg-accent/10">
+    <div className="grid grid-cols-2 gap-1.5 p-2 border-b border-border/40 bg-accent/10">
       <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
         <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Drive</p>
         <p className="text-xs font-semibold text-foreground">{formatTime(stats.driveMinutes)}</p>
@@ -187,8 +198,12 @@ function RoutePanelStats({ route, jobsById }: {
         <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Day</p>
         <p className="text-xs font-semibold text-foreground">{formatTime(stats.workMinutes)}</p>
       </div>
+      <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
+        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Value</p>
+        <p className="text-xs font-semibold text-emerald-400">{formatCurrency(stats.productionValue)}</p>
+      </div>
       {routeWithMetrics.fieldRoutesSync?.uploadedAt && (
-        <p className="col-span-3 text-[10px] text-emerald-400/80 truncate">
+        <p className="col-span-2 text-[10px] text-emerald-400/80 truncate">
           FieldRoutes uploaded · {new Date(routeWithMetrics.fieldRoutesSync.uploadedAt).toLocaleString()}
         </p>
       )}
@@ -210,6 +225,7 @@ function SortableStop({ job, index, color, dragDisabled, clickOrderActive, click
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: job.id, disabled: dragDisabled });
+  const stopProduction = calculateStopProductionValue(job);
   return (
     <div
       ref={setNodeRef}
@@ -248,10 +264,16 @@ function SortableStop({ job, index, color, dragDisabled, clickOrderActive, click
         <ConstraintBadges schedulingRequest={(job as unknown as Record<string, unknown>).schedulingRequest as string} />
       </div>
       <div className="flex items-center gap-0.5 shrink-0">
-        <span className="text-xs text-muted-foreground/50 flex items-center gap-1">
-          <Clock className="w-3 h-3" />
-          {job.duration}m
-        </span>
+        <div className="flex flex-col items-end gap-0.5">
+          <span className="text-xs text-muted-foreground/50 flex items-center gap-1">
+            <Clock className="w-3 h-3" />
+            {job.duration}m
+          </span>
+          <span className="text-xs text-emerald-400/80 flex items-center gap-1" title={stopProduction.explanation}>
+            <DollarSign className="w-3 h-3" />
+            {formatCurrency(stopProduction.value)}
+          </span>
+        </div>
         {(onRemove || moveTargets) && (
           <div className="relative">
             <button
@@ -982,6 +1004,7 @@ export default function RoutesPage() {
             : 0;
         const clickOrderActive = clickReorderRouteId === routeId;
         const routeStats = getRouteDisplayMetrics(tr.route, allJobs);
+        const stopProduction = calculateStopProductionValue(job);
 
         const marker = new window.google.maps.Marker({
           position: pos,
@@ -1014,6 +1037,8 @@ export default function RoutesPage() {
               ${job.serviceType ? `${escapeHtml(job.serviceType)} · ` : ""}${Number(job.duration || 25)} min at stop
             </div>
             <div style="border-top:1px solid #e5e7eb;padding-top:7px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+              <div><div style="color:#777">Stop value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
+              <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(routeStats.productionValue)}</div></div>
               <div><div style="color:#777">Route drive</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>
               <div><div style="color:#777">Full day</div><div style="font-weight:700">${formatTime(routeStats.workMinutes)}</div></div>
             </div>
@@ -1421,14 +1446,18 @@ export default function RoutesPage() {
 
   const handlePrint = (tr: TechRoute) => {
     const jobs = getJobsForRoute(tr);
+    const stats = getRouteDisplayMetrics(tr.route, allJobs);
     const w = window.open("", "_blank");
     if (!w) return;
     w.document.write(`<html><head><title>Route - ${tr.tech.name} - ${tr.route.date}</title>
-      <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a1a;padding:32px;max-width:800px;margin:0 auto}.header{border-bottom:2px solid #2563eb;padding-bottom:16px;margin-bottom:24px}.header h1{font-size:24px;font-weight:700;color:#2563eb}.meta{display:flex;gap:24px;margin-top:8px;color:#6b7280;font-size:14px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px}.stat{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px}.stat .label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}.stat .value{font-size:20px;font-weight:700;margin-top:2px}.stop{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #e5e7eb}.stop:last-child{border-bottom:none}.stop-num{width:28px;height:28px;border-radius:50%;background:#2563eb;color:white;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}.stop-details{flex:1}.stop-name{font-weight:600;font-size:14px}.stop-address{color:#6b7280;font-size:13px;margin-top:2px}.stop-meta{color:#9ca3af;font-size:12px;margin-top:4px}.footer{margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px;text-align:center}</style></head><body>
+      <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a1a;padding:32px;max-width:800px;margin:0 auto}.header{border-bottom:2px solid #2563eb;padding-bottom:16px;margin-bottom:24px}.header h1{font-size:24px;font-weight:700;color:#2563eb}.meta{display:flex;gap:24px;margin-top:8px;color:#6b7280;font-size:14px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}.stat{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px}.stat .label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}.stat .value{font-size:20px;font-weight:700;margin-top:2px}.stop{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #e5e7eb}.stop:last-child{border-bottom:none}.stop-num{width:28px;height:28px;border-radius:50%;background:#2563eb;color:white;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}.stop-details{flex:1}.stop-name{font-weight:600;font-size:14px}.stop-address{color:#6b7280;font-size:13px;margin-top:2px}.stop-meta{color:#9ca3af;font-size:12px;margin-top:4px}.footer{margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px;text-align:center}</style></head><body>
       <div class="header"><h1>RouteIQ</h1><div class="meta"><span><strong>Technician:</strong> ${tr.tech.name}</span><span><strong>Date:</strong> ${tr.route.date}</span><span><strong>Status:</strong> ${tr.route.approved ? "Approved" : "Pending"}</span></div></div>
-      <div class="stats"><div class="stat"><div class="label">Total Stops</div><div class="value">${tr.route.totalStops}</div></div><div class="stat"><div class="label">Drive Time</div><div class="value">${formatTime(tr.route.totalDriveTimeMinutes)}</div></div><div class="stat"><div class="label">Confidence</div><div class="value">${Math.round(tr.route.confidence * 100)}%</div></div></div>
+      <div class="stats"><div class="stat"><div class="label">Total Stops</div><div class="value">${stats.stops}</div></div><div class="stat"><div class="label">Drive Time</div><div class="value">${formatTime(stats.driveMinutes)}</div></div><div class="stat"><div class="label">Working Day</div><div class="value">${formatTime(stats.workMinutes)}</div></div><div class="stat"><div class="label">Route Value</div><div class="value">${formatCurrency(stats.productionValue)}</div></div></div>
       <h2 style="font-size:16px;font-weight:600;margin-bottom:8px">Stop Sequence</h2>
-      ${jobs.map((job, i) => `<div class="stop"><div class="stop-num">${i + 1}</div><div class="stop-details"><div class="stop-name">${job.customerName}</div><div class="stop-address">${job.address}</div><div class="stop-meta">${job.serviceType || ""} ${job.duration ? `· ${job.duration} min` : ""}</div></div></div>`).join("")}
+      ${jobs.map((job, i) => {
+        const stopProduction = calculateStopProductionValue(job);
+        return `<div class="stop"><div class="stop-num">${i + 1}</div><div class="stop-details"><div class="stop-name">${job.customerName}</div><div class="stop-address">${job.address}</div><div class="stop-meta">${job.serviceType || ""} ${job.duration ? `· ${job.duration} min` : ""} · ${formatCurrency(stopProduction.value)} stop value</div></div></div>`;
+      }).join("")}
       <div class="footer">Generated by RouteIQ · ${new Date().toLocaleDateString()}</div></body></html>`);
     w.document.close();
     w.print();
@@ -1437,6 +1466,7 @@ export default function RoutesPage() {
   const handleShare = async (tr: TechRoute) => {
     if (!userProfile?.companyId) return;
     const jobs = getJobsForRoute(tr);
+    const stats = getRouteDisplayMetrics(tr.route, allJobs);
     const token = crypto.randomUUID();
     const expires = new Date();
     expires.setDate(expires.getDate() + 7);
@@ -1450,6 +1480,8 @@ export default function RoutesPage() {
         expiresAt: expires.toISOString(),
         totalStops: tr.route.totalStops,
         totalDriveTimeMinutes: tr.route.totalDriveTimeMinutes,
+        totalWorkMinutes: stats.workMinutes,
+        productionValue: stats.productionValue,
         confidence: tr.route.confidence,
         approved: tr.route.approved,
         stops: jobs.map(j => ({
@@ -1457,6 +1489,10 @@ export default function RoutesPage() {
           address: j.address,
           serviceType: j.serviceType,
           duration: j.duration,
+          productionValue: calculateStopProductionValue(j).value,
+          billingFrequency: j.billingFrequency,
+          recurringFrequency: j.recurringFrequency,
+          recurringPrice: j.recurringPrice,
         })),
       });
 
@@ -1594,7 +1630,7 @@ export default function RoutesPage() {
                 );
               })}
               <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap pl-4">
-                {visibleRoutes.length} routes · {visibleRoutes.reduce((s, r) => s + r.route.totalStops, 0)} stops
+                {visibleRoutes.length} routes · {visibleRoutes.reduce((s, r) => s + r.route.totalStops, 0)} stops · {formatCurrency(visibleRoutes.reduce((total, r) => total + getRouteProductionValue(r.route.stopSequence, allJobs), 0))}
               </span>
             </div>
 
