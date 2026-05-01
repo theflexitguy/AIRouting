@@ -523,7 +523,7 @@ export async function POST(request: NextRequest) {
     const releasedJobIds = new Set<string>();
     const generatedAssignmentByJobId = new Map<
       string,
-      { techId: string; updatedAt: string }
+      { techId: string; createdAt: string }
     >();
     const existingRoutesSnap = await db
       .collection(`companies/${companyId}/routes`)
@@ -545,12 +545,10 @@ export async function POST(request: NextRequest) {
         if (!id) return;
         const jobId = String(id);
         releasedJobIds.add(jobId);
-        if (route.generatedBy === "ai") {
-          generatedAssignmentByJobId.set(jobId, {
-            techId: String(route.techId || ""),
-            updatedAt: String(route.updatedAt || route.createdAt || ""),
-          });
-        }
+        generatedAssignmentByJobId.set(jobId, {
+          techId: String(route.techId || ""),
+          createdAt: String(route.createdAt || route.updatedAt || ""),
+        });
       });
     }
     const replacedRouteCount = routeDocsToReplace.length;
@@ -580,7 +578,7 @@ export async function POST(request: NextRequest) {
       if (!generated) return false;
       return (
         String(d.assignedTechId || "").trim() === generated.techId &&
-        String(d.updatedAt || "") === generated.updatedAt
+        String(d.updatedAt || "") === generated.createdAt
       );
     };
 
@@ -626,6 +624,55 @@ export async function POST(request: NextRequest) {
 
     if (allJobDocs.length === 0) {
       await lockRef.delete().catch(() => {});
+      if (routeDocsToReplace.length > 0) {
+        const now = new Date().toISOString();
+        let cleanupBatch = db.batch();
+        let cleanupOps = 0;
+
+        for (const routeDoc of routeDocsToReplace) {
+          cleanupBatch.delete(routeDoc.ref);
+          cleanupOps++;
+          if (cleanupOps >= 450) {
+            await cleanupBatch.commit();
+            cleanupBatch = db.batch();
+            cleanupOps = 0;
+          }
+        }
+
+        for (const jobId of Array.from(releasedJobIds)) {
+          const releasedJobDoc = releasedJobDocMap.get(jobId);
+          if (!releasedJobDoc) continue;
+          const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
+          cleanupBatch.update(jobRef, {
+            status: "pending",
+            ...(isGeneratedRouteAssignment(releasedJobDoc)
+              ? { assignedTechId: "" }
+              : {}),
+            updatedAt: now,
+          });
+          cleanupOps++;
+          if (cleanupOps >= 450) {
+            await cleanupBatch.commit();
+            cleanupBatch = db.batch();
+            cleanupOps = 0;
+          }
+        }
+
+        if (cleanupOps > 0) {
+          await cleanupBatch.commit();
+        }
+
+        return NextResponse.json({
+          success: true,
+          routeCount: 0,
+          stopCount: 0,
+          warnings: [
+            `Removed ${routeDocsToReplace.length} unapproved route(s) for the selected technician/date range.`,
+            "No pending jobs are assigned to the selected technician(s).",
+          ],
+        });
+      }
+
       return NextResponse.json(
         {
           success: false,
