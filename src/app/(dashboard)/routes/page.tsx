@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, type ReactNode } from "react";
 import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -24,6 +24,7 @@ import {
   KeyboardSensor,
   PointerSensor,
   TouchSensor,
+  useDroppable,
   useSensor,
   useSensors,
   DragEndEvent,
@@ -41,6 +42,66 @@ import { Undo2, Redo2 } from "lucide-react";
 
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
 const NW_ARK = { lat: 36.07, lng: -94.17 };
+const ROUTE_DROP_PREFIX = "route:";
+
+function routeDropId(routeId: string) {
+  return `${ROUTE_DROP_PREFIX}${routeId}`;
+}
+
+function parseRouteDropId(id: string) {
+  return id.startsWith(ROUTE_DROP_PREFIX) ? id.slice(ROUTE_DROP_PREFIX.length) : null;
+}
+
+function toRadians(value: number) {
+  return (value * Math.PI) / 180;
+}
+
+function distanceMiles(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
+  const radiusMiles = 3958.7613;
+  const dLat = toRadians(b.lat - a.lat);
+  const dLng = toRadians(b.lng - a.lng);
+  const lat1 = toRadians(a.lat);
+  const lat2 = toRadians(b.lat);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return radiusMiles * 2 * Math.asin(Math.sqrt(h));
+}
+
+function estimateRouteMetrics(stopSequence: string[], jobsById: Record<string, Job>) {
+  let totalDriveTimeMinutes = 0;
+  let totalServiceMinutes = 0;
+  let previous: Job | null = null;
+
+  for (const jobId of stopSequence) {
+    const job = jobsById[jobId];
+    if (!job) continue;
+
+    totalServiceMinutes += Number(job.duration || 25);
+    if (
+      previous?.lat !== undefined &&
+      previous.lng !== undefined &&
+      job.lat !== undefined &&
+      job.lng !== undefined
+    ) {
+      totalDriveTimeMinutes +=
+        (distanceMiles(
+          { lat: previous.lat, lng: previous.lng },
+          { lat: job.lat, lng: job.lng },
+        ) /
+          30) *
+        60;
+    }
+    previous = job;
+  }
+
+  const roundedDrive = Math.round(totalDriveTimeMinutes);
+  return {
+    totalStops: stopSequence.length,
+    totalDriveTimeMinutes: roundedDrive,
+    totalWorkMinutes: roundedDrive + totalServiceMinutes,
+  };
+}
 
 interface TechRoute {
   route: Route;
@@ -52,8 +113,9 @@ interface TechRoute {
 
 interface StopMenuTarget { routeId: string; techName: string; color: string; date: string; }
 
-function SortableStop({ job, index, color, onRemove, moveTargets, onMoveTo, onHoverStart, onHoverEnd }: {
+function SortableStop({ job, index, color, dragDisabled, onRemove, moveTargets, onMoveTo, onHoverStart, onHoverEnd }: {
   job: Job; index: number; color: string;
+  dragDisabled?: boolean;
   onRemove?: () => void;
   moveTargets?: StopMenuTarget[];
   onMoveTo?: (targetRouteId: string) => void;
@@ -61,7 +123,7 @@ function SortableStop({ job, index, color, onRemove, moveTargets, onMoveTo, onHo
   onHoverEnd?: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: job.id });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: job.id, disabled: dragDisabled });
   return (
     <div
       ref={setNodeRef}
@@ -75,7 +137,14 @@ function SortableStop({ job, index, color, onRemove, moveTargets, onMoveTo, onHo
       onMouseEnter={onHoverStart}
       onMouseLeave={onHoverEnd}
     >
-      <div {...attributes} {...listeners} className="text-muted-foreground/40 hover:text-muted-foreground cursor-grab active:cursor-grabbing touch-none transition-colors">
+      <div
+        {...(!dragDisabled ? attributes : {})}
+        {...(!dragDisabled ? listeners : {})}
+        className={cn(
+          "text-muted-foreground/40 hover:text-muted-foreground touch-none transition-colors",
+          dragDisabled ? "cursor-default" : "cursor-grab active:cursor-grabbing",
+        )}
+      >
         <GripVertical className="w-4 h-4" />
       </div>
       <div
@@ -143,6 +212,29 @@ function SortableStop({ job, index, color, onRemove, moveTargets, onMoveTo, onHo
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function DroppableStopList({ routeId, enabled, children }: {
+  routeId: string;
+  enabled: boolean;
+  children: ReactNode;
+}) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: routeDropId(routeId),
+    disabled: !enabled,
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={cn(
+        "p-2 min-h-20 transition-colors",
+        enabled && isOver && "bg-blue-500/5",
+      )}
+    >
+      {children}
     </div>
   );
 }
@@ -219,40 +311,211 @@ export default function RoutesPage() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
-  const handleDragEnd = async (routeId: string, event: DragEndEvent) => {
+  const { pushEdit, undo, redo, canUndo, canRedo } = useEditHistory();
+
+  // Get unique dates that have routes
+  const routeDates = [...new Set(allRoutes.map((tr) => tr.route.date))].sort();
+  // Routes for selected dates (show all if none specifically selected)
+  const visibleRoutes = selectedDates.length > 0
+    ? allRoutes.filter((tr) => selectedDates.includes(tr.route.date))
+    : allRoutes;
+  const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved);
+
+  const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
+    return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
+  }, [allJobs]);
+
+  const handleMoveStop = useCallback(async (
+    jobId: string,
+    fromRouteId: string,
+    toRouteId: string,
+    insertAfterJobId?: string,
+  ) => {
+    if (!userProfile?.companyId || fromRouteId === toRouteId) return;
+    const fromRoute = allRoutes.find(r => r.route.id === fromRouteId);
+    const toRoute = allRoutes.find(r => r.route.id === toRouteId);
+    if (!fromRoute || !toRoute) return;
+
+    const newFromSeq = fromRoute.route.stopSequence.filter(id => id !== jobId);
+    const newToSeq = toRoute.route.stopSequence.filter(id => id !== jobId);
+    const insertAfterIndex = insertAfterJobId ? newToSeq.indexOf(insertAfterJobId) : -1;
+    if (insertAfterIndex >= 0) {
+      newToSeq.splice(insertAfterIndex + 1, 0, jobId);
+    } else {
+      newToSeq.push(jobId);
+    }
+
+    const fromMetrics = estimateRouteMetrics(newFromSeq, allJobs);
+    const toMetrics = estimateRouteMetrics(newToSeq, allJobs);
+    const previousRoutes = allRoutes;
+
+    setAllRoutes(allRoutes.map(r => {
+      if (r.route.id === fromRouteId) {
+        return {
+          ...r,
+          route: {
+            ...r.route,
+            stopSequence: newFromSeq,
+            totalStops: fromMetrics.totalStops,
+            totalDriveTimeMinutes: fromMetrics.totalDriveTimeMinutes,
+            generatedBy: "human" as const,
+          },
+        };
+      }
+      if (r.route.id === toRouteId) {
+        return {
+          ...r,
+          route: {
+            ...r.route,
+            stopSequence: newToSeq,
+            totalStops: toMetrics.totalStops,
+            totalDriveTimeMinutes: toMetrics.totalDriveTimeMinutes,
+            generatedBy: "human" as const,
+          },
+        };
+      }
+      return r;
+    }));
+
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId), {
+        stopSequence: newFromSeq,
+        totalStops: fromMetrics.totalStops,
+        totalDriveTimeMinutes: fromMetrics.totalDriveTimeMinutes,
+        totalWorkMinutes: fromMetrics.totalWorkMinutes,
+        generatedBy: "human",
+        updatedAt: new Date().toISOString(),
+      });
+      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
+        stopSequence: newToSeq,
+        totalStops: toMetrics.totalStops,
+        totalDriveTimeMinutes: toMetrics.totalDriveTimeMinutes,
+        totalWorkMinutes: toMetrics.totalWorkMinutes,
+        generatedBy: "human",
+        updatedAt: new Date().toISOString(),
+      });
+      batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
+        assignedTechId: toRoute.tech.id,
+        status: "scheduled",
+        updatedAt: new Date().toISOString(),
+      });
+      await batch.commit();
+
+      fetch("/api/record-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: fromRouteId,
+          originalRoute: fromRoute.route,
+          modifiedRoute: { ...fromRoute.route, stopSequence: newFromSeq },
+          modifiedBy: userProfile.email,
+        }),
+      }).catch(() => {});
+      fetch("/api/record-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: toRouteId,
+          originalRoute: toRoute.route,
+          modifiedRoute: { ...toRoute.route, stopSequence: newToSeq },
+          modifiedBy: userProfile.email,
+        }),
+      }).catch(() => {});
+
+      const job = allJobs[jobId];
+      toast.success(`Moved ${job?.customerName || "stop"} → ${toRoute.tech.name}`);
+    } catch (e) {
+      console.error("Move stop error:", e);
+      setAllRoutes(previousRoutes);
+      toast.error("Failed to move stop");
+    }
+  }, [allJobs, allRoutes, userProfile?.companyId, userProfile?.email]);
+
+  const handlePanelDragEnd = useCallback(async (event: DragEndEvent) => {
     const { active, over } = event;
-    if (!over || active.id === over.id || !userProfile?.companyId) return;
+    if (!editMode || !over || active.id === over.id || !userProfile?.companyId) return;
 
-    const tr = allRoutes.find(r => r.route.id === routeId);
-    if (!tr) return;
+    const activeId = String(active.id);
+    const overId = String(over.id);
+    const sourceRoute = allRoutes.find(r => r.route.stopSequence.includes(activeId));
+    if (!sourceRoute) return;
 
-    const oldSeq = tr.route.stopSequence;
-    const oldIdx = oldSeq.indexOf(String(active.id));
-    const newIdx = oldSeq.indexOf(String(over.id));
-    if (oldIdx === -1 || newIdx === -1) return;
+    const droppedRouteId = parseRouteDropId(overId);
+    const targetRoute = droppedRouteId
+      ? allRoutes.find(r => r.route.id === droppedRouteId)
+      : allRoutes.find(r => r.route.stopSequence.includes(overId));
+    if (!targetRoute) return;
+
+    if (sourceRoute.route.id !== targetRoute.route.id) {
+      await handleMoveStop(
+        activeId,
+        sourceRoute.route.id,
+        targetRoute.route.id,
+        droppedRouteId ? undefined : overId,
+      );
+      return;
+    }
+
+    const oldSeq = sourceRoute.route.stopSequence;
+    const oldIdx = oldSeq.indexOf(activeId);
+    const newIdx = oldSeq.indexOf(overId);
+    if (oldIdx === -1 || newIdx === -1 || oldIdx === newIdx) return;
 
     const newSeq = arrayMove(oldSeq, oldIdx, newIdx);
+    const metrics = estimateRouteMetrics(newSeq, allJobs);
+    const previousRoutes = allRoutes;
+
     setAllRoutes(allRoutes.map(r =>
-      r.route.id === routeId
-        ? { ...r, route: { ...r.route, stopSequence: newSeq, generatedBy: "human" as const } }
-        : r
+      r.route.id === sourceRoute.route.id
+        ? {
+            ...r,
+            route: {
+              ...r.route,
+              stopSequence: newSeq,
+              totalStops: metrics.totalStops,
+              totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+              generatedBy: "human" as const,
+            },
+          }
+        : r,
     ));
 
-    // Record feedback for AI learning
-    fetch("/api/record-feedback", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        companyId: userProfile.companyId,
-        routeId,
-        originalRoute: tr.route,
-        modifiedRoute: { ...tr.route, stopSequence: newSeq },
-        modifiedBy: userProfile.email,
-      }),
-    }).catch(() => {});
-  };
-
-  const { undo, redo, canUndo, canRedo } = useEditHistory();
+    try {
+      await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, sourceRoute.route.id), {
+        stopSequence: newSeq,
+        totalStops: metrics.totalStops,
+        totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+        totalWorkMinutes: metrics.totalWorkMinutes,
+        generatedBy: "human",
+        updatedAt: new Date().toISOString(),
+      });
+      pushEdit({
+        type: "reorder",
+        timestamp: Date.now(),
+        description: "Reordered route stops",
+        before: [{ routeId: sourceRoute.route.id, stopSequence: oldSeq, date: sourceRoute.route.date }],
+        after: [{ routeId: sourceRoute.route.id, stopSequence: newSeq, date: sourceRoute.route.date }],
+      });
+      fetch("/api/record-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: sourceRoute.route.id,
+          originalRoute: sourceRoute.route,
+          modifiedRoute: { ...sourceRoute.route, stopSequence: newSeq },
+          modifiedBy: userProfile.email,
+        }),
+      }).catch(() => {});
+    } catch (e) {
+      console.error("Reorder route error:", e);
+      setAllRoutes(previousRoutes);
+      toast.error("Failed to reorder route");
+    }
+  }, [allJobs, allRoutes, editMode, handleMoveStop, pushEdit, userProfile?.companyId, userProfile?.email]);
 
   // Undo/redo keyboard shortcuts
   useEffect(() => {
@@ -276,10 +539,13 @@ export default function RoutesPage() {
     if (!op || !userProfile?.companyId) return;
     // Revert all routes in this operation to their "before" state
     for (const snap of op.before) {
+      const metrics = estimateRouteMetrics(snap.stopSequence, allJobs);
       try {
         await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, snap.routeId), {
           stopSequence: snap.stopSequence,
-          totalStops: snap.stopSequence.length,
+          totalStops: metrics.totalStops,
+          totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+          totalWorkMinutes: metrics.totalWorkMinutes,
           ...(snap.date ? { date: snap.date } : {}),
           updatedAt: new Date().toISOString(),
         });
@@ -292,10 +558,13 @@ export default function RoutesPage() {
     const op = redo();
     if (!op || !userProfile?.companyId) return;
     for (const snap of op.after) {
+      const metrics = estimateRouteMetrics(snap.stopSequence, allJobs);
       try {
         await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, snap.routeId), {
           stopSequence: snap.stopSequence,
-          totalStops: snap.stopSequence.length,
+          totalStops: metrics.totalStops,
+          totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+          totalWorkMinutes: metrics.totalWorkMinutes,
           ...(snap.date ? { date: snap.date } : {}),
           updatedAt: new Date().toISOString(),
         });
@@ -303,14 +572,6 @@ export default function RoutesPage() {
     }
     toast.info(`Redone: ${op.description}`);
   };
-
-  // Get unique dates that have routes
-  const routeDates = [...new Set(allRoutes.map((tr) => tr.route.date))].sort();
-  // Routes for selected dates (show all if none specifically selected)
-  const visibleRoutes = selectedDates.length > 0
-    ? allRoutes.filter((tr) => selectedDates.includes(tr.route.date))
-    : allRoutes;
-  const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved);
 
   useEffect(() => {
     if (!userProfile?.companyId) return;
@@ -401,10 +662,6 @@ export default function RoutesPage() {
     hasFittedBounds.current = false;
   }, [mapLoaded]);
 
-  const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
-    return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
-  }, [allJobs]);
-
   const markerOriginalColors = useRef<Map<string, string>>(new Map());
 
   // Direct DOM + Maps API hover — no React re-renders
@@ -457,6 +714,34 @@ export default function RoutesPage() {
     hoveredStopIdRef.current = jobId;
   }, []);
 
+  const findNearestRouteDropTarget = useCallback((
+    droppedAt: { lat: number; lng: number },
+    sourceRouteId: string,
+    sourceJobId: string,
+  ) => {
+    const zoom = mapInstanceRef.current?.getZoom() ?? 11;
+    const maxDropMiles = zoom >= 14 ? 0.35 : zoom >= 12 ? 0.75 : 1.5;
+    let best: { routeId: string; jobId: string; techName: string; distance: number } | null = null;
+
+    for (const tr of visibleRoutes) {
+      if (tr.route.id === sourceRouteId) continue;
+      for (const targetJob of getJobsForRoute(tr)) {
+        if (targetJob.id === sourceJobId || targetJob.lat === undefined || targetJob.lng === undefined) continue;
+        const distance = distanceMiles(droppedAt, { lat: targetJob.lat, lng: targetJob.lng });
+        if (!best || distance < best.distance) {
+          best = {
+            routeId: tr.route.id,
+            jobId: targetJob.id,
+            techName: tr.tech.name,
+            distance,
+          };
+        }
+      }
+    }
+
+    return best && best.distance <= maxDropMiles ? best : null;
+  }, [getJobsForRoute, visibleRoutes]);
+
   // Update markers and polylines when routes/jobs change (without recreating the map)
   useEffect(() => {
     const map = mapInstanceRef.current;
@@ -487,6 +772,7 @@ export default function RoutesPage() {
         const marker = new window.google.maps.Marker({
           position: pos,
           map,
+          draggable: editMode,
           label: { text: String(idx + 1), color: "white", fontSize: "11px", fontWeight: "bold" },
           icon: {
             path: window.google.maps.SymbolPath.CIRCLE,
@@ -504,6 +790,23 @@ export default function RoutesPage() {
         marker.addListener("mouseout", () => setHoveredStop(null));
 
         const routeId = tr.route.id;
+        marker.addListener("dragstart", () => setHoveredStop(job.id));
+        marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
+          marker.setPosition(pos);
+          setHoveredStop(null);
+          if (!editMode || !event.latLng) return;
+
+          const target = findNearestRouteDropTarget(
+            { lat: event.latLng.lat(), lng: event.latLng.lng() },
+            routeId,
+            job.id,
+          );
+          if (!target) {
+            toast.info("Drop onto another route stop to move it.");
+            return;
+          }
+          await handleMoveStop(job.id, routeId, target.routeId, target.jobId);
+        });
         const infoWindow = new window.google.maps.InfoWindow({
           content: `<div style="color:#000;padding:6px;max-width:240px">
             <b>${job.customerName}</b><br/>
@@ -552,7 +855,7 @@ export default function RoutesPage() {
       map.fitBounds(bounds, 50);
       hasFittedBounds.current = true;
     }
-  }, [visibleRoutes, getJobsForRoute, setHoveredStop]);
+  }, [editMode, findNearestRouteDropTarget, getJobsForRoute, handleMoveStop, setHoveredStop, visibleRoutes]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -733,51 +1036,26 @@ export default function RoutesPage() {
     }
   };
 
-  const handleMoveStop = async (jobId: string, fromRouteId: string, toRouteId: string) => {
-    if (!userProfile?.companyId) return;
-    const fromRoute = allRoutes.find(r => r.route.id === fromRouteId);
-    const toRoute = allRoutes.find(r => r.route.id === toRouteId);
-    if (!fromRoute || !toRoute) return;
-
-    const newFromSeq = fromRoute.route.stopSequence.filter(id => id !== jobId);
-    const newToSeq = [...toRoute.route.stopSequence, jobId];
-
-    // Optimistic update
-    setAllRoutes(allRoutes.map(r => {
-      if (r.route.id === fromRouteId) return { ...r, route: { ...r.route, stopSequence: newFromSeq, totalStops: newFromSeq.length, generatedBy: "human" as const } };
-      if (r.route.id === toRouteId) return { ...r, route: { ...r.route, stopSequence: newToSeq, totalStops: newToSeq.length, generatedBy: "human" as const } };
-      return r;
-    }));
-
-    try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId), {
-        stopSequence: newFromSeq, totalStops: newFromSeq.length, generatedBy: "human", updatedAt: new Date().toISOString(),
-      });
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
-        stopSequence: newToSeq, totalStops: newToSeq.length, generatedBy: "human", updatedAt: new Date().toISOString(),
-      });
-      batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
-        assignedTechId: toRoute.tech.id, updatedAt: new Date().toISOString(),
-      });
-      await batch.commit();
-      const job = allJobs[jobId];
-      toast.success(`Moved ${job?.customerName || "stop"} → ${toRoute.tech.name}`);
-    } catch (e) {
-      console.error("Move stop error:", e);
-      toast.error("Failed to move stop");
-    }
-  };
-
   const handleRemoveStop = async (tr: TechRoute, jobId: string) => {
     if (!userProfile?.companyId) return;
     const job = allJobs[jobId];
     const newSeq = tr.route.stopSequence.filter(id => id !== jobId);
+    const metrics = estimateRouteMetrics(newSeq, allJobs);
+    const previousRoutes = allRoutes;
 
     // Optimistic update
     const updated = allRoutes.map(r =>
       r.route.id === tr.route.id
-        ? { ...r, route: { ...r.route, stopSequence: newSeq, totalStops: newSeq.length, generatedBy: "human" as const } }
+        ? {
+            ...r,
+            route: {
+              ...r.route,
+              stopSequence: newSeq,
+              totalStops: metrics.totalStops,
+              totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+              generatedBy: "human" as const,
+            },
+          }
         : r
     );
     setAllRoutes(updated);
@@ -786,7 +1064,9 @@ export default function RoutesPage() {
       const batch = writeBatch(db);
       batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
         stopSequence: newSeq,
-        totalStops: newSeq.length,
+        totalStops: metrics.totalStops,
+        totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+        totalWorkMinutes: metrics.totalWorkMinutes,
         generatedBy: "human",
         updatedAt: new Date().toISOString(),
       });
@@ -799,6 +1079,7 @@ export default function RoutesPage() {
       toast.success(`Removed ${job?.customerName || "stop"} — returned to pending`);
     } catch (e) {
       console.error("Remove stop error:", e);
+      setAllRoutes(previousRoutes);
       toast.error("Failed to remove stop");
     }
   };
@@ -1024,6 +1305,7 @@ export default function RoutesPage() {
         )}
 
         {/* Main content: left panel + map + right panel */}
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handlePanelDragEnd}>
         <div className="flex-1 overflow-hidden flex min-h-0">
 
           {/* LEFT PANEL — shows route assigned via click or L+click */}
@@ -1048,23 +1330,22 @@ export default function RoutesPage() {
                     <Pencil className="w-2.5 h-2.5" /> Edit mode active
                   </div>
                 )}
-                <div className="p-2">
-                  <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(tr.route.id, e)}>
-                    <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
-                      {panelJobs.map((job, idx) => (
-                        <SortableStop
-                          key={job.id} job={job} index={idx} color={tr.color}
-                          onHoverStart={() => setHoveredStop(job.id)}
-                          onHoverEnd={() => setHoveredStop(null)}
-                          onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
-                          moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
-                          onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
-                        />
-                      ))}
-                    </SortableContext>
-                  </DndContext>
+                <DroppableStopList routeId={tr.route.id} enabled={editMode}>
+                  <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
+                    {panelJobs.map((job, idx) => (
+                      <SortableStop
+                        key={job.id} job={job} index={idx} color={tr.color}
+                        dragDisabled={!editMode}
+                        onHoverStart={() => setHoveredStop(job.id)}
+                        onHoverEnd={() => setHoveredStop(null)}
+                        onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
+                        moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                        onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
+                      />
+                    ))}
+                  </SortableContext>
                   {panelJobs.length === 0 && <p className="text-xs text-muted-foreground/50 text-center py-4">{tr.route.stopSequence.length} stops</p>}
-                </div>
+                </DroppableStopList>
                 {/* Route actions */}
                 <div className="p-2 border-t border-border/40 flex flex-wrap gap-1">
                   {!editMode && (
@@ -1155,23 +1436,22 @@ export default function RoutesPage() {
                     <Pencil className="w-2.5 h-2.5" /> Edit mode active
                   </div>
                 )}
-                <div className="p-2">
-                  <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => handleDragEnd(tr.route.id, e)}>
-                    <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
-                      {panelJobs.map((job, idx) => (
-                        <SortableStop
-                          key={job.id} job={job} index={idx} color={tr.color}
-                          onHoverStart={() => setHoveredStop(job.id)}
-                          onHoverEnd={() => setHoveredStop(null)}
-                          onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
-                          moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
-                          onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
-                        />
-                      ))}
-                    </SortableContext>
-                  </DndContext>
+                <DroppableStopList routeId={tr.route.id} enabled={editMode}>
+                  <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
+                    {panelJobs.map((job, idx) => (
+                      <SortableStop
+                        key={job.id} job={job} index={idx} color={tr.color}
+                        dragDisabled={!editMode}
+                        onHoverStart={() => setHoveredStop(job.id)}
+                        onHoverEnd={() => setHoveredStop(null)}
+                        onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
+                        moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                        onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
+                      />
+                    ))}
+                  </SortableContext>
                   {panelJobs.length === 0 && <p className="text-xs text-muted-foreground/50 text-center py-4">{tr.route.stopSequence.length} stops</p>}
-                </div>
+                </DroppableStopList>
                 <div className="p-2 border-t border-border/40 flex flex-wrap gap-1">
                   {!editMode && (
                     <>
@@ -1191,6 +1471,7 @@ export default function RoutesPage() {
           })()}
 
         </div>
+        </DndContext>
       </div>
     </div>
   );
