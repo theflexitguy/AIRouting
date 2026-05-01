@@ -939,6 +939,15 @@ export default function RoutesPage() {
   };
 
 
+  const shouldClearGeneratedAssignment = (route: Route, job?: Job) => {
+    return (
+      route.generatedBy === "ai" &&
+      Boolean(route.updatedAt) &&
+      job?.assignedTechId === route.techId &&
+      job.updatedAt === route.updatedAt
+    );
+  };
+
   const handleApprove = async (techIndex: number, approved: boolean) => {
     if (!userProfile?.companyId) return;
     const visRoute = visibleRoutes[techIndex];
@@ -956,7 +965,14 @@ export default function RoutesPage() {
         const batch = writeBatch(db);
         for (const jobId of tr.route.stopSequence) {
           const jobRef = doc(db, `companies/${userProfile.companyId}/jobs`, jobId);
-          batch.update(jobRef, { status: "pending", updatedAt: new Date().toISOString() });
+          const job = allJobs[jobId];
+          batch.update(jobRef, {
+            status: "pending",
+            ...(shouldClearGeneratedAssignment(tr.route, job)
+              ? { assignedTechId: "" }
+              : {}),
+            updatedAt: new Date().toISOString(),
+          });
         }
         await batch.commit();
         await deleteDoc(routeRef);
@@ -1019,7 +1035,14 @@ export default function RoutesPage() {
         const batch = writeBatch(db);
         for (const jobId of tr.route.stopSequence) {
           const jobRef = doc(db, `companies/${userProfile.companyId}/jobs`, jobId);
-          batch.update(jobRef, { status: "pending", updatedAt: new Date().toISOString() });
+          const job = allJobs[jobId];
+          batch.update(jobRef, {
+            status: "pending",
+            ...(shouldClearGeneratedAssignment(tr.route, job)
+              ? { assignedTechId: "" }
+              : {}),
+            updatedAt: new Date().toISOString(),
+          });
         }
         await batch.commit();
         await deleteDoc(routeRef);

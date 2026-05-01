@@ -184,6 +184,77 @@ function distanceToCentroid(job: JobDoc, point: { lat: number; lng: number }) {
   return haversineMiles(Number(job.lat), Number(job.lng), point.lat, point.lng);
 }
 
+function getBalancedClusterSizes(totalJobs: number, routeCount: number) {
+  const baseSize = Math.floor(totalJobs / routeCount);
+  const extra = totalJobs % routeCount;
+  return Array.from(
+    { length: routeCount },
+    (_, index) => baseSize + (index < extra ? 1 : 0),
+  );
+}
+
+function splitBySizes(jobs: JobDoc[], sizes: number[]) {
+  const clusters: JobDoc[][] = [];
+  let cursor = 0;
+  for (const size of sizes) {
+    clusters.push(jobs.slice(cursor, cursor + size));
+    cursor += size;
+  }
+  return clusters.filter((cluster) => cluster.length > 0);
+}
+
+function routeClusterCost(jobs: JobDoc[]) {
+  if (jobs.length <= 1) return 0;
+  return routeDriveMinutes(twoOptImprove(orderNearestNeighbor(jobs)));
+}
+
+function partitionCost(clusters: JobDoc[][]) {
+  return clusters.reduce((sum, cluster) => sum + routeClusterCost(cluster), 0);
+}
+
+function principalAxisProjection(jobs: JobDoc[]) {
+  const center = centroid(jobs);
+  const cosLat = Math.cos(toRadians(center.lat));
+  let xx = 0;
+  let yy = 0;
+  let xy = 0;
+
+  for (const job of jobs) {
+    const x = (Number(job.lng) - center.lng) * cosLat;
+    const y = Number(job.lat) - center.lat;
+    xx += x * x;
+    yy += y * y;
+    xy += x * y;
+  }
+
+  const theta = 0.5 * Math.atan2(2 * xy, xx - yy);
+  const vx = Math.cos(theta);
+  const vy = Math.sin(theta);
+
+  return (job: JobDoc) =>
+    (Number(job.lng) - center.lng) * cosLat * vx +
+    (Number(job.lat) - center.lat) * vy;
+}
+
+function addSpatialSweepCandidates(
+  candidates: JobDoc[][][],
+  jobs: JobDoc[],
+  sizes: number[],
+) {
+  const projectAxis = principalAxisProjection(jobs);
+  const sorters: Array<(job: JobDoc) => number> = [
+    (job) => Number(job.lat),
+    (job) => Number(job.lng),
+    projectAxis,
+  ];
+
+  for (const project of sorters) {
+    const asc = [...jobs].sort((a, b) => project(a) - project(b));
+    candidates.push(splitBySizes(asc, sizes));
+    candidates.push(splitBySizes([...asc].reverse(), sizes));
+  }
+}
+
 function clusterJobsForRoutes(
   jobs: JobDoc[],
   routeCount: number,
@@ -219,11 +290,10 @@ function clusterJobsForRoutes(
   }
 
   const clusterCount = seeds.length;
-  const baseSize = Math.floor(jobs.length / clusterCount);
-  const extra = jobs.length % clusterCount;
+  const targetSizes = getBalancedClusterSizes(jobs.length, clusterCount);
   const clusters = seeds.map((seed, index) => ({
     seed,
-    targetSize: Math.min(maxStops, baseSize + (index < extra ? 1 : 0)),
+    targetSize: Math.min(maxStops, targetSizes[index] || maxStops),
     jobs: [] as JobDoc[],
   }));
 
@@ -251,13 +321,21 @@ function clusterJobsForRoutes(
     if (target) target.jobs.push(job);
   }
 
-  return clusters
+  const seededClusters = clusters
     .map((cluster) => cluster.jobs)
-    .filter((clusterJobs) => clusterJobs.length > 0)
+    .filter((clusterJobs) => clusterJobs.length > 0);
+
+  const candidates = [seededClusters];
+  addSpatialSweepCandidates(candidates, jobs, targetSizes);
+
+  return candidates
+    .reduce((best, candidate) =>
+      partitionCost(candidate) < partitionCost(best) ? candidate : best,
+    )
     .sort((a, b) => {
       const ca = centroid(a);
       const cb = centroid(b);
-      return ca.lng === cb.lng ? cb.lat - ca.lat : ca.lng - cb.lng;
+      return cb.lat === ca.lat ? ca.lng - cb.lng : cb.lat - ca.lat;
     });
 }
 
@@ -443,6 +521,10 @@ export async function POST(request: NextRequest) {
     // --- 2. Stage existing unapproved routes in this range for selected techs ---
     const selectedTechIdSet = new Set(selectedTechs.map((t) => t.id));
     const releasedJobIds = new Set<string>();
+    const generatedAssignmentByJobId = new Map<
+      string,
+      { techId: string; updatedAt: string }
+    >();
     const existingRoutesSnap = await db
       .collection(`companies/${companyId}/routes`)
       .where("date", ">=", rangeStart)
@@ -460,7 +542,15 @@ export async function POST(request: NextRequest) {
         ? route.stopSequence
         : [];
       stopSequence.forEach((id) => {
-        if (id) releasedJobIds.add(String(id));
+        if (!id) return;
+        const jobId = String(id);
+        releasedJobIds.add(jobId);
+        if (route.generatedBy === "ai") {
+          generatedAssignmentByJobId.set(jobId, {
+            techId: String(route.techId || ""),
+            updatedAt: String(route.updatedAt || route.createdAt || ""),
+          });
+        }
       });
     }
     const replacedRouteCount = routeDocsToReplace.length;
@@ -485,9 +575,19 @@ export async function POST(request: NextRequest) {
       Array.from(selectedTechNameSet).map(normalizeName),
     );
 
+    const isGeneratedRouteAssignment = (d: JobDoc) => {
+      const generated = generatedAssignmentByJobId.get(d.docId);
+      if (!generated) return false;
+      return (
+        String(d.assignedTechId || "").trim() === generated.techId &&
+        String(d.updatedAt || "") === generated.updatedAt
+      );
+    };
+
     const isJobForSelectedTech = (d: JobDoc) => {
+      if (isGeneratedRouteAssignment(d)) return false;
       const val = String(d.assignedTechId || "").trim();
-      if (!val) return true; // include unassigned
+      if (!val) return false;
       return (
         selectedTechIdSet.has(val) ||
         selectedTechNameSet.has(val.toLowerCase()) ||
@@ -501,6 +601,7 @@ export async function POST(request: NextRequest) {
       .get();
 
     const jobDocMap = new Map<string, JobDoc>();
+    const releasedJobDocMap = new Map<string, JobDoc>();
     allPendingSnap.docs.forEach((doc) => {
       const jobDoc = { docId: doc.id, ...doc.data() } as JobDoc;
       if (isJobForSelectedTech(jobDoc)) jobDocMap.set(doc.id, jobDoc);
@@ -516,6 +617,7 @@ export async function POST(request: NextRequest) {
       snaps.forEach((snap) => {
         if (!snap.exists) return;
         const jobDoc = { docId: snap.id, ...snap.data() } as JobDoc;
+        releasedJobDocMap.set(snap.id, jobDoc);
         if (isJobForSelectedTech(jobDoc)) jobDocMap.set(snap.id, jobDoc);
       });
     }
@@ -527,7 +629,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           success: false,
-          error: "No pending jobs for the selected technician(s)",
+          error: "No pending jobs assigned to the selected technician(s)",
         },
         { status: 404 },
       );
@@ -722,7 +824,6 @@ export async function POST(request: NextRequest) {
     // --- 7. Save routes + mark jobs scheduled ---
     const now = new Date().toISOString();
     const scheduledJobIds = new Set<string>();
-    const scheduledJobTechIds = new Map<string, string>();
     const routeWrites: Array<{
       routeRef: typeof lockRef;
       data: Record<string, unknown>;
@@ -747,7 +848,6 @@ export async function POST(request: NextRequest) {
       stopIds.forEach((id) => {
         if (!id) return;
         scheduledJobIds.add(id);
-        scheduledJobTechIds.set(id, techId);
       });
 
       const routeRef = db
@@ -815,9 +915,12 @@ export async function POST(request: NextRequest) {
     for (const jobId of Array.from(releasedJobIds)) {
       if (scheduledJobIds.has(jobId)) continue;
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
+      const releasedJobDoc = releasedJobDocMap.get(jobId);
       batch.update(jobRef, {
         status: "pending",
-        assignedTechId: "",
+        ...(releasedJobDoc && isGeneratedRouteAssignment(releasedJobDoc)
+          ? { assignedTechId: "" }
+          : {}),
         updatedAt: now,
       });
       batchOps++;
@@ -832,7 +935,6 @@ export async function POST(request: NextRequest) {
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       batch.update(jobRef, {
         status: "scheduled",
-        assignedTechId: scheduledJobTechIds.get(jobId) || "",
         updatedAt: now,
       });
       batchOps++;

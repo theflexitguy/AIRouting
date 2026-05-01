@@ -58,6 +58,7 @@ export interface Route {
   confidence: number; // 0-1
   approved: boolean;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface RouteHistory {
