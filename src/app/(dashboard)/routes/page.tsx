@@ -349,11 +349,15 @@ export default function RoutesPage() {
       });
       setAllRoutes(routes);
 
-      // Auto-select all dates on first load
+      // Keep selected date pills aligned with the currently loaded range.
       const dates = [...new Set(routes.map((r) => r.route.date))].sort();
-      setSelectedDates(prev => prev.length === 0 ? dates : prev);
+      setSelectedDates(prev => {
+        const stillVisible = prev.filter((date) => dates.includes(date));
+        return stillVisible.length > 0 ? stillVisible : dates;
+      });
     }, () => {
       setAllRoutes([]);
+      setSelectedDates([]);
     });
 
     return () => unsubscribe();
