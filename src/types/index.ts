@@ -68,7 +68,17 @@ export interface Route {
   stopSequence: string[]; // array of jobIds in order
   totalDriveTimeMinutes: number;
   totalWorkMinutes?: number;
+  totalServiceMinutes?: number;
   totalStops: number;
+  driveTimeSource?: string;
+  polylineSource?: string;
+  encodedPolyline?: string;
+  routePolyline?: Array<{ lat: number; lng: number }>;
+  polylineStatus?: string;
+  failedRouteSegments?: number;
+  googleRouteOptimizationShadowScore?: number;
+  googleRouteOptimizationRunId?: string;
+  googleRouteOptimizationSummary?: Record<string, unknown>;
   generatedBy: 'human' | 'ai';
   confidence: number; // 0-1
   approved: boolean;

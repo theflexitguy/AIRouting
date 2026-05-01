@@ -5,6 +5,15 @@ export const maxDuration = 300;
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
+import {
+  computeRouteGeometry,
+  computeRouteMatrix,
+  hasGoogleRoutesApiKey,
+  runRouteOptimizationShadow,
+  type MatrixSource,
+  type RouteOptimizationShadowResult,
+  type RoutePoint,
+} from "@/lib/google-routing";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -12,10 +21,6 @@ const BACKEND_URL =
 const DEFAULT_MAX_STOPS = 16;
 const DEFAULT_MAX_DRIVE_MINUTES = 240;
 const JOB_CAP = 500;
-const GOOGLE_MAPS_API_KEY =
-  process.env.GOOGLE_MAPS_API_KEY ||
-  process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
-  "";
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
 
@@ -219,8 +224,18 @@ interface BackendStop {
 interface BackendRoute {
   stops?: BackendStop[];
   totalDriveMinutes?: number;
+  totalServiceMinutes?: number;
   totalWorkMinutes?: number;
   routeName?: string;
+  driveTimeSource?: string;
+  polylineSource?: string;
+  encodedPolyline?: string;
+  routePolyline?: Array<{ lat: number; lng: number }>;
+  polylineStatus?: string;
+  failedRouteSegments?: number;
+  googleRouteOptimizationShadowScore?: number;
+  googleRouteOptimizationRunId?: string;
+  googleRouteOptimizationSummary?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -239,11 +254,15 @@ interface FastRouteBuildResult {
   routes: BackendRoute[];
   deferredJobIds: string[];
   warnings: string[];
+  usedMatrixSources: string[];
+  usedPolylineSources: string[];
 }
 
 type DriveMatrixResult = {
   matrix: number[][];
-  source: "google_traffic" | "fast_estimate";
+  source: MatrixSource;
+  failedElements: number;
+  warnings: string[];
 };
 
 function toRadians(value: number) {
@@ -281,70 +300,14 @@ function routeDriveMinutes(jobs: JobDoc[]) {
   return total;
 }
 
-function fallbackDriveMatrix(jobs: JobDoc[]): number[][] {
-  return jobs.map((from) => jobs.map((to) => (from === to ? 0 : estimateDriveMinutes(from, to))));
-}
-
-async function getDriveMatrix(jobs: JobDoc[]): Promise<DriveMatrixResult> {
-  const fallback = fallbackDriveMatrix(jobs);
-  if (!GOOGLE_MAPS_API_KEY || jobs.length <= 1) {
-    return { matrix: fallback, source: "fast_estimate" };
-  }
-  if (
-    jobs.some(
-      (job) => typeof job.lat !== "number" || typeof job.lng !== "number",
-    )
-  ) {
-    return { matrix: fallback, source: "fast_estimate" };
-  }
-
-  try {
-    const matrix = jobs.map(() => Array(jobs.length).fill(0) as number[]);
-    const maxElements = 100;
-    const originChunkSize = Math.max(1, Math.floor(maxElements / Math.max(1, jobs.length)));
-
-    for (let start = 0; start < jobs.length; start += originChunkSize) {
-      const originJobs = jobs.slice(start, start + originChunkSize);
-      const origins = originJobs.map((job) => `${job.lat},${job.lng}`).join("|");
-      const destinations = jobs.map((job) => `${job.lat},${job.lng}`).join("|");
-      const url = new URL("https://maps.googleapis.com/maps/api/distancematrix/json");
-      url.searchParams.set("origins", origins);
-      url.searchParams.set("destinations", destinations);
-      url.searchParams.set("departure_time", "now");
-      url.searchParams.set("traffic_model", "best_guess");
-      url.searchParams.set("key", GOOGLE_MAPS_API_KEY);
-
-      const res = await fetch(url.toString(), {
-        signal: AbortSignal.timeout(20000),
-      });
-      if (!res.ok) throw new Error(`Distance Matrix HTTP ${res.status}`);
-      const payload = await res.json() as {
-        status?: string;
-        rows?: Array<{ elements?: Array<{ status?: string; duration?: { value?: number }; duration_in_traffic?: { value?: number } }> }>;
-      };
-      if (payload.status && payload.status !== "OK") {
-        throw new Error(`Distance Matrix ${payload.status}`);
-      }
-
-      (payload.rows || []).forEach((row, rowIndex) => {
-        (row.elements || []).forEach((element, colIndex) => {
-          const seconds =
-            element.status === "OK"
-              ? element.duration_in_traffic?.value ?? element.duration?.value
-              : undefined;
-          matrix[start + rowIndex][colIndex] =
-            typeof seconds === "number"
-              ? Math.max(0, seconds / 60)
-              : fallback[start + rowIndex][colIndex];
-        });
-      });
-    }
-
-    return { matrix, source: "google_traffic" };
-  } catch (error) {
-    console.warn("Google Distance Matrix failed; using fast estimates", error);
-    return { matrix: fallback, source: "fast_estimate" };
-  }
+async function getDriveMatrix(jobs: JobDoc[], routeDate?: string): Promise<DriveMatrixResult> {
+  const result = await computeRouteMatrix(jobs, { routeDate });
+  return {
+    matrix: result.matrix,
+    source: result.source,
+    failedElements: result.failedElements,
+    warnings: result.warnings,
+  };
 }
 
 function matrixRouteCost(order: number[], matrix: number[][]) {
@@ -842,6 +805,9 @@ async function buildFastFallbackRoutes({
   const routes: BackendRoute[] = [];
   const deferredJobIds = new Set<string>();
   const constraintDeferrals: Array<{ job: JobDoc; reason: string }> = [];
+  const routeWarnings = new Set<string>();
+  const matrixSources = new Set<string>();
+  const polylineSources = new Set<string>();
   let slotIndex = 0;
 
   for (const tech of selectedTechs) {
@@ -876,12 +842,24 @@ async function buildFastFallbackRoutes({
       const picked = assignment.jobs;
       if (picked.length === 0) continue;
 
-      const matrixResult = await getDriveMatrix(picked);
+      const matrixResult = await getDriveMatrix(picked, slot.date);
+      matrixSources.add(matrixResult.source);
+      matrixResult.warnings.forEach((warning) => routeWarnings.add(warning));
       const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
       const ordered = orderedResult.ordered;
+      const geometryResult = await computeRouteGeometry(ordered, { routeDate: slot.date });
+      polylineSources.add(geometryResult.polylineSource);
+      geometryResult.warnings.forEach((warning) => routeWarnings.add(warning));
       const matrixById = new Map<string, number>();
       picked.forEach((job, idx) => matrixById.set(job.docId, idx));
-      const totalDriveMinutes = orderedResult.totalDriveMinutes;
+      const totalDriveMinutes =
+        geometryResult.driveTimeSource === "routes_api_polyline"
+          ? geometryResult.driveMinutes
+          : orderedResult.totalDriveMinutes;
+      const driveTimeSource =
+        geometryResult.driveTimeSource === "routes_api_polyline"
+          ? geometryResult.driveTimeSource
+          : matrixResult.source;
 
       const stops = ordered.map((job, idx) => {
         const stop: BackendStop = {
@@ -927,23 +905,38 @@ async function buildFastFallbackRoutes({
         date: slot.date,
         techId: slot.tech.id,
         techName: String(slot.tech.name || slot.tech.id),
-        driveTimeSource: matrixResult.source,
+        driveTimeSource,
+        polylineSource: geometryResult.polylineSource,
+        polylineStatus: geometryResult.status,
+        failedRouteSegments: geometryResult.failedSegments,
+        encodedPolyline:
+          geometryResult.polylineSource === "routes_api_polyline"
+            ? geometryResult.encodedPolyline
+            : "",
+        routePolyline:
+          geometryResult.polylineSource === "routes_api_polyline"
+            ? geometryResult.path
+            : [],
         overDriveCap: maxDriveTime > 0 && totalDriveMinutes > maxDriveTime,
       });
     }
   }
 
-  const warnings =
-    constraintDeferrals.length > 0
+  const warnings = [
+    ...Array.from(routeWarnings),
+    ...(constraintDeferrals.length > 0
       ? [
           `${constraintDeferrals.length} job(s) deferred because scheduling notes or route capacity block the available dates. Example: ${String(constraintDeferrals[0].job.customerName || constraintDeferrals[0].job.docId)} (${constraintDeferrals[0].reason}).`,
         ]
-      : [];
+      : []),
+  ];
 
   return {
     routes,
     deferredJobIds: Array.from(deferredJobIds),
     warnings,
+    usedMatrixSources: Array.from(matrixSources),
+    usedPolylineSources: Array.from(polylineSources),
   };
 }
 
@@ -1306,15 +1299,8 @@ export async function POST(request: NextRequest) {
       deferredJobIds?: string[];
     };
 
-    const hasSchedulingBlocks = jobsToRoute.some((job) =>
-      dates.some((routeDate) => !canScheduleJobOnDate(job, routeDate)),
-    );
-    const shouldUseFastFallback =
-      selectedTechs.length > 1 ||
-      jobsToRoute.length > 24 ||
-      numDays > 1 ||
-      hasSchedulingBlocks;
-    if (shouldUseFastFallback) {
+    const shouldUseCustomRouting = true;
+    if (shouldUseCustomRouting) {
       const fastResult = await buildFastFallbackRoutes({
         jobsToRoute,
         selectedTechs,
@@ -1329,13 +1315,14 @@ export async function POST(request: NextRequest) {
         routes: fastResult.routes,
         deferredJobIds: fastResult.deferredJobIds,
         warnings: [
-          GOOGLE_MAPS_API_KEY
-            ? "Used hard tech/date route generation with Google traffic drive times where available."
-            : "Used hard tech/date route generation. Add GOOGLE_MAPS_API_KEY for live traffic drive times.",
+          hasGoogleRoutesApiKey()
+            ? "Used hard tech/date route generation with Routes API matrix drive times and road polylines where available."
+            : "Used hard tech/date route generation. Add GOOGLE_MAPS_API_KEY for Routes API road drive times and polylines.",
           ...fastResult.warnings,
         ],
         summary: {
-          driveTimeSource: GOOGLE_MAPS_API_KEY ? "google_traffic" : "fast_estimate",
+          driveTimeSource: fastResult.usedMatrixSources.join(",") || "haversine_fallback",
+          polylineSource: fastResult.usedPolylineSources.join(",") || "haversine_fallback",
           jobsRequested: jobsToRoute.length,
         },
       };
@@ -1368,7 +1355,8 @@ export async function POST(request: NextRequest) {
             text.slice(0, 300),
           ].filter(Boolean),
           summary: {
-            driveTimeSource: "fast_estimate",
+            driveTimeSource: fastResult.usedMatrixSources.join(",") || "haversine_fallback",
+            polylineSource: fastResult.usedPolylineSources.join(",") || "haversine_fallback",
             jobsRequested: jobsToRoute.length,
           },
         };
@@ -1398,6 +1386,67 @@ export async function POST(request: NextRequest) {
           "No routes generated — check if jobs have valid coordinates",
         ],
       });
+    }
+
+    const shadowVehicleSlots = selectedTechs.flatMap((tech) =>
+      dates.map((routeDate) => ({ date: routeDate, tech })),
+    );
+    let routeOptimizationShadow: RouteOptimizationShadowResult = {
+      status: "disabled",
+      runId: `shadow-${result.runId || Date.now()}`,
+      routeCount: routes.length,
+      warnings: [],
+    };
+
+    try {
+      routeOptimizationShadow = await runRouteOptimizationShadow({
+        runId: `shadow-${result.runId || Date.now()}`,
+        jobs: jobsToRoute.map((job) => ({
+          id: job.docId,
+          lat: typeof job.lat === "number" ? job.lat : null,
+          lng: typeof job.lng === "number" ? job.lng : null,
+          duration: Number(job.duration || 25),
+          assignedTechId: String(job.assignedTechId || ""),
+          allowedVehicleIndices: shadowVehicleSlots
+            .map((slot, index) =>
+              jobAssignedToTech(job, slot.tech) && canScheduleJobOnDate(job, slot.date)
+                ? index
+                : -1,
+            )
+            .filter((index) => index >= 0),
+        })) satisfies RoutePoint[],
+        vehicles: shadowVehicleSlots.map((slot) => ({
+          date: slot.date,
+          techId: slot.tech.id,
+          techName: String((slot.tech as Record<string, unknown>).name || slot.tech.id),
+          maxStops,
+        })),
+        customRoutes: routes.map((route, index) => ({
+          id: String(route.routeName || index),
+          date: String(route.date || ""),
+          techId: String(route.techId || ""),
+          techName: String(route.techName || ""),
+          totalDriveMinutes: Number(route.totalDriveMinutes || 0),
+          totalWorkMinutes: Number(route.totalWorkMinutes || 0),
+          stops: (route.stops || []).map((stop) => ({
+            id: String(stop.id || stop.customerID || ""),
+            lat: typeof stop.lat === "number" ? stop.lat : null,
+            lng: typeof stop.lng === "number" ? stop.lng : null,
+            duration: typeof stop.duration === "number" ? stop.duration : null,
+          })),
+        })),
+        maxStops,
+        maxDriveMinutes: maxDriveTime,
+      });
+    } catch (error) {
+      routeOptimizationShadow = {
+        status: "failed",
+        runId: `shadow-${result.runId || Date.now()}`,
+        routeCount: routes.length,
+        warnings: [
+          `Route Optimization shadow mode failed. ${error instanceof Error ? error.message : String(error)}`,
+        ],
+      };
     }
 
     // --- 7. Save routes + mark jobs scheduled ---
@@ -1449,6 +1498,26 @@ export async function POST(request: NextRequest) {
               Number(route.totalDriveMinutes) ||
               0,
           ),
+          totalServiceMinutes: Math.round(Number(route.totalServiceMinutes) || 0),
+          driveTimeSource: String(route.driveTimeSource || "haversine_fallback"),
+          polylineSource: String(route.polylineSource || "haversine_fallback"),
+          encodedPolyline: String(route.encodedPolyline || ""),
+          routePolyline: Array.isArray(route.routePolyline) ? route.routePolyline : [],
+          polylineStatus: String(route.polylineStatus || ""),
+          failedRouteSegments: Number(route.failedRouteSegments || 0),
+          googleRouteOptimizationRunId: routeOptimizationShadow.runId || "",
+          ...(typeof routeOptimizationShadow.score === "number"
+            ? { googleRouteOptimizationShadowScore: routeOptimizationShadow.score }
+            : {}),
+          googleRouteOptimizationSummary: {
+            status: routeOptimizationShadow.status,
+            score: routeOptimizationShadow.score ?? null,
+            googleDriveMinutes: routeOptimizationShadow.googleDriveMinutes ?? null,
+            customDriveMinutes: routeOptimizationShadow.customDriveMinutes ?? null,
+            routeCount: routeOptimizationShadow.routeCount ?? routes.length,
+            rawStatus: routeOptimizationShadow.rawStatus || "",
+            warnings: routeOptimizationShadow.warnings,
+          },
           maxStopsParam: maxStops,
           maxDriveTimeParam: maxDriveTime,
           confidence: 0.85,
@@ -1566,8 +1635,14 @@ export async function POST(request: NextRequest) {
               `${backendDeferred.size} stop(s) dropped to stay within ${maxDriveTime}-min drive-time cap.`,
             ]
           : []),
+        ...(routeOptimizationShadow.status === "failed"
+          ? routeOptimizationShadow.warnings
+          : []),
       ],
-      summary: result.summary,
+      summary: {
+        ...(result.summary || {}),
+        googleRouteOptimizationShadow: routeOptimizationShadow,
+      },
     });
   } catch (error) {
     try {

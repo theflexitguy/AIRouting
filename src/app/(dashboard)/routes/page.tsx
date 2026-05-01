@@ -46,13 +46,16 @@ const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
 
 interface RoadRouteResult {
-  path: google.maps.LatLng[];
+  path: Array<{ lat: number; lng: number }>;
   totalDriveMinutes: number;
   failedLegs: number;
   status: string;
+  driveTimeSource: string;
+  polylineSource: string;
+  encodedPolyline?: string;
+  warnings?: string[];
 }
 
-const MAX_DIRECTIONS_STOPS_PER_REQUEST = 25;
 const roadRouteCache = new Map<string, Promise<RoadRouteResult>>();
 
 function routeDropId(routeId: string) {
@@ -111,10 +114,26 @@ function estimateRouteMetrics(stopSequence: string[], jobsById: Record<string, J
     totalStops: stopSequence.length,
     totalDriveTimeMinutes: roundedDrive,
     totalWorkMinutes: roundedDrive + totalServiceMinutes,
+    driveTimeSource: "haversine_fallback",
+    polylineSource: "haversine_fallback",
+    encodedPolyline: "",
+    routePolyline: [],
+    polylineStatus: "ESTIMATE_ONLY",
+    failedRouteSegments: Math.max(0, stopSequence.length - 1),
   };
 }
 
-type RouteMetricSummary = ReturnType<typeof estimateRouteMetrics>;
+interface RouteMetricSummary {
+  totalStops: number;
+  totalDriveTimeMinutes: number;
+  totalWorkMinutes: number;
+  driveTimeSource?: string;
+  polylineSource?: string;
+  encodedPolyline?: string;
+  routePolyline?: Array<{ lat: number; lng: number }>;
+  polylineStatus?: string;
+  failedRouteSegments?: number;
+}
 
 function getOrderedJobsWithCoordinates(stopSequence: string[], jobsById: Record<string, Job>) {
   const jobs = stopSequence.map((jobId) => jobsById[jobId]).filter(Boolean) as Job[];
@@ -127,136 +146,77 @@ function getOrderedJobsWithCoordinates(stopSequence: string[], jobsById: Record<
   return jobs;
 }
 
-function jobLatLng(job: Job) {
-  if (typeof job.lat !== "number" || typeof job.lng !== "number") return null;
-  return new window.google.maps.LatLng(job.lat, job.lng);
-}
-
 function roadRouteCacheKey(jobs: Job[]) {
   return jobs
     .map((job) => `${Number(job.lat).toFixed(6)},${Number(job.lng).toFixed(6)}`)
     .join("|");
 }
 
-function directionsRequestForChunk(jobs: Job[]): google.maps.DirectionsRequest | null {
-  if (jobs.length < 2) return null;
-  const origin = jobLatLng(jobs[0]);
-  const destination = jobLatLng(jobs[jobs.length - 1]);
-  if (!origin || !destination) return null;
-
-  return {
-    origin,
-    destination,
-    waypoints: jobs.slice(1, -1).map((job) => ({
-      location: new window.google.maps.LatLng(Number(job.lat), Number(job.lng)),
-      stopover: true,
-    })),
-    optimizeWaypoints: false,
-    travelMode: window.google.maps.TravelMode.DRIVING,
-  };
-}
-
-function routeResultToPath(result: google.maps.DirectionsResult) {
-  const route = result.routes[0];
-  const path: google.maps.LatLng[] = [];
-  let totalDriveMinutes = 0;
-
-  route.legs.forEach((leg) => {
-    const stepPath = (leg.steps || []).flatMap((step) => step.path || []);
-    const legPath = stepPath.length > 0 ? stepPath : route.overview_path || [];
-    if (path.length > 0 && legPath.length > 0) {
-      path.push(...legPath.slice(1));
-    } else {
-      path.push(...legPath);
-    }
-    totalDriveMinutes += (leg.duration?.value || 0) / 60;
-  });
-
-  return { path, totalDriveMinutes };
-}
-
-function requestDirectionsChunk(jobs: Job[]) {
-  if (!window.google?.maps?.DirectionsService) {
-    return Promise.resolve<RoadRouteResult>({
-      path: [],
-      totalDriveMinutes: 0,
-      failedLegs: Math.max(0, jobs.length - 1),
-      status: "DIRECTIONS_SERVICE_UNAVAILABLE",
-    });
-  }
-
-  const request = directionsRequestForChunk(jobs);
-  if (!request) {
-    return Promise.resolve<RoadRouteResult>({
-      path: [],
-      totalDriveMinutes: 0,
-      failedLegs: Math.max(0, jobs.length - 1),
-      status: "INVALID_COORDINATES",
-    });
-  }
-
-  return new Promise<RoadRouteResult>((resolve) => {
-    const service = new window.google.maps.DirectionsService();
-    service.route(request, (result, status) => {
-      if (status !== window.google.maps.DirectionsStatus.OK || !result?.routes?.[0]) {
-        resolve({
-          path: [],
-          totalDriveMinutes: 0,
-          failedLegs: Math.max(0, jobs.length - 1),
-          status: String(status || "UNKNOWN"),
-        });
-        return;
-      }
-
-      const routePath = routeResultToPath(result);
-      resolve({
-        ...routePath,
-        failedLegs: routePath.path.length > 0 ? 0 : Math.max(0, jobs.length - 1),
-        status: routePath.path.length > 0 ? "OK" : "NO_GEOMETRY",
-      });
-    });
-  });
-}
-
-async function getRoadRouteForJobs(jobs: Job[]): Promise<RoadRouteResult> {
+async function getRoadRouteForJobs(jobs: Job[], routeDate?: string): Promise<RoadRouteResult> {
   if (jobs.length < 2) {
-    return { path: [], totalDriveMinutes: 0, failedLegs: 0, status: "NO_STOPS" };
+    return {
+      path: [],
+      totalDriveMinutes: 0,
+      failedLegs: 0,
+      status: "NO_STOPS",
+      driveTimeSource: "haversine_fallback",
+      polylineSource: "haversine_fallback",
+    };
   }
 
-  const cacheKey = roadRouteCacheKey(jobs);
+  const cacheKey = `${routeDate || "now"}::${roadRouteCacheKey(jobs)}`;
   const cached = roadRouteCache.get(cacheKey);
   if (cached) return cached;
 
   const promise = (async () => {
-    const path: google.maps.LatLng[] = [];
-    let totalDriveMinutes = 0;
-    let failedLegs = 0;
-    let lastStatus = "OK";
+    const res = await fetch("/api/route-geometry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        routeDate,
+        jobs: jobs.map((job) => ({
+          id: job.id,
+          lat: job.lat,
+          lng: job.lng,
+          duration: job.duration,
+        })),
+      }),
+    });
 
-    for (let start = 0; start < jobs.length - 1; start += MAX_DIRECTIONS_STOPS_PER_REQUEST - 1) {
-      const chunk = jobs.slice(start, start + MAX_DIRECTIONS_STOPS_PER_REQUEST);
-      if (chunk.length < 2) break;
+    const data = (await res.json().catch(() => null)) as {
+      success?: boolean;
+      path?: Array<{ lat: number; lng: number }>;
+      driveMinutes?: number;
+      status?: string;
+      failedSegments?: number;
+      driveTimeSource?: string;
+      polylineSource?: string;
+      encodedPolyline?: string;
+      warnings?: string[];
+      error?: string;
+    } | null;
 
-      const chunkResult = await requestDirectionsChunk(chunk);
-      if (chunkResult.status !== "OK") {
-        failedLegs += chunkResult.failedLegs;
-        lastStatus = chunkResult.status;
-        continue;
-      }
-
-      totalDriveMinutes += chunkResult.totalDriveMinutes;
-      if (path.length > 0 && chunkResult.path.length > 0) {
-        path.push(...chunkResult.path.slice(1));
-      } else {
-        path.push(...chunkResult.path);
-      }
+    if (!res.ok || !data?.success) {
+      return {
+        path: [],
+        totalDriveMinutes: 0,
+        failedLegs: Math.max(0, jobs.length - 1),
+        status: data?.error || `HTTP_${res.status}`,
+        driveTimeSource: "haversine_fallback",
+        polylineSource: "haversine_fallback",
+        warnings: data?.warnings,
+      };
     }
 
     return {
-      path,
-      totalDriveMinutes,
-      failedLegs,
-      status: failedLegs > 0 ? lastStatus : "OK",
+      path: data.path || [],
+      totalDriveMinutes: Number(data.driveMinutes || 0),
+      failedLegs: Number(data.failedSegments || 0),
+      status: data.status || "OK",
+      driveTimeSource: data.driveTimeSource || "haversine_fallback",
+      polylineSource: data.polylineSource || "haversine_fallback",
+      encodedPolyline: data.encodedPolyline,
+      warnings: data.warnings,
     };
   })();
 
@@ -267,19 +227,36 @@ async function getRoadRouteForJobs(jobs: Job[]): Promise<RoadRouteResult> {
 async function calculateRouteMetricsFromRoads(
   stopSequence: string[],
   jobsById: Record<string, Job>,
+  routeDate?: string,
 ): Promise<RouteMetricSummary> {
   const estimated = estimateRouteMetrics(stopSequence, jobsById);
   const jobs = getOrderedJobsWithCoordinates(stopSequence, jobsById);
   if (!jobs || jobs.length < 2) return estimated;
 
-  const roadRoute = await getRoadRouteForJobs(jobs);
-  if (roadRoute.failedLegs > 0 || roadRoute.path.length === 0) return estimated;
+  const roadRoute = await getRoadRouteForJobs(jobs, routeDate);
+  if (roadRoute.failedLegs > 0 || roadRoute.path.length === 0) {
+    return {
+      ...estimated,
+      driveTimeSource: roadRoute.driveTimeSource,
+      polylineSource: roadRoute.polylineSource,
+      polylineStatus: roadRoute.status,
+      failedRouteSegments: roadRoute.failedLegs,
+      routePolyline: [],
+      encodedPolyline: "",
+    };
+  }
 
   const roundedDrive = Math.round(roadRoute.totalDriveMinutes);
   return {
     totalStops: stopSequence.length,
     totalDriveTimeMinutes: roundedDrive,
     totalWorkMinutes: roundedDrive + getRouteServiceMinutes(stopSequence, jobsById),
+    driveTimeSource: roadRoute.driveTimeSource,
+    polylineSource: roadRoute.polylineSource,
+    polylineStatus: roadRoute.status,
+    failedRouteSegments: roadRoute.failedLegs,
+    routePolyline: roadRoute.path,
+    encodedPolyline: roadRoute.encodedPolyline || "",
   };
 }
 
@@ -320,23 +297,52 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
   };
 }
 
+function applyMetricsToRoute(route: Route, metrics: RouteMetricSummary): RouteWithMetrics {
+  return {
+    ...route,
+    totalStops: metrics.totalStops,
+    totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+    totalWorkMinutes: metrics.totalWorkMinutes,
+    driveTimeSource: metrics.driveTimeSource || route.driveTimeSource || "haversine_fallback",
+    polylineSource: metrics.polylineSource || route.polylineSource || "haversine_fallback",
+    encodedPolyline: metrics.encodedPolyline ?? route.encodedPolyline ?? "",
+    routePolyline: metrics.routePolyline ?? route.routePolyline ?? [],
+    polylineStatus: metrics.polylineStatus || route.polylineStatus || "",
+    failedRouteSegments: metrics.failedRouteSegments ?? route.failedRouteSegments ?? 0,
+  };
+}
+
+function routeMetricUpdateFields(metrics: RouteMetricSummary) {
+  return {
+    totalStops: metrics.totalStops,
+    totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+    totalWorkMinutes: metrics.totalWorkMinutes,
+    driveTimeSource: metrics.driveTimeSource || "haversine_fallback",
+    polylineSource: metrics.polylineSource || "haversine_fallback",
+    encodedPolyline: metrics.encodedPolyline || "",
+    routePolyline: metrics.routePolyline || [],
+    polylineStatus: metrics.polylineStatus || "",
+    failedRouteSegments: metrics.failedRouteSegments || 0,
+  };
+}
+
 function describeDirectionsStatus(status?: string) {
   if (status === "REQUEST_DENIED") {
-    return "Google rejected the Directions request. Check that the API key has Directions enabled, billing active, and browser referrer restrictions include this domain.";
+    return "Google rejected the server Routes API request. Check that the server API key has Routes API enabled and billing active.";
   }
   if (status === "OVER_QUERY_LIMIT") {
-    return "Google rate-limited the Directions request. Try again after a moment or increase the Directions quota.";
+    return "Google rate-limited the Routes API request. Try again after a moment or increase the Routes quota.";
   }
   if (status === "ZERO_RESULTS") {
     return "Google could not find a drivable route for at least one stop pair.";
   }
   if (status === "INVALID_REQUEST" || status === "INVALID_COORDINATES") {
-    return "One or more stops have invalid coordinates for Directions.";
+    return "One or more stops have invalid coordinates for Routes API road geometry.";
   }
-  if (status === "DIRECTIONS_SERVICE_UNAVAILABLE") {
-    return "Google Directions is not available from the loaded Maps JavaScript API.";
+  if (status === "MISSING_GOOGLE_MAPS_API_KEY") {
+    return "The server is missing GOOGLE_MAPS_API_KEY, so road geometry cannot be requested.";
   }
-  return "Google Directions did not return road geometry for this route.";
+  return "Google Routes API did not return road geometry for this route.";
 }
 
 function escapeHtml(value: unknown) {
@@ -644,7 +650,8 @@ export default function RoutesPage() {
   }, []);
 
   const calculateRouteMetrics = useCallback(
-    (stopSequence: string[]) => calculateRouteMetricsFromRoads(stopSequence, allJobs),
+    (stopSequence: string[], routeDate?: string) =>
+      calculateRouteMetricsFromRoads(stopSequence, allJobs, routeDate),
     [allJobs],
   );
 
@@ -669,8 +676,8 @@ export default function RoutesPage() {
     }
 
     const [fromMetrics, toMetrics] = await Promise.all([
-      calculateRouteMetrics(newFromSeq),
-      calculateRouteMetrics(newToSeq),
+      calculateRouteMetrics(newFromSeq, fromRoute.route.date),
+      calculateRouteMetrics(newToSeq, toRoute.route.date),
     ]);
     const previousRoutes = allRoutes;
 
@@ -678,27 +685,21 @@ export default function RoutesPage() {
       if (r.route.id === fromRouteId) {
         return {
           ...r,
-          route: {
+          route: applyMetricsToRoute({
             ...r.route,
             stopSequence: newFromSeq,
-            totalStops: fromMetrics.totalStops,
-            totalDriveTimeMinutes: fromMetrics.totalDriveTimeMinutes,
-            totalWorkMinutes: fromMetrics.totalWorkMinutes,
             generatedBy: "human" as const,
-          },
+          }, fromMetrics),
         };
       }
       if (r.route.id === toRouteId) {
         return {
           ...r,
-          route: {
+          route: applyMetricsToRoute({
             ...r.route,
             stopSequence: newToSeq,
-            totalStops: toMetrics.totalStops,
-            totalDriveTimeMinutes: toMetrics.totalDriveTimeMinutes,
-            totalWorkMinutes: toMetrics.totalWorkMinutes,
             generatedBy: "human" as const,
-          },
+          }, toMetrics),
         };
       }
       return r;
@@ -708,17 +709,13 @@ export default function RoutesPage() {
       const batch = writeBatch(db);
       batch.update(doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId), {
         stopSequence: newFromSeq,
-        totalStops: fromMetrics.totalStops,
-        totalDriveTimeMinutes: fromMetrics.totalDriveTimeMinutes,
-        totalWorkMinutes: fromMetrics.totalWorkMinutes,
+        ...routeMetricUpdateFields(fromMetrics),
         generatedBy: "human",
         updatedAt: new Date().toISOString(),
       });
       batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
         stopSequence: newToSeq,
-        totalStops: toMetrics.totalStops,
-        totalDriveTimeMinutes: toMetrics.totalDriveTimeMinutes,
-        totalWorkMinutes: toMetrics.totalWorkMinutes,
+        ...routeMetricUpdateFields(toMetrics),
         generatedBy: "human",
         updatedAt: new Date().toISOString(),
       });
@@ -792,21 +789,18 @@ export default function RoutesPage() {
     if (oldIdx === -1 || newIdx === -1 || oldIdx === newIdx) return;
 
     const newSeq = arrayMove(oldSeq, oldIdx, newIdx);
-    const metrics = await calculateRouteMetrics(newSeq);
+    const metrics = await calculateRouteMetrics(newSeq, sourceRoute.route.date);
     const previousRoutes = allRoutes;
 
     setAllRoutes(allRoutes.map(r =>
       r.route.id === sourceRoute.route.id
         ? {
             ...r,
-            route: {
+            route: applyMetricsToRoute({
               ...r.route,
               stopSequence: newSeq,
-              totalStops: metrics.totalStops,
-              totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-              totalWorkMinutes: metrics.totalWorkMinutes,
               generatedBy: "human" as const,
-            },
+            }, metrics),
           }
         : r,
     ));
@@ -814,9 +808,7 @@ export default function RoutesPage() {
     try {
       await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, sourceRoute.route.id), {
         stopSequence: newSeq,
-        totalStops: metrics.totalStops,
-        totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-        totalWorkMinutes: metrics.totalWorkMinutes,
+        ...routeMetricUpdateFields(metrics),
         generatedBy: "human",
         updatedAt: new Date().toISOString(),
       });
@@ -882,20 +874,17 @@ export default function RoutesPage() {
       return;
     }
 
-    const metrics = await calculateRouteMetrics(newSeq);
+    const metrics = await calculateRouteMetrics(newSeq, tr.route.date);
     const previousRoutes = allRoutes;
     setAllRoutes(allRoutes.map((route) =>
       route.route.id === routeId
         ? {
             ...route,
-            route: {
+            route: applyMetricsToRoute({
               ...route.route,
               stopSequence: newSeq,
-              totalStops: metrics.totalStops,
-              totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-              totalWorkMinutes: metrics.totalWorkMinutes,
               generatedBy: "human" as const,
-            },
+            }, metrics),
           }
         : route,
     ));
@@ -903,9 +892,7 @@ export default function RoutesPage() {
     try {
       await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, routeId), {
         stopSequence: newSeq,
-        totalStops: metrics.totalStops,
-        totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-        totalWorkMinutes: metrics.totalWorkMinutes,
+        ...routeMetricUpdateFields(metrics),
         generatedBy: "human",
         updatedAt: new Date().toISOString(),
       });
@@ -984,13 +971,11 @@ export default function RoutesPage() {
     if (!op || !userProfile?.companyId) return;
     // Revert all routes in this operation to their "before" state
     for (const snap of op.before) {
-      const metrics = await calculateRouteMetrics(snap.stopSequence);
+      const metrics = await calculateRouteMetrics(snap.stopSequence, snap.date);
       try {
         await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, snap.routeId), {
           stopSequence: snap.stopSequence,
-          totalStops: metrics.totalStops,
-          totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-          totalWorkMinutes: metrics.totalWorkMinutes,
+          ...routeMetricUpdateFields(metrics),
           ...(snap.date ? { date: snap.date } : {}),
           updatedAt: new Date().toISOString(),
         });
@@ -1003,13 +988,11 @@ export default function RoutesPage() {
     const op = redo();
     if (!op || !userProfile?.companyId) return;
     for (const snap of op.after) {
-      const metrics = await calculateRouteMetrics(snap.stopSequence);
+      const metrics = await calculateRouteMetrics(snap.stopSequence, snap.date);
       try {
         await updateDoc(doc(db, `companies/${userProfile.companyId}/routes`, snap.routeId), {
           stopSequence: snap.stopSequence,
-          totalStops: metrics.totalStops,
-          totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-          totalWorkMinutes: metrics.totalWorkMinutes,
+          ...routeMetricUpdateFields(metrics),
           ...(snap.date ? { date: snap.date } : {}),
           updatedAt: new Date().toISOString(),
         });
@@ -1343,26 +1326,44 @@ export default function RoutesPage() {
         });
         mapPolylinesRef.current.push(polyline);
 
-        const roadJobs = getOrderedJobsWithCoordinates(tr.route.stopSequence, allJobs);
-        if (roadJobs) {
-          void getRoadRouteForJobs(roadJobs).then((roadRoute) => {
-            if (cancelled) return;
-            if (roadRoute.path.length === 0 || roadRoute.failedLegs > 0) {
-              polyline.setMap(null);
-              warnRoadSnapFailure(
-                tr.route.id,
-                `Could not snap ${tr.tech.name}'s ${tr.route.date} route to roads (${roadRoute.status}). ${describeDirectionsStatus(roadRoute.status)}`,
-              );
-              return;
-            }
-            polyline.setPath(roadRoute.path);
-          });
+        const storedRoadPath = Array.isArray(tr.route.routePolyline)
+          ? tr.route.routePolyline.filter(
+              (point) =>
+                typeof point.lat === "number" &&
+                Number.isFinite(point.lat) &&
+                typeof point.lng === "number" &&
+                Number.isFinite(point.lng),
+            )
+          : [];
+
+        if (tr.route.polylineSource === "routes_api_polyline" && storedRoadPath.length > 1) {
+          polyline.setPath(storedRoadPath);
         } else {
-          polyline.setMap(null);
-          warnRoadSnapFailure(
-            tr.route.id,
-            `${tr.tech.name}'s ${tr.route.date} route has stops missing coordinates, so the road path could not be drawn.`,
-          );
+          const roadJobs = getOrderedJobsWithCoordinates(tr.route.stopSequence, allJobs);
+          if (roadJobs) {
+            void getRoadRouteForJobs(roadJobs, tr.route.date).then((roadRoute) => {
+              if (cancelled) return;
+              if (
+                roadRoute.path.length === 0 ||
+                roadRoute.failedLegs > 0 ||
+                roadRoute.polylineSource !== "routes_api_polyline"
+              ) {
+                polyline.setMap(null);
+                warnRoadSnapFailure(
+                  tr.route.id,
+                  `Could not snap ${tr.tech.name}'s ${tr.route.date} route to roads (${roadRoute.status}). ${describeDirectionsStatus(roadRoute.status)}`,
+                );
+                return;
+              }
+              polyline.setPath(roadRoute.path);
+            });
+          } else {
+            polyline.setMap(null);
+            warnRoadSnapFailure(
+              tr.route.id,
+              `${tr.tech.name}'s ${tr.route.date} route has stops missing coordinates, so the road path could not be drawn.`,
+            );
+          }
         }
       }
     });
@@ -1642,7 +1643,7 @@ export default function RoutesPage() {
     if (!userProfile?.companyId) return;
     const job = allJobs[jobId];
     const newSeq = tr.route.stopSequence.filter(id => id !== jobId);
-    const metrics = await calculateRouteMetrics(newSeq);
+    const metrics = await calculateRouteMetrics(newSeq, tr.route.date);
     const previousRoutes = allRoutes;
 
     // Optimistic update
@@ -1650,14 +1651,11 @@ export default function RoutesPage() {
       r.route.id === tr.route.id
         ? {
             ...r,
-            route: {
+            route: applyMetricsToRoute({
               ...r.route,
               stopSequence: newSeq,
-              totalStops: metrics.totalStops,
-              totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-              totalWorkMinutes: metrics.totalWorkMinutes,
               generatedBy: "human" as const,
-            },
+            }, metrics),
           }
         : r
     );
@@ -1667,9 +1665,7 @@ export default function RoutesPage() {
       const batch = writeBatch(db);
       batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
         stopSequence: newSeq,
-        totalStops: metrics.totalStops,
-        totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
-        totalWorkMinutes: metrics.totalWorkMinutes,
+        ...routeMetricUpdateFields(metrics),
         generatedBy: "human",
         updatedAt: new Date().toISOString(),
       });
