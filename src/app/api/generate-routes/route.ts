@@ -11,6 +11,10 @@ const BACKEND_URL =
 const DEFAULT_MAX_STOPS = 16;
 const DEFAULT_MAX_DRIVE_MINUTES = 240;
 const JOB_CAP = 500;
+const GOOGLE_MAPS_API_KEY =
+  process.env.GOOGLE_MAPS_API_KEY ||
+  process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
+  "";
 
 function _dateOffset(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
@@ -22,6 +26,123 @@ function _daysBetween(start: string, end: string): number {
   const s = new Date(start + "T00:00:00");
   const e = new Date(end + "T00:00:00");
   return Math.max(1, Math.round((e.getTime() - s.getTime()) / 86400000) + 1);
+}
+
+function daysBetweenDates(a: string, b: string) {
+  if (!a || !b) return 0;
+  const aTime = new Date(a + "T00:00:00").getTime();
+  const bTime = new Date(b + "T00:00:00").getTime();
+  if (!Number.isFinite(aTime) || !Number.isFinite(bTime)) return 0;
+  return Math.round((aTime - bTime) / 86400000);
+}
+
+function normalizeName(s: string) {
+  return s
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function techMatchTokens(tech: Record<string, unknown> & { id: string }) {
+  return [
+    String(tech.id || "").trim(),
+    String(tech.name || "").trim(),
+    String(tech.employeeId || "").trim(),
+    String(tech.fieldRoutesEmployeeId || "").trim(),
+    String(tech.fieldRoutesTechId || "").trim(),
+  ].filter(Boolean);
+}
+
+function jobAssignedToTech(
+  job: JobDoc,
+  tech: Record<string, unknown> & { id: string },
+) {
+  const assigned = String(job.assignedTechId || "").trim();
+  if (!assigned) return false;
+  const assignedNormalized = normalizeName(assigned);
+  return techMatchTokens(tech).some((token) => {
+    return token === assigned || normalizeName(token) === assignedNormalized;
+  });
+}
+
+function serviceFrequencyDays(job: JobDoc) {
+  const raw = String(
+    job.recurringFrequency ||
+      job.serviceFrequency ||
+      job.frequency ||
+      job.subscriptionCategory ||
+      "",
+  ).toLowerCase();
+
+  const everyNumber = raw.match(/every\s+(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months|year|years)/);
+  if (everyNumber) {
+    const value = Number(everyNumber[1]);
+    const unit = everyNumber[2];
+    if (unit.startsWith("day")) return value;
+    if (unit.startsWith("week")) return value * 7;
+    if (unit.startsWith("month")) return value * 30;
+    if (unit.startsWith("year")) return value * 365;
+  }
+
+  if (raw.includes("weekly")) return 7;
+  if (raw.includes("biweekly") || raw.includes("bi-weekly")) return 14;
+  if (raw.includes("monthly") || raw.includes("month")) return 30;
+  if (raw.includes("quarterly") || raw.includes("90")) return 90;
+  if (raw.includes("semi") && raw.includes("annual")) return 180;
+  if (raw.includes("annual") || raw.includes("year")) return 365;
+  return 999;
+}
+
+function serviceFrequencyUrgency(job: JobDoc) {
+  const days = serviceFrequencyDays(job);
+  if (days <= 31) return 9;
+  if (days <= 60) return 6;
+  if (days <= 100) return 3;
+  if (days <= 190) return 2;
+  return 1;
+}
+
+function dateTier(job: JobDoc, rangeStart: string, rangeEnd: string) {
+  const sd = String(job.scheduledDate || "");
+  if (!sd) return 3;
+  if (sd < rangeStart) return 0;
+  if (sd <= rangeEnd) return 1;
+  return 2;
+}
+
+function jobPriorityComparator(rangeStart: string, rangeEnd: string) {
+  return (a: JobDoc, b: JobDoc) => {
+    const tierDiff = dateTier(a, rangeStart, rangeEnd) - dateTier(b, rangeStart, rangeEnd);
+    if (tierDiff !== 0) return tierDiff;
+
+    const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
+    if (dateDiff !== 0) return dateDiff;
+
+    const freqDiff = serviceFrequencyDays(a) - serviceFrequencyDays(b);
+    if (freqDiff !== 0) return freqDiff;
+
+    return String(a.customerName || a.docId).localeCompare(String(b.customerName || b.docId));
+  };
+}
+
+function dateAssignmentPenalty(job: JobDoc, slotDate: string, rangeStart: string, rangeEnd: string) {
+  const sd = String(job.scheduledDate || "");
+  if (!sd) return 25;
+
+  const urgency = serviceFrequencyUrgency(job);
+  const tier = dateTier(job, rangeStart, rangeEnd);
+
+  if (tier === 0) {
+    return Math.max(0, daysBetweenDates(slotDate, rangeStart)) * urgency * 18;
+  }
+  if (tier === 1) {
+    return Math.abs(daysBetweenDates(slotDate, sd)) * urgency * 20;
+  }
+  if (tier === 2) {
+    return Math.abs(daysBetweenDates(slotDate, rangeEnd)) * urgency * 8;
+  }
+  return 25;
 }
 
 interface JobDoc {
@@ -39,6 +160,9 @@ interface JobDoc {
   subscriptionId?: string;
   subscriptionID?: string;
   assignedTechId?: string;
+  recurringFrequency?: string;
+  billingFrequency?: string;
+  subscriptionCategory?: string;
   [key: string]: unknown;
 }
 
@@ -61,6 +185,16 @@ interface RouteSlot {
   tech: Record<string, unknown> & { id: string };
   index: number;
 }
+
+interface SlotAssignment {
+  slot: RouteSlot;
+  jobs: JobDoc[];
+}
+
+type DriveMatrixResult = {
+  matrix: number[][];
+  source: "google_traffic" | "fast_estimate";
+};
 
 function toRadians(value: number) {
   return (value * Math.PI) / 180;
@@ -95,6 +229,168 @@ function routeDriveMinutes(jobs: JobDoc[]) {
     total += estimateDriveMinutes(jobs[i - 1], jobs[i]);
   }
   return total;
+}
+
+function fallbackDriveMatrix(jobs: JobDoc[]): number[][] {
+  return jobs.map((from) => jobs.map((to) => (from === to ? 0 : estimateDriveMinutes(from, to))));
+}
+
+async function getDriveMatrix(jobs: JobDoc[]): Promise<DriveMatrixResult> {
+  const fallback = fallbackDriveMatrix(jobs);
+  if (!GOOGLE_MAPS_API_KEY || jobs.length <= 1) {
+    return { matrix: fallback, source: "fast_estimate" };
+  }
+  if (
+    jobs.some(
+      (job) => typeof job.lat !== "number" || typeof job.lng !== "number",
+    )
+  ) {
+    return { matrix: fallback, source: "fast_estimate" };
+  }
+
+  try {
+    const matrix = jobs.map(() => Array(jobs.length).fill(0) as number[]);
+    const maxElements = 100;
+    const originChunkSize = Math.max(1, Math.floor(maxElements / Math.max(1, jobs.length)));
+
+    for (let start = 0; start < jobs.length; start += originChunkSize) {
+      const originJobs = jobs.slice(start, start + originChunkSize);
+      const origins = originJobs.map((job) => `${job.lat},${job.lng}`).join("|");
+      const destinations = jobs.map((job) => `${job.lat},${job.lng}`).join("|");
+      const url = new URL("https://maps.googleapis.com/maps/api/distancematrix/json");
+      url.searchParams.set("origins", origins);
+      url.searchParams.set("destinations", destinations);
+      url.searchParams.set("departure_time", "now");
+      url.searchParams.set("traffic_model", "best_guess");
+      url.searchParams.set("key", GOOGLE_MAPS_API_KEY);
+
+      const res = await fetch(url.toString(), {
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) throw new Error(`Distance Matrix HTTP ${res.status}`);
+      const payload = await res.json() as {
+        status?: string;
+        rows?: Array<{ elements?: Array<{ status?: string; duration?: { value?: number }; duration_in_traffic?: { value?: number } }> }>;
+      };
+      if (payload.status && payload.status !== "OK") {
+        throw new Error(`Distance Matrix ${payload.status}`);
+      }
+
+      (payload.rows || []).forEach((row, rowIndex) => {
+        (row.elements || []).forEach((element, colIndex) => {
+          const seconds =
+            element.status === "OK"
+              ? element.duration_in_traffic?.value ?? element.duration?.value
+              : undefined;
+          matrix[start + rowIndex][colIndex] =
+            typeof seconds === "number"
+              ? Math.max(0, seconds / 60)
+              : fallback[start + rowIndex][colIndex];
+        });
+      });
+    }
+
+    return { matrix, source: "google_traffic" };
+  } catch (error) {
+    console.warn("Google Distance Matrix failed; using fast estimates", error);
+    return { matrix: fallback, source: "fast_estimate" };
+  }
+}
+
+function matrixRouteCost(order: number[], matrix: number[][]) {
+  let total = 0;
+  for (let i = 1; i < order.length; i++) {
+    total += matrix[order[i - 1]][order[i]];
+  }
+  return total;
+}
+
+function nearestNeighborOrderFromMatrix(matrix: number[][], startIdx: number) {
+  const remaining = Array.from({ length: matrix.length }, (_, idx) => idx);
+  const ordered = [remaining.splice(startIdx, 1)[0]];
+  while (remaining.length > 0) {
+    const last = ordered[ordered.length - 1];
+    let bestRemainingIdx = 0;
+    for (let i = 1; i < remaining.length; i++) {
+      if (matrix[last][remaining[i]] < matrix[last][remaining[bestRemainingIdx]]) {
+        bestRemainingIdx = i;
+      }
+    }
+    ordered.push(remaining.splice(bestRemainingIdx, 1)[0]);
+  }
+  return ordered;
+}
+
+function twoOptImproveMatrix(order: number[], matrix: number[][]) {
+  if (order.length <= 3) return order;
+  let best = [...order];
+  let bestCost = matrixRouteCost(best, matrix);
+  let improved = true;
+  let passes = 0;
+
+  while (improved && passes < 40) {
+    improved = false;
+    passes++;
+    for (let i = 1; i < best.length - 1; i++) {
+      for (let j = i + 1; j < best.length; j++) {
+        const candidate = [
+          ...best.slice(0, i),
+          ...best.slice(i, j + 1).reverse(),
+          ...best.slice(j + 1),
+        ];
+        const cost = matrixRouteCost(candidate, matrix);
+        if (cost + 0.01 < bestCost) {
+          best = candidate;
+          bestCost = cost;
+          improved = true;
+          break;
+        }
+      }
+      if (improved) break;
+    }
+  }
+  return best;
+}
+
+function orderRouteWithMatrix(jobs: JobDoc[], matrix: number[][]) {
+  if (jobs.length <= 2) {
+    const order = jobs.map((_, idx) => idx);
+    return { ordered: jobs, totalDriveMinutes: matrixRouteCost(order, matrix) };
+  }
+
+  const center = centroid(jobs);
+  const starts = new Set<number>();
+  starts.add(
+    jobs.reduce((bestIdx, job, idx) =>
+      distanceToCentroid(job, center) < distanceToCentroid(jobs[bestIdx], center)
+        ? idx
+        : bestIdx,
+    0),
+  );
+  if (jobs.length <= 22) {
+    jobs.forEach((_, idx) => starts.add(idx));
+  } else {
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lat) < Number(jobs[bestIdx].lat) ? idx : bestIdx, 0));
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lat) > Number(jobs[bestIdx].lat) ? idx : bestIdx, 0));
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lng) < Number(jobs[bestIdx].lng) ? idx : bestIdx, 0));
+    starts.add(jobs.reduce((bestIdx, job, idx) => Number(job.lng) > Number(jobs[bestIdx].lng) ? idx : bestIdx, 0));
+  }
+
+  let bestOrder = twoOptImproveMatrix(nearestNeighborOrderFromMatrix(matrix, 0), matrix);
+  let bestCost = matrixRouteCost(bestOrder, matrix);
+  for (const startIdx of starts) {
+    const candidate = twoOptImproveMatrix(nearestNeighborOrderFromMatrix(matrix, startIdx), matrix);
+    const cost = matrixRouteCost(candidate, matrix);
+    if (cost + 0.01 < bestCost) {
+      bestOrder = candidate;
+      bestCost = cost;
+    }
+  }
+
+  return {
+    ordered: bestOrder.map((idx) => jobs[idx]),
+    totalDriveMinutes: bestCost,
+  };
 }
 
 function orderNearestNeighbor(jobs: JobDoc[]) {
@@ -241,96 +537,85 @@ function distanceToCentroid(job: JobDoc, point: { lat: number; lng: number }) {
   return haversineMiles(Number(job.lat), Number(job.lng), point.lat, point.lng);
 }
 
-function getBalancedClusterSizes(totalJobs: number, routeCount: number) {
-  const baseSize = Math.floor(totalJobs / routeCount);
-  const extra = totalJobs % routeCount;
-  return Array.from(
-    { length: routeCount },
-    (_, index) => baseSize + (index < extra ? 1 : 0),
-  );
-}
-
-function splitBySizes(jobs: JobDoc[], sizes: number[]) {
-  const clusters: JobDoc[][] = [];
-  let cursor = 0;
-  for (const size of sizes) {
-    clusters.push(jobs.slice(cursor, cursor + size));
-    cursor += size;
-  }
-  return clusters.filter((cluster) => cluster.length > 0);
-}
-
 function routeClusterCost(jobs: JobDoc[]) {
   if (jobs.length <= 1) return 0;
   return routeDriveMinutes(orderRoute(jobs));
 }
 
-function partitionCost(clusters: JobDoc[][]) {
-  return clusters.reduce((sum, cluster) => sum + routeClusterCost(cluster), 0);
-}
-
-function principalAxisProjection(jobs: JobDoc[]) {
-  const center = centroid(jobs);
-  const cosLat = Math.cos(toRadians(center.lat));
-  let xx = 0;
-  let yy = 0;
-  let xy = 0;
-
-  for (const job of jobs) {
-    const x = (Number(job.lng) - center.lng) * cosLat;
-    const y = Number(job.lat) - center.lat;
-    xx += x * x;
-    yy += y * y;
-    xy += x * y;
-  }
-
-  const theta = 0.5 * Math.atan2(2 * xy, xx - yy);
-  const vx = Math.cos(theta);
-  const vy = Math.sin(theta);
-
-  return (job: JobDoc) =>
-    (Number(job.lng) - center.lng) * cosLat * vx +
-    (Number(job.lat) - center.lat) * vy;
-}
-
-function addSpatialSweepCandidates(
-  candidates: JobDoc[][][],
-  jobs: JobDoc[],
-  sizes: number[],
+function slotAssignmentCost(
+  job: JobDoc,
+  slotJobs: JobDoc[],
+  slotDate: string,
+  rangeStart: string,
+  rangeEnd: string,
 ) {
-  const projectAxis = principalAxisProjection(jobs);
-  const sorters: Array<(job: JobDoc) => number> = [
-    (job) => Number(job.lat),
-    (job) => Number(job.lng),
-    projectAxis,
-  ];
+  const datePenalty = dateAssignmentPenalty(job, slotDate, rangeStart, rangeEnd);
+  if (slotJobs.length === 0) return datePenalty;
 
-  for (const project of sorters) {
-    const asc = [...jobs].sort((a, b) => project(a) - project(b));
-    candidates.push(splitBySizes(asc, sizes));
-    candidates.push(splitBySizes([...asc].reverse(), sizes));
-  }
+  const nearestStopCost = Math.min(
+    ...slotJobs.map((existing) => estimateDriveMinutes(job, existing)),
+  );
+  const balancePenalty = slotJobs.length * 1.5;
+  return datePenalty + nearestStopCost + balancePenalty;
 }
 
-function optimizeRoutePartition(clusters: JobDoc[][], maxStops: number) {
-  let optimized = clusters.map((cluster) => [...cluster]);
-  const costCache = new Map<string, number>();
-  const clusterCost = (cluster: JobDoc[]) => {
-    const key = cluster
-      .map((job) => job.docId)
-      .sort()
-      .join("|");
-    const cached = costCache.get(key);
-    if (cached !== undefined) return cached;
-    const cost = routeClusterCost(cluster);
-    costCache.set(key, cost);
-    return cost;
-  };
+function assignmentCost(
+  assignment: SlotAssignment,
+  rangeStart: string,
+  rangeEnd: string,
+) {
+  const driveCost = routeClusterCost(assignment.jobs);
+  const dateCost = assignment.jobs.reduce(
+    (sum, job) => sum + dateAssignmentPenalty(job, assignment.slot.date, rangeStart, rangeEnd),
+    0,
+  );
+  return driveCost + dateCost;
+}
 
-  let costs = optimized.map(clusterCost);
-  const totalJobs = optimized.reduce((sum, cluster) => sum + cluster.length, 0);
-  const maxPasses = totalJobs <= 120 ? 16 : totalJobs <= 240 ? 8 : 4;
-  const maxEvaluations = totalJobs <= 120 ? 80000 : totalJobs <= 240 ? 45000 : 18000;
+function assignJobsToTechSlots({
+  jobs,
+  slots,
+  maxStops,
+  rangeStart,
+  rangeEnd,
+}: {
+  jobs: JobDoc[];
+  slots: RouteSlot[];
+  maxStops: number;
+  rangeStart: string;
+  rangeEnd: string;
+}) {
+  const assignments: SlotAssignment[] = slots.map((slot) => ({ slot, jobs: [] }));
+  const sortedJobs = [...jobs].sort(jobPriorityComparator(rangeStart, rangeEnd));
+
+  for (const job of sortedJobs) {
+    const target = assignments
+      .filter((assignment) => assignment.jobs.length < maxStops)
+      .map((assignment) => ({
+        assignment,
+        cost: slotAssignmentCost(job, assignment.jobs, assignment.slot.date, rangeStart, rangeEnd),
+      }))
+      .sort((a, b) => a.cost - b.cost)[0]?.assignment;
+    if (target) target.jobs.push(job);
+  }
+
+  return optimizeSlotAssignments(assignments, maxStops, rangeStart, rangeEnd);
+}
+
+function optimizeSlotAssignments(
+  assignments: SlotAssignment[],
+  maxStops: number,
+  rangeStart: string,
+  rangeEnd: string,
+) {
+  let optimized = assignments.map((assignment) => ({
+    slot: assignment.slot,
+    jobs: [...assignment.jobs],
+  }));
+  let costs = optimized.map((assignment) => assignmentCost(assignment, rangeStart, rangeEnd));
+  const totalJobs = optimized.reduce((sum, assignment) => sum + assignment.jobs.length, 0);
+  const maxPasses = totalJobs <= 120 ? 12 : totalJobs <= 240 ? 6 : 3;
+  const maxEvaluations = totalJobs <= 120 ? 50000 : totalJobs <= 240 ? 25000 : 10000;
 
   for (let pass = 0; pass < maxPasses; pass++) {
     let best:
@@ -352,44 +637,50 @@ function optimizeRoutePartition(clusters: JobDoc[][], maxStops: number) {
         const routeB = optimized[bIdx];
         const currentCost = costs[aIdx] + costs[bIdx];
 
-        for (let i = 0; i < routeA.length; i++) {
-          if (routeB.length < maxStops && routeA.length > 1) {
-            const nextA = routeA.filter((_, idx) => idx !== i);
-            const nextB = [...routeB, routeA[i]];
-            const nextACost = clusterCost(nextA);
-            const nextBCost = clusterCost(nextB);
+        for (let i = 0; i < routeA.jobs.length; i++) {
+          if (routeB.jobs.length < maxStops && routeA.jobs.length > 1) {
+            const nextAJobs = routeA.jobs.filter((_, idx) => idx !== i);
+            const nextBJobs = [...routeB.jobs, routeA.jobs[i]];
+            const nextA = { slot: routeA.slot, jobs: nextAJobs };
+            const nextB = { slot: routeB.slot, jobs: nextBJobs };
+            const nextACost = assignmentCost(nextA, rangeStart, rangeEnd);
+            const nextBCost = assignmentCost(nextB, rangeStart, rangeEnd);
             const delta = currentCost - nextACost - nextBCost;
             evaluations++;
             if (delta > (best?.delta ?? 0)) {
-              best = { delta, aIdx, bIdx, nextA, nextB, nextACost, nextBCost };
+              best = { delta, aIdx, bIdx, nextA: nextAJobs, nextB: nextBJobs, nextACost, nextBCost };
             }
           }
 
-          for (let j = 0; j < routeB.length; j++) {
-            const nextA = routeA.map((job, idx) => (idx === i ? routeB[j] : job));
-            const nextB = routeB.map((job, idx) => (idx === j ? routeA[i] : job));
-            const nextACost = clusterCost(nextA);
-            const nextBCost = clusterCost(nextB);
+          for (let j = 0; j < routeB.jobs.length; j++) {
+            const nextAJobs = routeA.jobs.map((job, idx) => (idx === i ? routeB.jobs[j] : job));
+            const nextBJobs = routeB.jobs.map((job, idx) => (idx === j ? routeA.jobs[i] : job));
+            const nextA = { slot: routeA.slot, jobs: nextAJobs };
+            const nextB = { slot: routeB.slot, jobs: nextBJobs };
+            const nextACost = assignmentCost(nextA, rangeStart, rangeEnd);
+            const nextBCost = assignmentCost(nextB, rangeStart, rangeEnd);
             const delta = currentCost - nextACost - nextBCost;
             evaluations++;
             if (delta > (best?.delta ?? 0)) {
-              best = { delta, aIdx, bIdx, nextA, nextB, nextACost, nextBCost };
+              best = { delta, aIdx, bIdx, nextA: nextAJobs, nextB: nextBJobs, nextACost, nextBCost };
             }
             if (evaluations >= maxEvaluations) break;
           }
           if (evaluations >= maxEvaluations) break;
         }
 
-        if (routeA.length < maxStops && routeB.length > 1) {
-          for (let j = 0; j < routeB.length; j++) {
-            const nextA = [...routeA, routeB[j]];
-            const nextB = routeB.filter((_, idx) => idx !== j);
-            const nextACost = clusterCost(nextA);
-            const nextBCost = clusterCost(nextB);
+        if (routeA.jobs.length < maxStops && routeB.jobs.length > 1) {
+          for (let j = 0; j < routeB.jobs.length; j++) {
+            const nextAJobs = [...routeA.jobs, routeB.jobs[j]];
+            const nextBJobs = routeB.jobs.filter((_, idx) => idx !== j);
+            const nextA = { slot: routeA.slot, jobs: nextAJobs };
+            const nextB = { slot: routeB.slot, jobs: nextBJobs };
+            const nextACost = assignmentCost(nextA, rangeStart, rangeEnd);
+            const nextBCost = assignmentCost(nextB, rangeStart, rangeEnd);
             const delta = currentCost - nextACost - nextBCost;
             evaluations++;
             if (delta > (best?.delta ?? 0)) {
-              best = { delta, aIdx, bIdx, nextA, nextB, nextACost, nextBCost };
+              best = { delta, aIdx, bIdx, nextA: nextAJobs, nextB: nextBJobs, nextACost, nextBCost };
             }
             if (evaluations >= maxEvaluations) break;
           }
@@ -401,10 +692,10 @@ function optimizeRoutePartition(clusters: JobDoc[][], maxStops: number) {
     }
 
     if (!best || best.delta < 0.25) break;
-    optimized = optimized.map((cluster, idx) => {
-      if (idx === best.aIdx) return best.nextA;
-      if (idx === best.bIdx) return best.nextB;
-      return cluster;
+    optimized = optimized.map((assignment, idx) => {
+      if (idx === best.aIdx) return { slot: assignment.slot, jobs: best.nextA };
+      if (idx === best.bIdx) return { slot: assignment.slot, jobs: best.nextB };
+      return assignment;
     });
     costs = costs.map((cost, idx) => {
       if (idx === best.aIdx) return best.nextACost;
@@ -413,170 +704,112 @@ function optimizeRoutePartition(clusters: JobDoc[][], maxStops: number) {
     });
   }
 
-  return optimized.filter((cluster) => cluster.length > 0);
+  return optimized;
 }
 
-function clusterJobsForRoutes(
-  jobs: JobDoc[],
-  routeCount: number,
-  maxStops: number,
-) {
-  if (jobs.length === 0) return [];
-  if (routeCount <= 1) return [jobs.slice(0, maxStops)];
-
-  const allCenter = centroid(jobs);
-  const seeds: JobDoc[] = [];
-  const firstSeed = jobs.reduce(
-    (best, job) =>
-      distanceToCentroid(job, allCenter) > distanceToCentroid(best, allCenter)
-        ? job
-        : best,
-    jobs[0],
-  );
-  seeds.push(firstSeed);
-
-  while (seeds.length < routeCount) {
-    const nextSeed = jobs.reduce((best, job) => {
-      if (seeds.includes(job)) return best;
-      const nearestSeedDistance = Math.min(
-        ...seeds.map((seed) => estimateDriveMinutes(job, seed)),
-      );
-      const bestDistance = seeds.includes(best)
-        ? -1
-        : Math.min(...seeds.map((seed) => estimateDriveMinutes(best, seed)));
-      return nearestSeedDistance > bestDistance ? job : best;
-    }, jobs[0]);
-    if (seeds.includes(nextSeed)) break;
-    seeds.push(nextSeed);
-  }
-
-  const clusterCount = seeds.length;
-  const targetSizes = getBalancedClusterSizes(jobs.length, clusterCount);
-  const clusters = seeds.map((seed, index) => ({
-    seed,
-    targetSize: Math.min(maxStops, targetSizes[index] || maxStops),
-    jobs: [] as JobDoc[],
-  }));
-
-  const assignmentOrder = [...jobs].sort((a, b) => {
-    const aDistances = seeds
-      .map((seed) => estimateDriveMinutes(a, seed))
-      .sort((x, y) => x - y);
-    const bDistances = seeds
-      .map((seed) => estimateDriveMinutes(b, seed))
-      .sort((x, y) => x - y);
-    const aGap = (aDistances[1] ?? aDistances[0] ?? 0) - (aDistances[0] ?? 0);
-    const bGap = (bDistances[1] ?? bDistances[0] ?? 0) - (bDistances[0] ?? 0);
-    return bGap - aGap;
-  });
-
-  for (const job of assignmentOrder) {
-    const candidates = clusters
-      .filter((cluster) => cluster.jobs.length < cluster.targetSize)
-      .sort(
-        (a, b) =>
-          estimateDriveMinutes(job, a.seed) - estimateDriveMinutes(job, b.seed),
-      );
-    const target =
-      candidates[0] || clusters.find((c) => c.jobs.length < maxStops);
-    if (target) target.jobs.push(job);
-  }
-
-  const seededClusters = clusters
-    .map((cluster) => cluster.jobs)
-    .filter((clusterJobs) => clusterJobs.length > 0);
-
-  const candidates = [seededClusters];
-  addSpatialSweepCandidates(candidates, jobs, targetSizes);
-
-  const bestCandidate = candidates
-    .reduce((best, candidate) =>
-      partitionCost(candidate) < partitionCost(best) ? candidate : best,
-    );
-
-  return optimizeRoutePartition(bestCandidate, maxStops)
-    .sort((a, b) => {
-      const ca = centroid(a);
-      const cb = centroid(b);
-      return cb.lat === ca.lat ? ca.lng - cb.lng : cb.lat - ca.lat;
-    });
-}
-
-function buildFastFallbackRoutes({
+async function buildFastFallbackRoutes({
   jobsToRoute,
   selectedTechs,
   dates,
   maxStops,
   maxDriveTime,
+  rangeStart,
+  rangeEnd,
 }: {
   jobsToRoute: JobDoc[];
   selectedTechs: Array<Record<string, unknown> & { id: string }>;
   dates: string[];
   maxStops: number;
   maxDriveTime: number;
-}): BackendRoute[] {
-  const slots: RouteSlot[] = [];
-  for (const date of dates) {
-    for (const tech of selectedTechs) {
-      slots.push({ date, tech, index: slots.length });
+  rangeStart: string;
+  rangeEnd: string;
+}): Promise<BackendRoute[]> {
+  const routes: BackendRoute[] = [];
+  let slotIndex = 0;
+
+  for (const tech of selectedTechs) {
+    const techJobs = jobsToRoute.filter((job) => jobAssignedToTech(job, tech));
+    if (techJobs.length === 0) {
+      slotIndex += dates.length;
+      continue;
+    }
+
+    const techSlots = dates.map((routeDate, dateIndex) => ({
+      date: routeDate,
+      tech,
+      index: slotIndex + dateIndex,
+    }));
+    slotIndex += dates.length;
+
+    const assignments = assignJobsToTechSlots({
+      jobs: techJobs,
+      slots: techSlots,
+      maxStops,
+      rangeStart,
+      rangeEnd,
+    });
+
+    for (const assignment of assignments) {
+      const slot = assignment.slot;
+      const picked = assignment.jobs;
+      if (picked.length === 0) continue;
+
+      const matrixResult = await getDriveMatrix(picked);
+      const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
+      const ordered = orderedResult.ordered;
+      const matrixById = new Map<string, number>();
+      picked.forEach((job, idx) => matrixById.set(job.docId, idx));
+      const totalDriveMinutes = orderedResult.totalDriveMinutes;
+
+      const stops = ordered.map((job, idx) => {
+        const stop: BackendStop = {
+          id: job.docId,
+          customerID: job.docId,
+          subscriptionID: String(job.subscriptionId || job.subscriptionID || job.docId),
+          sequence: idx + 1,
+          duration: Number(job.duration || 25),
+          lat: job.lat,
+          lng: job.lng,
+          customerName: String(job.customerName || ""),
+          address: String(job.address || ""),
+          serviceType: String(job.serviceType || ""),
+          serviceDue: String(job.scheduledDate || slot.date),
+          recurringFrequency: String(job.recurringFrequency || ""),
+          billingFrequency: String(job.billingFrequency || ""),
+        };
+        if (idx > 0) {
+          const prevIdx = matrixById.get(ordered[idx - 1].docId);
+          const currentIdx = matrixById.get(job.docId);
+          const legMinutes =
+            prevIdx !== undefined && currentIdx !== undefined
+              ? matrixResult.matrix[prevIdx][currentIdx]
+              : estimateDriveMinutes(ordered[idx - 1], job);
+          stop.driveMinutesFromPrev = Math.round(legMinutes * 10) / 10;
+        }
+        return stop;
+      });
+
+      const totalServiceMinutes = ordered.reduce(
+        (sum, job) => sum + Number(job.duration || 25),
+        0,
+      );
+
+      routes.push({
+        routeName: `${String(slot.tech.name || "Route")} ${slot.date}`,
+        routeIndex: slot.index,
+        totalDriveMinutes: Math.round(totalDriveMinutes * 10) / 10,
+        totalServiceMinutes,
+        totalWorkMinutes:
+          Math.round((totalDriveMinutes + totalServiceMinutes) * 10) / 10,
+        stops,
+        date: slot.date,
+        techId: slot.tech.id,
+        techName: String(slot.tech.name || slot.tech.id),
+        driveTimeSource: matrixResult.source,
+        overDriveCap: maxDriveTime > 0 && totalDriveMinutes > maxDriveTime,
+      });
     }
   }
-
-  const neededRoutes = Math.max(1, Math.ceil(jobsToRoute.length / maxStops));
-  const routeCount = Math.min(slots.length, neededRoutes);
-  const clusters = clusterJobsForRoutes(jobsToRoute, routeCount, maxStops);
-  const routes: BackendRoute[] = [];
-
-  clusters.forEach((picked, index) => {
-    const slot = slots[index];
-    if (!slot) return;
-    if (picked.length === 0) return;
-
-    const ordered = orderRoute(picked);
-    const totalDriveMinutes = routeDriveMinutes(ordered);
-
-    const stops = ordered.map((job, idx) => {
-      const stop: BackendStop = {
-        id: job.docId,
-        customerID: job.docId,
-        subscriptionID: String(job.subscriptionId || job.subscriptionID || job.docId),
-        sequence: idx + 1,
-        duration: Number(job.duration || 25),
-        lat: job.lat,
-        lng: job.lng,
-        customerName: String(job.customerName || ""),
-        address: String(job.address || ""),
-        serviceType: String(job.serviceType || ""),
-        serviceDue: String(job.scheduledDate || slot.date),
-      };
-      if (idx > 0) {
-        stop.driveMinutesFromPrev = Math.round(
-          estimateDriveMinutes(ordered[idx - 1], job) * 10,
-        ) / 10;
-      }
-      return stop;
-    });
-
-    const totalServiceMinutes = ordered.reduce(
-      (sum, job) => sum + Number(job.duration || 25),
-      0,
-    );
-
-    routes.push({
-      routeName: `${String(slot.tech.name || "Route")} ${slot.date}`,
-      routeIndex: slot.index,
-      totalDriveMinutes: Math.round(totalDriveMinutes * 10) / 10,
-      totalServiceMinutes,
-      totalWorkMinutes:
-        Math.round((totalDriveMinutes + totalServiceMinutes) * 10) / 10,
-      stops,
-      date: slot.date,
-      techId: slot.tech.id,
-      techName: String(slot.tech.name || slot.tech.id),
-      driveTimeSource: "fast_estimate",
-      overDriveCap: maxDriveTime > 0 && totalDriveMinutes > maxDriveTime,
-    });
-  });
 
   return routes;
 }
@@ -716,26 +949,7 @@ export async function POST(request: NextRequest) {
     }
     const replacedRouteCount = routeDocsToReplace.length;
 
-    // --- 3. Fetch pending jobs for selected techs (or unassigned) ---
-    const selectedTechNameSet = new Set(
-      selectedTechs
-        .map((t) =>
-          String((t as Record<string, unknown>).name || "")
-            .trim()
-            .toLowerCase(),
-        )
-        .filter(Boolean),
-    );
-    const normalizeName = (s: string) =>
-      s
-        .toLowerCase()
-        .replace(/['"]/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
-    const selectedTechNamesNormalized = new Set(
-      Array.from(selectedTechNameSet).map(normalizeName),
-    );
-
+    // --- 3. Fetch pending jobs for selected techs ---
     const isGeneratedRouteAssignment = (d: JobDoc) => {
       const generated = generatedAssignmentByJobId.get(d.docId);
       if (!generated) return false;
@@ -747,13 +961,7 @@ export async function POST(request: NextRequest) {
 
     const isJobForSelectedTech = (d: JobDoc) => {
       if (isGeneratedRouteAssignment(d)) return false;
-      const val = String(d.assignedTechId || "").trim();
-      if (!val) return false;
-      return (
-        selectedTechIdSet.has(val) ||
-        selectedTechNameSet.has(val.toLowerCase()) ||
-        selectedTechNamesNormalized.has(normalizeName(val))
-      );
+      return selectedTechs.some((tech) => jobAssignedToTech(d, tech));
     };
 
     const allPendingSnap = await db
@@ -845,7 +1053,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // --- 3. Tiered selection: overdue → in-window → future ---
+    // --- 4. Tiered selection: overdue → in-window → future → no-date.
     // scheduledDate is normalized to YYYY-MM-DD, so lexicographic sort equals chronological sort.
     const overdue: JobDoc[] = [];
     const inWindow: JobDoc[] = [];
@@ -863,23 +1071,30 @@ export async function POST(request: NextRequest) {
       else future.push(j);
     }
 
-    const byDateAsc = (a: JobDoc, b: JobDoc) =>
-      String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
-    overdue.sort(byDateAsc);
-    inWindow.sort(byDateAsc);
-    future.sort(byDateAsc);
-
-    // Tier order: in-window first for the date range the user explicitly chose,
-    // then overdue/future/no-date only if there is leftover capacity.
-    const tieredPool = [...inWindow, ...overdue, ...future, ...noDate];
-
-    // --- 4. Capacity calculation ---
     const numDays = _daysBetween(rangeStart, rangeEnd);
     const totalSlots = selectedTechs.length * numDays;
     const capacity = Math.min(JOB_CAP, totalSlots * maxStops);
+    const perTechCapacity = numDays * maxStops;
+    const prioritySort = jobPriorityComparator(rangeStart, rangeEnd);
 
-    const jobsToRoute = tieredPool.slice(0, capacity);
-    const jobsDeferred = tieredPool.length - jobsToRoute.length;
+    const selectedByTech = new Map<string, JobDoc[]>();
+    const deferredByTech = new Map<string, JobDoc[]>();
+    for (const tech of selectedTechs) {
+      const techJobs = allJobDocs
+        .filter((job) => jobAssignedToTech(job, tech))
+        .sort(prioritySort);
+      selectedByTech.set(tech.id, techJobs.slice(0, perTechCapacity));
+      deferredByTech.set(tech.id, techJobs.slice(perTechCapacity));
+    }
+
+    let jobsToRoute = selectedTechs.flatMap((tech) => selectedByTech.get(tech.id) || []);
+    let capacityDeferred = selectedTechs.flatMap((tech) => deferredByTech.get(tech.id) || []);
+    if (jobsToRoute.length > capacity) {
+      jobsToRoute = jobsToRoute.sort(prioritySort);
+      capacityDeferred = [...jobsToRoute.slice(capacity), ...capacityDeferred];
+      jobsToRoute = jobsToRoute.slice(0, capacity);
+    }
+    const jobsDeferred = capacityDeferred.length;
 
     const selectedOverdueCount = jobsToRoute.filter((j) => {
       const sd = String(j.scheduledDate || "");
@@ -933,6 +1148,8 @@ export async function POST(request: NextRequest) {
       duration: Number(d.duration || 25),
       serviceType: String(d.serviceType || ""),
       customerName: String(d.customerName || ""),
+      recurringFrequency: String(d.recurringFrequency || ""),
+      billingFrequency: String(d.billingFrequency || ""),
     }));
 
     const dates: string[] = [];
@@ -956,22 +1173,27 @@ export async function POST(request: NextRequest) {
       deferredJobIds?: string[];
     };
 
-    const shouldUseFastFallback = jobsToRoute.length > 24 || numDays > 1;
+    const shouldUseFastFallback = selectedTechs.length > 1 || jobsToRoute.length > 24 || numDays > 1;
     if (shouldUseFastFallback) {
+      const fastRoutes = await buildFastFallbackRoutes({
+        jobsToRoute,
+        selectedTechs,
+        dates,
+        maxStops,
+        maxDriveTime,
+        rangeStart,
+        rangeEnd,
+      });
       result = {
         runId: `fast-${Date.now()}`,
-        routes: buildFastFallbackRoutes({
-          jobsToRoute,
-          selectedTechs,
-          dates,
-          maxStops,
-          maxDriveTime,
-        }),
+        routes: fastRoutes,
         warnings: [
-          "Used fast route generation for this multi-day or large batch. Drive times are estimates.",
+          GOOGLE_MAPS_API_KEY
+            ? "Used hard tech/date route generation with Google traffic drive times where available."
+            : "Used hard tech/date route generation. Add GOOGLE_MAPS_API_KEY for live traffic drive times.",
         ],
         summary: {
-          driveTimeSource: "fast_estimate",
+          driveTimeSource: GOOGLE_MAPS_API_KEY ? "google_traffic" : "fast_estimate",
           jobsRequested: jobsToRoute.length,
         },
       };
@@ -985,15 +1207,18 @@ export async function POST(request: NextRequest) {
 
       if (!backendRes.ok) {
         const text = await backendRes.text();
+        const fastRoutes = await buildFastFallbackRoutes({
+          jobsToRoute,
+          selectedTechs,
+          dates,
+          maxStops,
+          maxDriveTime,
+          rangeStart,
+          rangeEnd,
+        });
         result = {
           runId: `fast-${Date.now()}`,
-          routes: buildFastFallbackRoutes({
-            jobsToRoute,
-            selectedTechs,
-            dates,
-            maxStops,
-            maxDriveTime,
-          }),
+          routes: fastRoutes,
           warnings: [
             `Routing engine returned ${backendRes.status}; used fast route generation instead.`,
             text.slice(0, 300),
