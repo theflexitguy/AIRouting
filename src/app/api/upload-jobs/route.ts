@@ -139,8 +139,10 @@ function getSubscriptionLastServicedFromRow(row: CsvRow) {
 function resolveExistingStatus(
   existingStatus: string,
   serviceDueAlreadyCompleted: boolean,
+  fieldRoutesScheduled: boolean,
 ) {
   if (serviceDueAlreadyCompleted) return "completed";
+  if (fieldRoutesScheduled) return "scheduled";
   if (existingStatus === "scheduled" || existingStatus === "in_progress") return existingStatus;
   return "pending";
 }
@@ -170,6 +172,8 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData();
     const file = formData.get("file") as File | null;
     const companyId = formData.get("companyId") as string | null;
+    const uploadKind = String(formData.get("uploadKind") || "job_pool");
+    const isScheduledJobsUpload = uploadKind === "scheduled_jobs";
 
     if (!file || !companyId) {
       return NextResponse.json(
@@ -203,6 +207,10 @@ export async function POST(request: NextRequest) {
       "serviceDue",
       "scheduledDate",
       "Scheduled Date",
+      "Appointment Date",
+      "Start Date",
+      "Scheduled For",
+      "Route Date",
     );
     const testSvc = col(
       first,
@@ -210,6 +218,24 @@ export async function POST(request: NextRequest) {
       "serviceType",
       "Service Type",
       "Subscription Category",
+    );
+    const testScheduledFor = col(
+      first,
+      "Scheduled For",
+      "scheduledFor",
+      "Scheduled Date",
+      "Appointment Date",
+      "Start Date",
+      "Route Date",
+    );
+    const testServicedBy = col(
+      first,
+      "Serviced By",
+      "servicedBy",
+      "ServicedBy",
+      "Service By",
+      "Scheduled On",
+      "Route Assigned To",
     );
 
     if (!testAddr || !testDate || !testSvc) {
@@ -229,11 +255,28 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (isScheduledJobsUpload && (!testScheduledFor || !testServicedBy)) {
+      const missing = [
+        !testScheduledFor && "Scheduled For",
+        !testServicedBy && "Serviced By",
+      ]
+        .filter(Boolean)
+        .join(", ");
+      const availableCols = Object.keys(first).join(", ");
+      return NextResponse.json(
+        {
+          error: `Missing scheduled-job column(s): ${missing}. Found columns: ${availableCols}`,
+        },
+        { status: 400 },
+      );
+    }
+
     const db = adminDb();
 
     let newCount = 0;
     let updatedCount = 0;
     let alreadyCompletedCount = 0;
+    let fieldRoutesScheduledCount = 0;
     let duplicatesSkipped = 0;
     const invalidRows: InvalidRow[] = [];
 
@@ -264,8 +307,23 @@ export async function POST(request: NextRequest) {
         "Scheduled Date",
         "routeDate",
         "Route Date",
+        "Appointment Date",
+        "Start Date",
+        "Scheduled For",
       );
       const scheduledDate = normalizeServiceDate(rawServiceDue);
+      const rawFieldRoutesScheduledDate = col(
+        row,
+        "Scheduled For",
+        "scheduledFor",
+        "Scheduled Date",
+        "Appointment Date",
+        "Start Date",
+        "Route Date",
+      );
+      const fieldRoutesScheduledDate =
+        normalizeServiceDate(rawFieldRoutesScheduledDate) ||
+        normalizeRouteDateValue(rawFieldRoutesScheduledDate);
 
       const serviceType =
         col(
@@ -345,7 +403,24 @@ export async function POST(request: NextRequest) {
           : firstName || lastName || customerId);
 
       const csvSnapshot = buildCsvSnapshot(row);
-      const assignedTechId = col(
+      const fieldRoutesServicedBy = col(
+        row,
+        "Serviced By",
+        "servicedBy",
+        "ServicedBy",
+        "Service By",
+        "Scheduled On",
+        "Route Assigned To",
+      );
+      const fieldRoutesServicedById = col(
+        row,
+        "Serviced By ID",
+        "servicedById",
+        "ServicedByID",
+        "Serviced By Employee ID",
+        "Serviced By Tech ID",
+      );
+      const assignedTechId = fieldRoutesServicedBy || col(
         row,
         "Preferred Tech",
         "preferredTech",
@@ -359,6 +434,10 @@ export async function POST(request: NextRequest) {
       const serviceDueAlreadyCompleted =
         Boolean(subscriptionLastCompletedDate) &&
         subscriptionLastCompletedDate >= scheduledDate;
+      const fieldRoutesScheduled =
+        Boolean(fieldRoutesServicedBy.trim()) &&
+        Boolean(fieldRoutesScheduledDate || scheduledDate) &&
+        !serviceDueAlreadyCompleted;
       const baseJobData = {
         jobId,
         customerId,
@@ -375,6 +454,11 @@ export async function POST(request: NextRequest) {
             col(row, "duration", "Duration", "estimated_duration") || "25",
           ) || 25,
         assignedTechId,
+        fieldRoutesScheduled,
+        fieldRoutesScheduledDate: fieldRoutesScheduledDate || scheduledDate,
+        fieldRoutesServicedBy,
+        fieldRoutesServicedById,
+        fieldRoutesScheduleSource: fieldRoutesScheduled ? "csv_serviced_by" : "",
         subscriptionId: col(
           row,
           "Subscription ID",
@@ -417,7 +501,11 @@ export async function POST(request: NextRequest) {
         subscriptionCategory: col(row, "Subscription Category", "subscriptionCategory"),
         ...csvSnapshot,
         csvSourceColumns: csvSnapshot.csvColumns,
-        status: serviceDueAlreadyCompleted ? "completed" as const : "pending" as const,
+        status: serviceDueAlreadyCompleted
+          ? "completed" as const
+          : fieldRoutesScheduled
+            ? "scheduled" as const
+            : "pending" as const,
         ...(serviceDueAlreadyCompleted ? { completedAt: subscriptionLastCompletedDate } : {}),
         companyId,
         source: "csv_upload" as const,
@@ -436,6 +524,9 @@ export async function POST(request: NextRequest) {
 
     const preparedJobs = [...preparedById.values()];
     alreadyCompletedCount = preparedJobs.filter((job) => job.serviceDueAlreadyCompleted).length;
+    fieldRoutesScheduledCount = preparedJobs.filter(
+      (job) => Boolean(job.baseJobData.fieldRoutesScheduled),
+    ).length;
     const jobRefs = preparedJobs.map((job) => db.doc(`companies/${companyId}/jobs/${job.jobId}`));
     const existingJobs = await getExistingJobDocs(db, jobRefs);
     let batch = db.batch();
@@ -448,20 +539,24 @@ export async function POST(request: NextRequest) {
       const resolvedStatus = resolveExistingStatus(
         existingStatus,
         prepared.serviceDueAlreadyCompleted,
+        Boolean(prepared.baseJobData.fieldRoutesScheduled),
       );
       const keepExistingAssignment =
         prepared.serviceDueAlreadyCompleted ||
         existingStatus === "scheduled" ||
         existingStatus === "in_progress";
+      const assignedTechId = prepared.baseJobData.fieldRoutesScheduled
+        ? prepared.assignedTechId
+        : keepExistingAssignment
+          ? existingData?.assignedTechId || prepared.assignedTechId
+          : prepared.assignedTechId;
 
       batch.set(
         jobRef,
         {
           ...prepared.baseJobData,
           status: resolvedStatus,
-          assignedTechId: keepExistingAssignment
-            ? existingData?.assignedTechId || prepared.assignedTechId
-            : prepared.assignedTechId,
+          assignedTechId,
           lastUploadBatchId: batchId,
           ...(existingData ? {} : { createdAt: uploadedAt }),
         },
@@ -494,6 +589,7 @@ export async function POST(request: NextRequest) {
       newJobs: newCount,
       updatedJobs: updatedCount,
       alreadyCompleted: alreadyCompletedCount,
+      fieldRoutesScheduled: fieldRoutesScheduledCount,
       duplicatesSkipped,
       invalidRows: invalidRows.length,
       invalidRowsSample: invalidRows.slice(0, 20),
@@ -507,11 +603,12 @@ export async function POST(request: NextRequest) {
       new: newCount,
       updated: updatedCount,
       alreadyCompleted: alreadyCompletedCount,
+      fieldRoutesScheduled: fieldRoutesScheduledCount,
       skipped: 0,
       duplicatesSkipped,
       invalid: invalidRows.length,
       invalidSample: invalidRows.slice(0, 10),
-      message: `${total} rows: ${newCount} new, ${updatedCount} updated${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${duplicatesSkipped ? `, ${duplicatesSkipped} duplicate rows merged` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
+      message: `${total} rows: ${newCount} new, ${updatedCount} updated${fieldRoutesScheduledCount ? `, ${fieldRoutesScheduledCount} scheduled from FieldRoutes` : ""}${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${duplicatesSkipped ? `, ${duplicatesSkipped} duplicate rows merged` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
     });
   } catch (error) {
     console.error("Upload jobs error:", error);

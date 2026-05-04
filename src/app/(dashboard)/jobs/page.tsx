@@ -35,7 +35,13 @@ function normalizeStatus(value: unknown) {
   return normalized;
 }
 
-type TechOption = { id: string; name: string; employeeId?: string };
+type TechOption = {
+  id: string;
+  name: string;
+  employeeId?: string;
+  fieldRoutesEmployeeId?: string;
+  fieldRoutesTechId?: string;
+};
 
 function uniqueOptions(values: Array<unknown>) {
   return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))]
@@ -55,6 +61,10 @@ interface JobRow {
   serviceType: string;
   duration: number;
   assignedTechId?: string;
+  fieldRoutesScheduled?: boolean;
+  fieldRoutesScheduledDate?: string;
+  fieldRoutesServicedBy?: string;
+  fieldRoutesServicedById?: string;
   status: string;
   subscriptionId?: string;
   schedulingRequest?: string;
@@ -94,6 +104,7 @@ export default function JobsPage() {
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [scheduledUploading, setScheduledUploading] = useState(false);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterTech, setFilterTech] = useState("all");
@@ -110,6 +121,7 @@ export default function JobsPage() {
   const [pageSize, setPageSize] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const scheduledFileInputRef = useRef<HTMLInputElement>(null);
 
   const today = format(new Date(), "yyyy-MM-dd");
 
@@ -177,6 +189,11 @@ export default function JobsPage() {
         batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, id), {
           status: "pending",
           assignedTechId: "",
+          fieldRoutesScheduled: false,
+          fieldRoutesScheduledDate: "",
+          fieldRoutesServicedBy: "",
+          fieldRoutesServicedById: "",
+          fieldRoutesScheduleSource: "",
           updatedAt: new Date().toISOString(),
         });
         ops++;
@@ -217,6 +234,8 @@ export default function JobsPage() {
           id: d.id,
           name: String(data.name || d.id),
           employeeId: data.employeeId ? String(data.employeeId) : undefined,
+          fieldRoutesEmployeeId: data.fieldRoutesEmployeeId ? String(data.fieldRoutesEmployeeId) : undefined,
+          fieldRoutesTechId: data.fieldRoutesTechId ? String(data.fieldRoutesTechId) : undefined,
         };
       }));
     } catch (error: unknown) {
@@ -238,7 +257,7 @@ export default function JobsPage() {
     let filtered = [...jobs];
     const techByAssignment = new Map<string, TechOption>();
     techs.forEach((tech) => {
-      [tech.id, tech.name, tech.employeeId].forEach((value) => {
+      [tech.id, tech.name, tech.employeeId, tech.fieldRoutesEmployeeId, tech.fieldRoutesTechId].forEach((value) => {
         const key = normalizeText(value);
         if (key) techByAssignment.set(key, tech);
       });
@@ -247,15 +266,22 @@ export default function JobsPage() {
     if (search.trim()) {
       const s = normalizeText(search);
       filtered = filtered.filter((j) => {
-        const assignedTech = techByAssignment.get(normalizeText(j.assignedTechId));
+        const assignedTech =
+          techByAssignment.get(normalizeText(j.assignedTechId)) ||
+          techByAssignment.get(normalizeText(j.fieldRoutesServicedBy)) ||
+          techByAssignment.get(normalizeText(j.fieldRoutesServicedById));
         const searchableValues = [
           j.customerName,
           j.address,
           j.serviceType,
           j.customerId,
           j.assignedTechId,
+          j.fieldRoutesServicedBy,
+          j.fieldRoutesServicedById,
           assignedTech?.name,
           assignedTech?.employeeId,
+          assignedTech?.fieldRoutesEmployeeId,
+          assignedTech?.fieldRoutesTechId,
           j.subscriptionId,
           j.schedulingRequest,
           j.billingFrequency,
@@ -270,6 +296,7 @@ export default function JobsPage() {
           j.productionValue,
           j.subscriptionCategory,
           j.scheduledDate,
+          j.fieldRoutesScheduledDate,
           j.status,
           ...Object.values(j.rawCsv || {}),
           ...(j.csvFields || []).flatMap((field) => [field.name, field.value]),
@@ -283,14 +310,26 @@ export default function JobsPage() {
     if (filterTech !== "all") {
       const selectedTech = techs.find((tech) => tech.id === filterTech);
       const selectedKeys = new Set(
-        [selectedTech?.id, selectedTech?.name, selectedTech?.employeeId]
+        [
+          selectedTech?.id,
+          selectedTech?.name,
+          selectedTech?.employeeId,
+          selectedTech?.fieldRoutesEmployeeId,
+          selectedTech?.fieldRoutesTechId,
+        ]
           .map(normalizeText)
           .filter(Boolean),
       );
       filtered = filtered.filter((j) => {
-        const assigned = normalizeText(j.assignedTechId);
-        if (filterTech === "unassigned") return !assigned;
-        return selectedKeys.has(assigned);
+        const assignedValues = [
+          j.assignedTechId,
+          j.fieldRoutesServicedBy,
+          j.fieldRoutesServicedById,
+        ]
+          .map(normalizeText)
+          .filter(Boolean);
+        if (filterTech === "unassigned") return assignedValues.length === 0;
+        return assignedValues.some((assigned) => selectedKeys.has(assigned));
       });
     }
     if (filterService !== "all") {
@@ -347,16 +386,20 @@ export default function JobsPage() {
     if (currentPage > totalPages) setCurrentPage(totalPages);
   }, [currentPage, totalPages]);
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const uploadCsvFile = async (
+    file: File,
+    uploadKind: "job_pool" | "scheduled_jobs",
+  ) => {
     if (!file || !userProfile?.companyId) return;
 
-    setUploading(true);
+    if (uploadKind === "scheduled_jobs") setScheduledUploading(true);
+    else setUploading(true);
     setUploadResult(null);
     try {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("companyId", userProfile.companyId);
+      formData.append("uploadKind", uploadKind);
 
       const res = await fetch("/api/upload-jobs", {
         method: "POST",
@@ -365,6 +408,7 @@ export default function JobsPage() {
       const data = await res.json();
       if (data.success) {
         setUploadResult(data.message || `${data.new} new, ${data.updated} updated`);
+        if (uploadKind === "scheduled_jobs") setFilterStatus("scheduled");
         await loadJobs();
       } else {
         setUploadResult(`Upload failed: ${data.error}`);
@@ -372,16 +416,30 @@ export default function JobsPage() {
     } catch {
       setUploadResult("Upload failed. Check your connection.");
     } finally {
-      setUploading(false);
+      if (uploadKind === "scheduled_jobs") setScheduledUploading(false);
+      else setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
+      if (scheduledFileInputRef.current) scheduledFileInputRef.current.value = "";
     }
+  };
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    await uploadCsvFile(file, "job_pool");
+  };
+
+  const handleScheduledUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    await uploadCsvFile(file, "scheduled_jobs");
   };
 
   const getTechLabel = (assignedTechId?: string) => {
     const assigned = normalizeText(assignedTechId);
     if (!assigned) return "Unassigned";
     const tech = techs.find((t) =>
-      [t.id, t.name, t.employeeId].some((value) => normalizeText(value) === assigned),
+      [t.id, t.name, t.employeeId, t.fieldRoutesEmployeeId, t.fieldRoutesTechId].some((value) => normalizeText(value) === assigned),
     );
     return tech?.name || assignedTechId || "Unassigned";
   };
@@ -416,7 +474,7 @@ export default function JobsPage() {
         </div>
 
         {/* Filters row */}
-        <div className="flex flex-col sm:flex-row gap-2.5">
+        <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2.5">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
             <Input
@@ -467,13 +525,29 @@ export default function JobsPage() {
             onChange={handleUpload}
             className="hidden"
           />
+          <input
+            ref={scheduledFileInputRef}
+            type="file"
+            accept=".csv"
+            onChange={handleScheduledUpload}
+            className="hidden"
+          />
           <Button
             onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
+            disabled={uploading || scheduledUploading}
             className="bg-blue-500 hover:bg-blue-600 text-white shrink-0 h-9"
           >
             {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
             Upload CSV
+          </Button>
+          <Button
+            onClick={() => scheduledFileInputRef.current?.click()}
+            disabled={uploading || scheduledUploading}
+            variant="outline"
+            className="shrink-0 h-9"
+          >
+            {scheduledUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Calendar className="w-4 h-4" />}
+            Upload Scheduled Jobs CSV
           </Button>
         </div>
 
@@ -545,7 +619,7 @@ export default function JobsPage() {
         <div className="flex items-start gap-2 text-xs text-muted-foreground bg-accent/30 rounded-lg px-3 py-2 border border-border/40">
           <FileSpreadsheet className="w-4 h-4 mt-0.5 shrink-0" />
           <span>
-            Accepts FieldRoutes CSV exports and preserves every uploaded column. Key columns: <code className="bg-accent px-1 rounded">Customer ID</code>, <code className="bg-accent px-1 rounded">Address</code>, <code className="bg-accent px-1 rounded">Service Due</code>, <code className="bg-accent px-1 rounded">Preferred Tech</code>, <code className="bg-accent px-1 rounded">Billing Frequency</code>, <code className="bg-accent px-1 rounded">Recurring Frequency</code>, <code className="bg-accent px-1 rounded">Recurring Price</code>
+            Accepts FieldRoutes CSV exports and preserves every uploaded column. Key columns: <code className="bg-accent px-1 rounded">Customer ID</code>, <code className="bg-accent px-1 rounded">Address</code>, <code className="bg-accent px-1 rounded">Service Due</code>, <code className="bg-accent px-1 rounded">Scheduled For</code>, <code className="bg-accent px-1 rounded">Serviced By</code>, <code className="bg-accent px-1 rounded">Preferred Tech</code>, <code className="bg-accent px-1 rounded">Billing Frequency</code>, <code className="bg-accent px-1 rounded">Recurring Frequency</code>, <code className="bg-accent px-1 rounded">Recurring Price</code>
           </span>
         </div>
 
@@ -685,6 +759,10 @@ export default function JobsPage() {
                       const pastDue = isPastDue(job);
                       const stopProduction = calculateStopProductionValue(job);
                       const csvFieldCount = getCsvFields(job).length;
+                      const scheduledRouteDate =
+                        job.fieldRoutesScheduledDate && job.fieldRoutesScheduledDate !== job.scheduledDate
+                          ? job.fieldRoutesScheduledDate
+                          : "";
                       return (
                         <tr key={job.id} className={`border-b border-border/30 last:border-0 hover:bg-accent/20 transition-colors ${pastDue ? "bg-red-500/5" : ""} ${selectedIds.has(job.id) ? "bg-blue-500/5" : ""}`}>
                           <td className="w-10 p-4">
@@ -715,12 +793,17 @@ export default function JobsPage() {
                             {pastDue && (
                               <Badge variant="destructive" className="mt-1 text-[10px] px-1.5 py-0">Past Due</Badge>
                             )}
+                            {scheduledRouteDate && (
+                              <div className="mt-1 text-[10px] text-blue-400">
+                                Scheduled {formatDate(scheduledRouteDate)}
+                              </div>
+                            )}
                           </td>
                           <td className="p-4 text-muted-foreground/70">{job.serviceType}</td>
                           <td className="p-4 text-muted-foreground/70">
                             <div className="flex items-center gap-1.5">
                               <User className="w-3 h-3 text-muted-foreground/40" />
-                              <span className="truncate max-w-[120px]">{getTechLabel(job.assignedTechId)}</span>
+                              <span className="truncate max-w-[120px]">{getTechLabel(job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById)}</span>
                             </div>
                           </td>
                           <td className="p-4 text-muted-foreground/70">
@@ -808,6 +891,10 @@ export default function JobsPage() {
                   const pastDue = isPastDue(job);
                   const stopProduction = calculateStopProductionValue(job);
                   const csvFieldCount = getCsvFields(job).length;
+                  const scheduledRouteDate =
+                    job.fieldRoutesScheduledDate && job.fieldRoutesScheduledDate !== job.scheduledDate
+                      ? job.fieldRoutesScheduledDate
+                      : "";
                   return (
                     <div key={job.id} className={`p-4 hover:bg-accent/20 active:bg-accent/30 transition-colors ${pastDue ? "bg-red-500/5" : ""} ${selectedIds.has(job.id) ? "bg-blue-500/5" : ""}`}>
                       <div className="flex items-start justify-between gap-2 mb-2">
@@ -831,7 +918,10 @@ export default function JobsPage() {
                       <div className="space-y-1 text-sm text-muted-foreground/60">
                         <div className="flex items-center gap-1.5"><MapPin className="w-3 h-3" />{job.address}</div>
                         <div className="flex items-center gap-1.5"><Calendar className="w-3 h-3" /><span className={pastDue ? "text-red-400" : ""}>{formatDate(job.scheduledDate)}</span> · {job.serviceType}</div>
-                        <div className="flex items-center gap-1.5"><User className="w-3 h-3" />{getTechLabel(job.assignedTechId)}</div>
+                        {scheduledRouteDate && (
+                          <div className="flex items-center gap-1.5 text-blue-400"><Calendar className="w-3 h-3" />Scheduled {formatDate(scheduledRouteDate)}</div>
+                        )}
+                        <div className="flex items-center gap-1.5"><User className="w-3 h-3" />{getTechLabel(job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById)}</div>
                         <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
                           <span><Repeat className="w-3 h-3 inline mr-1" />Billing: {job.billingFrequency || "-"}</span>
                           <span><Repeat className="w-3 h-3 inline mr-1" />Service: {job.recurringFrequency || "-"}</span>

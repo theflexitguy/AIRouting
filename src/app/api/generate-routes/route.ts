@@ -67,12 +67,43 @@ function jobAssignedToTech(
   job: JobDoc,
   tech: Record<string, unknown> & { id: string },
 ) {
-  const assigned = String(job.assignedTechId || "").trim();
-  if (!assigned) return false;
-  const assignedNormalized = normalizeName(assigned);
-  return techMatchTokens(tech).some((token) => {
-    return token === assigned || normalizeName(token) === assignedNormalized;
+  const assignedValues = [
+    job.assignedTechId,
+    job.fieldRoutesServicedBy,
+    job.fieldRoutesServicedById,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (assignedValues.length === 0) return false;
+
+  const tokens = techMatchTokens(tech);
+  return assignedValues.some((assigned) => {
+    const assignedNormalized = normalizeName(assigned);
+    return tokens.some((token) => {
+      return token === assigned || normalizeName(token) === assignedNormalized;
+    });
   });
+}
+
+function routeSlotKey(date: string, techId: string) {
+  return `${date}::${techId}`;
+}
+
+function isFieldRoutesScheduledJob(job: JobDoc) {
+  return Boolean(job.fieldRoutesScheduled || job.fieldRoutesServicedBy);
+}
+
+function pinnedFieldRoutesSlotKey(
+  job: JobDoc,
+  techs: Array<Record<string, unknown> & { id: string }>,
+  rangeStart: string,
+  rangeEnd: string,
+) {
+  if (!isFieldRoutesScheduledJob(job)) return "";
+  const scheduledDate = String(job.fieldRoutesScheduledDate || job.scheduledDate || "");
+  if (scheduledDate < rangeStart || scheduledDate > rangeEnd) return "";
+  const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
+  return tech ? routeSlotKey(scheduledDate, tech.id) : "";
 }
 
 function serviceFrequencyDays(job: JobDoc) {
@@ -163,6 +194,9 @@ function dateTier(job: JobDoc, rangeStart: string, rangeEnd: string) {
 
 function jobPriorityComparator(rangeStart: string, rangeEnd: string) {
   return (a: JobDoc, b: JobDoc) => {
+    const scheduledDiff = Number(Boolean(isFieldRoutesScheduledJob(b))) - Number(Boolean(isFieldRoutesScheduledJob(a)));
+    if (scheduledDiff !== 0) return scheduledDiff;
+
     const tierDiff = dateTier(a, rangeStart, rangeEnd) - dateTier(b, rangeStart, rangeEnd);
     if (tierDiff !== 0) return tierDiff;
 
@@ -254,6 +288,11 @@ interface JobDoc {
   subscriptionLastServiced?: string;
   subscriptionLastCompletedDate?: string;
   serviceDueAlreadyCompleted?: boolean;
+  fieldRoutesScheduled?: boolean;
+  fieldRoutesScheduledDate?: string;
+  fieldRoutesServicedBy?: string;
+  fieldRoutesServicedById?: string;
+  fieldRoutesScheduleSource?: string;
   subscriptionCategory?: string;
   [key: string]: unknown;
 }
@@ -676,6 +715,7 @@ function assignmentCost(
 interface JobUnit {
   id: string;
   jobs: JobDoc[];
+  lockedSlotKey?: string;
 }
 
 interface UnitAssignment {
@@ -696,12 +736,22 @@ function jobUnitId(jobs: JobDoc[]) {
   return key || jobs.map((job) => job.docId).join("|");
 }
 
-function buildSameAddressJobUnits(jobs: JobDoc[], rangeStart: string, rangeEnd: string) {
+function buildSameAddressJobUnits(
+  jobs: JobDoc[],
+  rangeStart: string,
+  rangeEnd: string,
+  lockedSlotKeyByJobId = new Map<string, string>(),
+) {
   const byAddress = new Map<string, JobDoc[]>();
   const singles: JobUnit[] = [];
   const prioritySort = jobPriorityComparator(rangeStart, rangeEnd);
 
   for (const job of jobs) {
+    const lockedSlotKey = lockedSlotKeyByJobId.get(job.docId) || "";
+    if (lockedSlotKey) {
+      singles.push({ id: job.docId, jobs: [job], lockedSlotKey });
+      continue;
+    }
     const key = routeAddressKey(job);
     if (!key) {
       singles.push({ id: job.docId, jobs: [job] });
@@ -710,7 +760,7 @@ function buildSameAddressJobUnits(jobs: JobDoc[], rangeStart: string, rangeEnd: 
     byAddress.set(key, [...(byAddress.get(key) || []), job]);
   }
 
-  const units = [
+  const units: JobUnit[] = [
     ...singles,
     ...Array.from(byAddress.values()).map((group) => ({
       id: jobUnitId(group),
@@ -723,6 +773,13 @@ function buildSameAddressJobUnits(jobs: JobDoc[], rangeStart: string, rangeEnd: 
 
 function canScheduleUnitOnDate(unit: JobUnit, slotDate: string) {
   return unit.jobs.every((job) => canScheduleJobOnDate(job, slotDate));
+}
+
+function canPlaceUnitOnSlot(unit: JobUnit, slot: RouteSlot) {
+  return (
+    (!unit.lockedSlotKey || unit.lockedSlotKey === routeSlotKey(slot.date, slot.tech.id)) &&
+    canScheduleUnitOnDate(unit, slot.date)
+  );
 }
 
 function unitAssignmentCost(
@@ -808,6 +865,7 @@ function optimizeUnitAssignments(
         for (let i = 0; i < routeA.units.length; i++) {
           const movingA = routeA.units[i];
           if (
+            !movingA.lockedSlotKey &&
             routeBStopCount + movingA.jobs.length <= maxStops &&
             routeA.units.length > 1 &&
             canScheduleUnitOnDate(movingA, routeB.slot.date)
@@ -828,6 +886,8 @@ function optimizeUnitAssignments(
           for (let j = 0; j < routeB.units.length; j++) {
             const movingB = routeB.units[j];
             if (
+              movingA.lockedSlotKey ||
+              movingB.lockedSlotKey ||
               routeAStopCount - movingA.jobs.length + movingB.jobs.length > maxStops ||
               routeBStopCount - movingB.jobs.length + movingA.jobs.length > maxStops ||
               !canScheduleUnitOnDate(movingB, routeA.slot.date) ||
@@ -878,16 +938,23 @@ function assignJobsToTechSlots({
   maxStops,
   rangeStart,
   rangeEnd,
+  selectedTechs,
 }: {
   jobs: JobDoc[];
   slots: RouteSlot[];
   maxStops: number;
   rangeStart: string;
   rangeEnd: string;
+  selectedTechs: Array<Record<string, unknown> & { id: string }>;
 }) {
   const assignments: UnitAssignment[] = slots.map((slot) => ({ slot, units: [] }));
   const unassignedJobs: Array<{ job: JobDoc; reason: string }> = [];
-  const sortedUnits = buildSameAddressJobUnits(jobs, rangeStart, rangeEnd);
+  const lockedSlotKeyByJobId = new Map(
+    jobs
+      .map((job) => [job.docId, pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd)] as const)
+      .filter((entry) => entry[1]),
+  );
+  const sortedUnits = buildSameAddressJobUnits(jobs, rangeStart, rangeEnd, lockedSlotKeyByJobId);
 
   for (const unit of sortedUnits) {
     if (unit.jobs.length > maxStops) {
@@ -902,7 +969,7 @@ function assignJobsToTechSlots({
     const target = assignments
       .filter((assignment) =>
         unitStopCount(assignment.units) + unit.jobs.length <= maxStops &&
-        canScheduleUnitOnDate(unit, assignment.slot.date),
+        canPlaceUnitOnSlot(unit, assignment.slot),
       )
       .map((assignment) => ({
         assignment,
@@ -924,7 +991,9 @@ function assignJobsToTechSlots({
           .filter((entry) => !entry.endsWith(": "));
         unassignedJobs.push({
           job,
-          reason: blockedDates.length > 0
+          reason: unit.lockedSlotKey
+            ? "FieldRoutes scheduled stop does not match an available selected tech/date route"
+            : blockedDates.length > 0
             ? blockedDates.join("; ")
             : "no route capacity",
         });
@@ -984,6 +1053,7 @@ async function buildFastFallbackRoutes({
       maxStops,
       rangeStart,
       rangeEnd,
+      selectedTechs,
     });
     const assignments = assignmentResult.assignments;
     assignmentResult.unassignedJobs.forEach((entry) => {
@@ -1248,18 +1318,26 @@ export async function POST(request: NextRequest) {
     const isJobForSelectedTech = (d: JobDoc) => {
       if (isGeneratedRouteAssignment(d)) return false;
       if (d.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(d)) return false;
+      if (String(d.status || "").toLowerCase() === "scheduled" && isFieldRoutesScheduledJob(d)) {
+        const routeDate = String(d.fieldRoutesScheduledDate || d.scheduledDate || "");
+        if (routeDate < rangeStart || routeDate > rangeEnd) return false;
+      }
       return selectedTechs.some((tech) => jobAssignedToTech(d, tech));
     };
 
     const allPendingSnap = await db
       .collection(`companies/${companyId}/jobs`)
-      .where("status", "==", "pending")
+      .where("status", "in", ["pending", "scheduled"])
       .get();
 
     const jobDocMap = new Map<string, JobDoc>();
     const releasedJobDocMap = new Map<string, JobDoc>();
     allPendingSnap.docs.forEach((doc) => {
       const jobDoc = { docId: doc.id, ...doc.data() } as JobDoc;
+      const status = String(jobDoc.status || "").toLowerCase();
+      if (status === "scheduled" && !isFieldRoutesScheduledJob(jobDoc) && !releasedJobIds.has(doc.id)) {
+        return;
+      }
       if (isJobForSelectedTech(jobDoc)) jobDocMap.set(doc.id, jobDoc);
     });
 
@@ -1302,8 +1380,8 @@ export async function POST(request: NextRequest) {
           if (!releasedJobDoc) continue;
           const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
           cleanupBatch.update(jobRef, {
-            status: "pending",
-            ...(isGeneratedRouteAssignment(releasedJobDoc)
+            status: isFieldRoutesScheduledJob(releasedJobDoc) ? "scheduled" : "pending",
+            ...(isGeneratedRouteAssignment(releasedJobDoc) && !isFieldRoutesScheduledJob(releasedJobDoc)
               ? { assignedTechId: "" }
               : {}),
             updatedAt: now,
@@ -1735,8 +1813,8 @@ export async function POST(request: NextRequest) {
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       const releasedJobDoc = releasedJobDocMap.get(jobId);
       batch.update(jobRef, {
-        status: "pending",
-        ...(releasedJobDoc && isGeneratedRouteAssignment(releasedJobDoc)
+        status: releasedJobDoc && isFieldRoutesScheduledJob(releasedJobDoc) ? "scheduled" : "pending",
+        ...(releasedJobDoc && isGeneratedRouteAssignment(releasedJobDoc) && !isFieldRoutesScheduledJob(releasedJobDoc)
           ? { assignedTechId: "" }
           : {}),
         updatedAt: now,
