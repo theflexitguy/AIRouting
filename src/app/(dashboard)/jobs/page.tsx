@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { collection, query, where, getDocs, orderBy, doc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -36,6 +36,11 @@ function normalizeStatus(value: unknown) {
 }
 
 type TechOption = { id: string; name: string; employeeId?: string };
+
+function uniqueOptions(values: Array<unknown>) {
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+}
 
 // Extended job type for all CSV fields
 interface JobRow {
@@ -86,19 +91,24 @@ function getCsvFields(job: JobRow) {
 export default function JobsPage() {
   const { userProfile } = useAuth();
   const [jobs, setJobs] = useState<JobRow[]>([]);
-  const [filteredJobs, setFilteredJobs] = useState<JobRow[]>([]);
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterTech, setFilterTech] = useState("all");
+  const [filterService, setFilterService] = useState("all");
+  const [filterSubscriptionStatus, setFilterSubscriptionStatus] = useState("all");
+  const [filterBillingFrequency, setFilterBillingFrequency] = useState("all");
+  const [filterServiceFrequency, setFilterServiceFrequency] = useState("all");
   const [dateFrom, setDateFrom] = useState(format(startOfYear(new Date()), "yyyy-MM-dd"));
   const [dateTo, setDateTo] = useState(format(addDays(new Date(), 90), "yyyy-MM-dd"));
   const [uploadResult, setUploadResult] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [selectedCsvJob, setSelectedCsvJob] = useState<JobRow | null>(null);
   const [bulkLoading, setBulkLoading] = useState(false);
+  const [pageSize, setPageSize] = useState(50);
+  const [currentPage, setCurrentPage] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const today = format(new Date(), "yyyy-MM-dd");
@@ -112,11 +122,16 @@ export default function JobsPage() {
   };
 
   const toggleSelectAll = () => {
-    if (selectedIds.size === filteredJobs.length) {
-      setSelectedIds(new Set());
-    } else {
-      setSelectedIds(new Set(filteredJobs.map(j => j.id)));
-    }
+    const pageIds = paginatedJobs.map(j => j.id);
+    const allPageSelected = pageIds.length > 0 && pageIds.every(id => selectedIds.has(id));
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      pageIds.forEach(id => {
+        if (allPageSelected) next.delete(id);
+        else next.add(id);
+      });
+      return next;
+    });
   };
 
   const handleBulkDelete = async () => {
@@ -219,7 +234,7 @@ export default function JobsPage() {
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
-  useEffect(() => {
+  const filteredJobs = useMemo(() => {
     let filtered = [...jobs];
     const techByAssignment = new Map<string, TechOption>();
     techs.forEach((tech) => {
@@ -278,8 +293,59 @@ export default function JobsPage() {
         return selectedKeys.has(assigned);
       });
     }
-    setFilteredJobs(filtered);
-  }, [jobs, search, filterStatus, filterTech, techs]);
+    if (filterService !== "all") {
+      filtered = filtered.filter(j => String(j.serviceType || "") === filterService);
+    }
+    if (filterSubscriptionStatus !== "all") {
+      filtered = filtered.filter(j => String(j.subscriptionStatus || "") === filterSubscriptionStatus);
+    }
+    if (filterBillingFrequency !== "all") {
+      filtered = filtered.filter(j => String(j.billingFrequency || "") === filterBillingFrequency);
+    }
+    if (filterServiceFrequency !== "all") {
+      filtered = filtered.filter(j => String(j.recurringFrequency || "") === filterServiceFrequency);
+    }
+    return filtered;
+  }, [
+    filterBillingFrequency,
+    filterService,
+    filterServiceFrequency,
+    filterStatus,
+    filterSubscriptionStatus,
+    filterTech,
+    jobs,
+    search,
+    techs,
+  ]);
+
+  const serviceOptions = useMemo(() => uniqueOptions(jobs.map(j => j.serviceType)), [jobs]);
+  const subscriptionStatusOptions = useMemo(() => uniqueOptions(jobs.map(j => j.subscriptionStatus)), [jobs]);
+  const billingFrequencyOptions = useMemo(() => uniqueOptions(jobs.map(j => j.billingFrequency)), [jobs]);
+  const serviceFrequencyOptions = useMemo(() => uniqueOptions(jobs.map(j => j.recurringFrequency)), [jobs]);
+  const totalPages = Math.max(1, Math.ceil(filteredJobs.length / pageSize));
+  const safeCurrentPage = Math.min(currentPage, totalPages);
+  const pageStartIndex = filteredJobs.length === 0 ? 0 : (safeCurrentPage - 1) * pageSize;
+  const pageEndIndex = Math.min(pageStartIndex + pageSize, filteredJobs.length);
+  const paginatedJobs = filteredJobs.slice(pageStartIndex, pageEndIndex);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    dateFrom,
+    dateTo,
+    filterBillingFrequency,
+    filterService,
+    filterServiceFrequency,
+    filterStatus,
+    filterSubscriptionStatus,
+    filterTech,
+    pageSize,
+    search,
+  ]);
+
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [currentPage, totalPages]);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -383,6 +449,17 @@ export default function JobsPage() {
               {techs.map(t => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}
             </SelectContent>
           </Select>
+          <Select value={String(pageSize)} onValueChange={(value) => setPageSize(Number(value) || 50)}>
+            <SelectTrigger className="w-full sm:w-28 h-9">
+              <SelectValue placeholder="Rows" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="25">25 rows</SelectItem>
+              <SelectItem value="50">50 rows</SelectItem>
+              <SelectItem value="100">100 rows</SelectItem>
+              <SelectItem value="250">250 rows</SelectItem>
+            </SelectContent>
+          </Select>
           <input
             ref={fileInputRef}
             type="file"
@@ -397,6 +474,62 @@ export default function JobsPage() {
           >
             {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
             Upload CSV
+          </Button>
+        </div>
+
+        <div className="flex flex-col lg:flex-row gap-2.5">
+          <Select value={filterService} onValueChange={setFilterService}>
+            <SelectTrigger className="w-full lg:w-48 h-9">
+              <SelectValue placeholder="Service" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Services</SelectItem>
+              {serviceOptions.map(option => <SelectItem key={option} value={option}>{option}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Select value={filterSubscriptionStatus} onValueChange={setFilterSubscriptionStatus}>
+            <SelectTrigger className="w-full lg:w-48 h-9">
+              <SelectValue placeholder="Subscription" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Subscription Status</SelectItem>
+              {subscriptionStatusOptions.map(option => <SelectItem key={option} value={option}>{option}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Select value={filterBillingFrequency} onValueChange={setFilterBillingFrequency}>
+            <SelectTrigger className="w-full lg:w-48 h-9">
+              <SelectValue placeholder="Billing frequency" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Billing Frequency</SelectItem>
+              {billingFrequencyOptions.map(option => <SelectItem key={option} value={option}>{option}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Select value={filterServiceFrequency} onValueChange={setFilterServiceFrequency}>
+            <SelectTrigger className="w-full lg:w-48 h-9">
+              <SelectValue placeholder="Service frequency" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All Service Frequency</SelectItem>
+              {serviceFrequencyOptions.map(option => <SelectItem key={option} value={option}>{option}</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-9 lg:ml-auto"
+            onClick={() => {
+              setSearch("");
+              setFilterStatus("all");
+              setFilterTech("all");
+              setFilterService("all");
+              setFilterSubscriptionStatus("all");
+              setFilterBillingFrequency("all");
+              setFilterServiceFrequency("all");
+            }}
+          >
+            <RotateCcw className="w-4 h-4" />
+            Reset
           </Button>
         </div>
 
@@ -422,10 +555,57 @@ export default function JobsPage() {
           </div>
         )}
 
-        <div className="flex items-center justify-between text-xs text-muted-foreground/60 animate-fade-in">
-          <span>{filteredJobs.length} of {jobs.length} jobs</span>
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground/60 animate-fade-in">
+          <span>
+            {filteredJobs.length > 0
+              ? `${pageStartIndex + 1}-${pageEndIndex} of ${filteredJobs.length} filtered`
+              : "0 filtered"} · {jobs.length} loaded
+          </span>
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => setCurrentPage(1)}
+              disabled={safeCurrentPage === 1}
+            >
+              First
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => setCurrentPage(page => Math.max(1, page - 1))}
+              disabled={safeCurrentPage === 1}
+            >
+              Prev
+            </Button>
+            <span className="whitespace-nowrap">Page {safeCurrentPage} of {totalPages}</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => setCurrentPage(page => Math.min(totalPages, page + 1))}
+              disabled={safeCurrentPage === totalPages}
+            >
+              Next
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => setCurrentPage(totalPages)}
+              disabled={safeCurrentPage === totalPages}
+            >
+              Last
+            </Button>
+          </div>
           {selectedIds.size > 0 && (
-            <div className="flex items-center gap-2 animate-scale-in">
+            <div className="flex items-center gap-2 animate-scale-in basis-full sm:basis-auto">
               <span className="text-blue-400 font-medium">{selectedIds.size} selected</span>
               <Button
                 size="sm"
@@ -478,7 +658,7 @@ export default function JobsPage() {
                       <th className="w-10 p-4">
                         <input
                           type="checkbox"
-                          checked={selectedIds.size === filteredJobs.length && filteredJobs.length > 0}
+                          checked={paginatedJobs.length > 0 && paginatedJobs.every(job => selectedIds.has(job.id))}
                           onChange={toggleSelectAll}
                           className="rounded border-border/60 bg-transparent cursor-pointer accent-blue-500"
                         />
@@ -499,7 +679,7 @@ export default function JobsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredJobs.map((job) => {
+                    {paginatedJobs.map((job) => {
                       const status = normalizeStatus(job.status);
                       const sc = statusConfig[status] || statusConfig.pending;
                       const pastDue = isPastDue(job);
@@ -622,7 +802,7 @@ export default function JobsPage() {
 
               {/* Mobile/iPad cards */}
               <div className="lg:hidden divide-y divide-border/30">
-                {filteredJobs.map(job => {
+                {paginatedJobs.map(job => {
                   const status = normalizeStatus(job.status);
                   const sc = statusConfig[status] || statusConfig.pending;
                   const pastDue = isPastDue(job);

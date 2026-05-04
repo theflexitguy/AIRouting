@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
-import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot } from "firebase/firestore";
+import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -699,8 +699,8 @@ export default function RoutesPage() {
   const [mapError, setMapError] = useState(false);
   const [editMode, setEditMode] = useState(false);
   const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
-  const [jobPoolDueStart, setJobPoolDueStart] = useState("");
-  const [jobPoolDueEnd, setJobPoolDueEnd] = useState(offsetDateString(endDate, 14));
+  const [jobPoolDueStart, setJobPoolDueStart] = useState(startDate);
+  const [jobPoolDueEnd, setJobPoolDueEnd] = useState(endDate);
   const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
@@ -730,9 +730,9 @@ export default function RoutesPage() {
 
   useEffect(() => {
     if (jobPoolFilterTouched) return;
-    setJobPoolDueStart("");
-    setJobPoolDueEnd(offsetDateString(endDate, 14));
-  }, [endDate, jobPoolFilterTouched]);
+    setJobPoolDueStart(startDate);
+    setJobPoolDueEnd(endDate);
+  }, [endDate, jobPoolFilterTouched, startDate]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -1277,6 +1277,59 @@ export default function RoutesPage() {
     toast.info(`Redone: ${op.description}`);
   };
 
+  const loadJobsForRange = useCallback(async (companyId: string) => {
+    try {
+      const snap = await getDocs(query(
+        collection(db, `companies/${companyId}/jobs`),
+        where("scheduledDate", ">=", startDate),
+        where("scheduledDate", "<=", endDate),
+      ));
+      const jobMap: { [id: string]: Job } = {};
+      snap.docs.forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
+      setAllJobs(jobMap);
+    } catch {
+      setAllJobs({});
+    }
+  }, [endDate, startDate]);
+
+  const loadRouteStopJobs = useCallback(async (companyId: string, stopIds: string[]) => {
+    const uniqueStopIds = [...new Set(stopIds.filter(Boolean))];
+    if (uniqueStopIds.length === 0) return;
+
+    try {
+      const loaded: { [id: string]: Job } = {};
+      for (let i = 0; i < uniqueStopIds.length; i += 30) {
+        const chunk = uniqueStopIds.slice(i, i + 30);
+        const snap = await getDocs(query(
+          collection(db, `companies/${companyId}/jobs`),
+          where(documentId(), "in", chunk),
+        ));
+        snap.docs.forEach(d => { loaded[d.id] = { id: d.id, ...d.data() } as Job; });
+      }
+      if (Object.keys(loaded).length > 0) {
+        setAllJobs(prev => ({ ...prev, ...loaded }));
+      }
+    } catch (error) {
+      console.error("Load route stop jobs error:", error);
+    }
+  }, []);
+
+  const loadJobPoolJobs = useCallback(async (companyId: string, dueStart: string, dueEnd: string) => {
+    if (!dueStart || !dueEnd) return;
+    try {
+      const snap = await getDocs(query(
+        collection(db, `companies/${companyId}/jobs`),
+        where("scheduledDate", ">=", dueStart),
+        where("scheduledDate", "<=", dueEnd),
+      ));
+      const jobMap: { [id: string]: Job } = {};
+      snap.docs.forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
+      setAllJobs(prev => ({ ...prev, ...jobMap }));
+    } catch (error) {
+      console.error("Load job pool jobs error:", error);
+    }
+  }, []);
+
   useEffect(() => {
     if (!userProfile?.companyId) return;
     loadTechs(userProfile.companyId);
@@ -1313,6 +1366,8 @@ export default function RoutesPage() {
         return { route, tech, jobs: [], color, expanded: true };
       });
       setAllRoutes(routes);
+      const routeStopIds = routes.flatMap((tr) => tr.route.stopSequence || []);
+      loadRouteStopJobs(userProfile.companyId!, routeStopIds);
 
       // Keep selected date pills aligned with the currently loaded range.
       const dates = [...new Set(routes.map((r) => r.route.date))].sort();
@@ -1326,7 +1381,16 @@ export default function RoutesPage() {
     });
 
     return () => unsubscribe();
-  }, [userProfile, startDate, endDate]);
+  }, [endDate, loadJobsForRange, loadRouteStopJobs, startDate, userProfile]);
+
+  useEffect(() => {
+    if (!userProfile?.companyId || !showJobPoolLayer) return;
+    loadJobPoolJobs(
+      userProfile.companyId,
+      jobPoolDueStart || startDate,
+      jobPoolDueEnd || endDate,
+    );
+  }, [endDate, jobPoolDueEnd, jobPoolDueStart, loadJobPoolJobs, showJobPoolLayer, startDate, userProfile?.companyId]);
 
   useEffect(() => {
     const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
@@ -1720,18 +1784,6 @@ export default function RoutesPage() {
     } catch {
       setTechs([]);
       setSelectedTechIds([]);
-    }
-  }
-
-  async function loadJobsForRange(companyId: string) {
-    try {
-      // Load all jobs that could appear in routes (pending + scheduled in range, plus past-due)
-      const snap = await getDocs(collection(db, `companies/${companyId}/jobs`));
-      const jobMap: { [id: string]: Job } = {};
-      snap.docs.forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
-      setAllJobs(jobMap);
-    } catch {
-      setAllJobs({});
     }
   }
 
@@ -2220,8 +2272,8 @@ export default function RoutesPage() {
               className="h-8 px-2 text-xs text-cyan-200 hover:text-cyan-100 hover:bg-cyan-500/10"
               onClick={() => {
                 setJobPoolFilterTouched(false);
-                setJobPoolDueStart("");
-                setJobPoolDueEnd(offsetDateString(endDate, 14));
+                setJobPoolDueStart(startDate);
+                setJobPoolDueEnd(endDate);
               }}
             >
               Reset
