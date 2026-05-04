@@ -18,7 +18,7 @@ import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
-import { getSubscriptionLastServiced, routeAddressKey } from "@/lib/route-bundles";
+import { getSubscriptionLastServiced, routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Input } from "@/components/ui/input";
 import {
@@ -745,6 +745,7 @@ export default function RoutesPage() {
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return false;
         const status = String(job.status || "pending").toLowerCase();
         if (status === "completed" || status === "cancelled") return false;
+        if (job.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(job)) return false;
         const dueDate = String(job.scheduledDate || "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
         return dueDate <= poolEndDate;
@@ -908,6 +909,7 @@ export default function RoutesPage() {
         if (routedJobIds.has(candidate.id)) return false;
         const status = String(candidate.status || "pending").toLowerCase();
         if (status === "completed" || status === "cancelled") return false;
+        if (candidate.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(candidate)) return false;
         const dueDate = String(candidate.scheduledDate || "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
         if (dueDate > bundleHorizon && dueDate.slice(0, 7) !== routeMonth) return false;
@@ -1461,6 +1463,7 @@ export default function RoutesPage() {
         const clickOrderActive = clickReorderRouteId === routeId;
         const routeStats = getRouteDisplayMetrics(tr.route, allJobs);
         const stopProduction = calculateStopProductionValue(job);
+        const lastServiced = getSubscriptionLastServiced(job);
 
         const marker = new window.google.maps.Marker({
           position: pos,
@@ -1493,6 +1496,8 @@ export default function RoutesPage() {
               ${job.serviceType ? `${escapeHtml(job.serviceType)} · ` : ""}${Number(job.duration || 25)} min at stop
             </div>
             <div style="border-top:1px solid #e5e7eb;padding-top:7px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+              <div><div style="color:#777">Due</div><div style="font-weight:700">${escapeHtml(job.scheduledDate || "-")}</div></div>
+              <div><div style="color:#777">Last serviced</div><div style="font-weight:700">${escapeHtml(lastServiced || "-")}</div></div>
               <div><div style="color:#777">Stop value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
               <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(routeStats.productionValue)}</div></div>
               <div><div style="color:#777">Route drive</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>

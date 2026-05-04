@@ -50,6 +50,9 @@ export interface Job {
   subscriptionOnHold?: string;
   initialServiceDate?: string;
   subscriptionLastServiced?: string;
+  subscriptionLastCompletedDate?: string;
+  serviceDueAlreadyCompleted?: boolean;
+  serviceDueCompletionCheck?: string;
   revenue?: string;
   productionValue?: string;
   subscriptionCategory?: string;

@@ -10,6 +10,7 @@ import {
   normalizeServiceDate,
   normalizeServiceType,
 } from "@/lib/job-id";
+import { normalizeRouteDateValue } from "@/lib/route-bundles";
 
 interface CsvRow {
   [key: string]: string;
@@ -179,6 +180,7 @@ export async function POST(request: NextRequest) {
 
     let newCount = 0;
     let updatedCount = 0;
+    let alreadyCompletedCount = 0;
     const invalidRows: InvalidRow[] = [];
 
     const batchId = randomUUID();
@@ -301,6 +303,25 @@ export async function POST(request: NextRequest) {
         "assigned_tech",
         "Tech",
       );
+      const subscriptionLastServiced = col(
+        row,
+        "Subscription Last Serviced",
+        "subscriptionLastServiced",
+        "Subscription Last Service",
+        "Last Serviced",
+        "lastServiced",
+        "Last Service Date",
+        "lastServiceDate",
+        "Last Completed",
+        "lastCompleted",
+      );
+      const subscriptionLastCompletedDate =
+        normalizeServiceDate(subscriptionLastServiced) ||
+        normalizeRouteDateValue(subscriptionLastServiced);
+      const serviceDueAlreadyCompleted =
+        Boolean(subscriptionLastCompletedDate) &&
+        subscriptionLastCompletedDate >= scheduledDate;
+      if (serviceDueAlreadyCompleted) alreadyCompletedCount++;
       const baseJobData = {
         jobId,
         customerId,
@@ -347,24 +368,20 @@ export async function POST(request: NextRequest) {
         subscriptionBalance: col(row, "Subscription Balance", "subscriptionBalance"),
         subscriptionOnHold: col(row, "Subscription On Hold", "subscriptionOnHold"),
         initialServiceDate: col(row, "Initial Service", "initialService", "initialServiceDate"),
-        subscriptionLastServiced: col(
-          row,
-          "Subscription Last Serviced",
-          "subscriptionLastServiced",
-          "Subscription Last Service",
-          "Last Serviced",
-          "lastServiced",
-          "Last Service Date",
-          "lastServiceDate",
-          "Last Completed",
-          "lastCompleted",
-        ),
+        subscriptionLastServiced,
+        subscriptionLastCompletedDate,
+        serviceDueAlreadyCompleted,
+        serviceDueCompletionCheck:
+          serviceDueAlreadyCompleted && subscriptionLastCompletedDate
+            ? `Last completed ${subscriptionLastCompletedDate} is on or after service due ${scheduledDate}.`
+            : "",
         revenue: col(row, "Revenue", "revenue"),
         productionValue: col(row, "Production Value", "productionValue"),
         subscriptionCategory: col(row, "Subscription Category", "subscriptionCategory"),
         ...csvSnapshot,
         csvSourceColumns: csvSnapshot.csvColumns,
-        status: "pending" as const,
+        status: serviceDueAlreadyCompleted ? "completed" as const : "pending" as const,
+        ...(serviceDueAlreadyCompleted ? { completedAt: subscriptionLastCompletedDate } : {}),
         companyId,
         source: "csv_upload" as const,
         uploadBatchId: batchId,
@@ -374,10 +391,15 @@ export async function POST(request: NextRequest) {
       if (existing.exists) {
         const existingData = existing.data() || {};
         const existingStatus = String(existingData.status || "").toLowerCase();
+        const resolvedStatus = serviceDueAlreadyCompleted
+          ? "completed"
+          : existingData.status || "pending";
         const updateData = {
           ...baseJobData,
-          status: existingData.status || "pending",
-          ...(existingStatus && existingStatus !== "pending"
+          status: resolvedStatus,
+          ...(serviceDueAlreadyCompleted
+            ? { assignedTechId: existingData.assignedTechId || assignedTechId }
+            : existingStatus && existingStatus !== "pending"
             ? { assignedTechId: existingData.assignedTechId || assignedTechId }
             : { assignedTechId }),
           lastUploadBatchId: batchId,
@@ -414,6 +436,7 @@ export async function POST(request: NextRequest) {
       totalRows: rows.length,
       newJobs: newCount,
       updatedJobs: updatedCount,
+      alreadyCompleted: alreadyCompletedCount,
       invalidRows: invalidRows.length,
       invalidRowsSample: invalidRows.slice(0, 20),
     });
@@ -425,11 +448,12 @@ export async function POST(request: NextRequest) {
       total,
       new: newCount,
       updated: updatedCount,
+      alreadyCompleted: alreadyCompletedCount,
       skipped: 0,
       duplicatesSkipped: 0,
       invalid: invalidRows.length,
       invalidSample: invalidRows.slice(0, 10),
-      message: `${total} rows: ${newCount} new, ${updatedCount} updated${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
+      message: `${total} rows: ${newCount} new, ${updatedCount} updated${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
     });
   } catch (error) {
     console.error("Upload jobs error:", error);

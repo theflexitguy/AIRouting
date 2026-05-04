@@ -1,7 +1,9 @@
 type CsvBackedRecord = {
   address?: unknown;
   addressRaw?: unknown;
+  scheduledDate?: unknown;
   subscriptionLastServiced?: unknown;
+  subscriptionLastCompletedDate?: unknown;
   lastServiced?: unknown;
   lastServiceDate?: unknown;
   csvFields?: Array<{ name?: unknown; value?: unknown }>;
@@ -47,11 +49,43 @@ function csvFieldValue(record: CsvBackedRecord, names: string[]) {
 
 export function getSubscriptionLastServiced(record: CsvBackedRecord) {
   return (
+    String(record.subscriptionLastCompletedDate || "").trim() ||
     String(record.subscriptionLastServiced || "").trim() ||
     String(record.lastServiced || "").trim() ||
     String(record.lastServiceDate || "").trim() ||
     csvFieldValue(record, LAST_SERVICED_FIELD_NAMES)
   );
+}
+
+export function normalizeRouteDateValue(value: unknown) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) {
+    const [, y, m, d] = iso;
+    return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+
+  const slash = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (slash) {
+    const [, m, d, y] = slash;
+    const year = y.length === 2 ? `20${y}` : y;
+    return `${year}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) return "";
+  const year = parsed.getUTCFullYear();
+  const month = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export function serviceDueAlreadyCompleted(record: CsvBackedRecord) {
+  const dueDate = normalizeRouteDateValue(record.scheduledDate);
+  const lastCompleted = normalizeRouteDateValue(getSubscriptionLastServiced(record));
+  return Boolean(dueDate && lastCompleted && lastCompleted >= dueDate);
 }
 
 export function normalizeRouteAddress(value: unknown) {

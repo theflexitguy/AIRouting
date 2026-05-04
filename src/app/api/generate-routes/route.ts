@@ -14,7 +14,7 @@ import {
   type RouteOptimizationShadowResult,
   type RoutePoint,
 } from "@/lib/google-routing";
-import { routeAddressKey } from "@/lib/route-bundles";
+import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -252,6 +252,8 @@ interface JobDoc {
   recurringFrequency?: string;
   billingFrequency?: string;
   subscriptionLastServiced?: string;
+  subscriptionLastCompletedDate?: string;
+  serviceDueAlreadyCompleted?: boolean;
   subscriptionCategory?: string;
   [key: string]: unknown;
 }
@@ -1245,6 +1247,7 @@ export async function POST(request: NextRequest) {
 
     const isJobForSelectedTech = (d: JobDoc) => {
       if (isGeneratedRouteAssignment(d)) return false;
+      if (d.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(d)) return false;
       return selectedTechs.some((tech) => jobAssignedToTech(d, tech));
     };
 
