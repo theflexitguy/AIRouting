@@ -24,6 +24,7 @@ const DEFAULT_MAX_DRIVE_MINUTES = 240;
 const JOB_CAP = 500;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
+const TUESDAY_STOP_REDUCTION = 3;
 
 function _dateOffset(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
@@ -147,6 +148,15 @@ function weekdayLabelForDate(dateStr: string) {
   const date = new Date(`${dateStr}T00:00:00Z`);
   const day = date.getUTCDay();
   return WEEKDAY_LABEL_BY_JS_DAY[Number.isFinite(day) ? day : 0];
+}
+
+function maxStopsForRouteDate(baseMaxStops: number, routeDate: string) {
+  return Math.max(
+    1,
+    weekdayLabelForDate(routeDate) === "TUE"
+      ? baseMaxStops - TUESDAY_STOP_REDUCTION
+      : baseMaxStops,
+  );
 }
 
 function weekdaySet(value: string) {
@@ -325,6 +335,7 @@ interface RouteSlot {
   date: string;
   tech: Record<string, unknown> & { id: string };
   index: number;
+  maxStops: number;
 }
 
 interface SlotAssignment {
@@ -782,6 +793,10 @@ function canPlaceUnitOnSlot(unit: JobUnit, slot: RouteSlot) {
   );
 }
 
+function slotStopLimit(slot: RouteSlot) {
+  return Math.max(1, Number(slot.maxStops || 1));
+}
+
 function unitAssignmentCost(
   unit: JobUnit,
   slotJobs: JobDoc[],
@@ -827,7 +842,6 @@ function unitAssignmentCostForSlot(
 
 function optimizeUnitAssignments(
   assignments: UnitAssignment[],
-  maxStops: number,
   rangeStart: string,
   rangeEnd: string,
 ) {
@@ -861,12 +875,14 @@ function optimizeUnitAssignments(
         const currentCost = costs[aIdx] + costs[bIdx];
         const routeAStopCount = unitStopCount(routeA.units);
         const routeBStopCount = unitStopCount(routeB.units);
+        const routeAStopLimit = slotStopLimit(routeA.slot);
+        const routeBStopLimit = slotStopLimit(routeB.slot);
 
         for (let i = 0; i < routeA.units.length; i++) {
           const movingA = routeA.units[i];
           if (
             !movingA.lockedSlotKey &&
-            routeBStopCount + movingA.jobs.length <= maxStops &&
+            routeBStopCount + movingA.jobs.length <= routeBStopLimit &&
             routeA.units.length > 1 &&
             canScheduleUnitOnDate(movingA, routeB.slot.date)
           ) {
@@ -888,8 +904,8 @@ function optimizeUnitAssignments(
             if (
               movingA.lockedSlotKey ||
               movingB.lockedSlotKey ||
-              routeAStopCount - movingA.jobs.length + movingB.jobs.length > maxStops ||
-              routeBStopCount - movingB.jobs.length + movingA.jobs.length > maxStops ||
+              routeAStopCount - movingA.jobs.length + movingB.jobs.length > routeAStopLimit ||
+              routeBStopCount - movingB.jobs.length + movingA.jobs.length > routeBStopLimit ||
               !canScheduleUnitOnDate(movingB, routeA.slot.date) ||
               !canScheduleUnitOnDate(movingA, routeB.slot.date)
             ) {
@@ -935,14 +951,12 @@ function optimizeUnitAssignments(
 function assignJobsToTechSlots({
   jobs,
   slots,
-  maxStops,
   rangeStart,
   rangeEnd,
   selectedTechs,
 }: {
   jobs: JobDoc[];
   slots: RouteSlot[];
-  maxStops: number;
   rangeStart: string;
   rangeEnd: string;
   selectedTechs: Array<Record<string, unknown> & { id: string }>;
@@ -955,20 +969,25 @@ function assignJobsToTechSlots({
       .filter((entry) => entry[1]),
   );
   const sortedUnits = buildSameAddressJobUnits(jobs, rangeStart, rangeEnd, lockedSlotKeyByJobId);
+  const maxSlotStops = slots.reduce((max, slot) => Math.max(max, slotStopLimit(slot)), 1);
 
   for (const unit of sortedUnits) {
-    if (unit.jobs.length > maxStops) {
+    const lockedSlot = unit.lockedSlotKey
+      ? slots.find((slot) => routeSlotKey(slot.date, slot.tech.id) === unit.lockedSlotKey)
+      : null;
+    const unitStopLimit = lockedSlot ? slotStopLimit(lockedSlot) : maxSlotStops;
+    if (unit.jobs.length > unitStopLimit) {
       unit.jobs.forEach((job) => {
         unassignedJobs.push({
           job,
-          reason: `same-address bundle has ${unit.jobs.length} subscriptions, over the ${maxStops}-stop route limit`,
+          reason: `same-address bundle has ${unit.jobs.length} subscriptions, over the ${unitStopLimit}-stop route limit`,
         });
       });
       continue;
     }
     const target = assignments
       .filter((assignment) =>
-        unitStopCount(assignment.units) + unit.jobs.length <= maxStops &&
+        unitStopCount(assignment.units) + unit.jobs.length <= slotStopLimit(assignment.slot) &&
         canPlaceUnitOnSlot(unit, assignment.slot),
       )
       .map((assignment) => ({
@@ -1002,7 +1021,7 @@ function assignJobsToTechSlots({
   }
 
   return {
-    assignments: optimizeUnitAssignments(assignments, maxStops, rangeStart, rangeEnd)
+    assignments: optimizeUnitAssignments(assignments, rangeStart, rangeEnd)
       .map(unitAssignmentToSlotAssignment),
     unassignedJobs,
   };
@@ -1044,13 +1063,13 @@ async function buildFastFallbackRoutes({
       date: routeDate,
       tech,
       index: slotIndex + dateIndex,
+      maxStops: maxStopsForRouteDate(maxStops, routeDate),
     }));
     slotIndex += dates.length;
 
     const assignmentResult = assignJobsToTechSlots({
       jobs: techJobs,
       slots: techSlots,
-      maxStops,
       rangeStart,
       rangeEnd,
       selectedTechs,
@@ -1135,6 +1154,8 @@ async function buildFastFallbackRoutes({
         date: slot.date,
         techId: slot.tech.id,
         techName: String(slot.tech.name || slot.tech.id),
+        maxStopsParam: slot.maxStops,
+        baseMaxStopsParam: maxStops,
         driveTimeSource,
         polylineSource: geometryResult.polylineSource,
         polylineStatus: geometryResult.status,
@@ -1437,9 +1458,17 @@ export async function POST(request: NextRequest) {
     }
 
     const numDays = _daysBetween(rangeStart, rangeEnd);
+    const dates: string[] = [];
+    for (let d = 0; d < numDays; d++) {
+      dates.push(_dateOffset(rangeStart, d));
+    }
+    const perTechCapacity = dates.reduce(
+      (sum, routeDate) => sum + maxStopsForRouteDate(maxStops, routeDate),
+      0,
+    );
+    const tuesdayMaxStops = Math.max(1, maxStops - TUESDAY_STOP_REDUCTION);
     const totalSlots = selectedTechs.length * numDays;
-    const capacity = Math.min(JOB_CAP, totalSlots * maxStops);
-    const perTechCapacity = numDays * maxStops;
+    const capacity = Math.min(JOB_CAP, selectedTechs.length * perTechCapacity);
     const prioritySort = jobPriorityComparator(rangeStart, rangeEnd);
 
     const selectedByTech = new Map<string, JobDoc[]>();
@@ -1503,7 +1532,13 @@ export async function POST(request: NextRequest) {
         },
         capacity,
         deferred: jobsDeferred,
-        params: { maxStops, maxDriveTime, numDays, numTechs: selectedTechs.length },
+        params: {
+          maxStops,
+          tuesdayMaxStops,
+          maxDriveTime,
+          numDays,
+          numTechs: selectedTechs.length,
+        },
       }),
     );
 
@@ -1525,11 +1560,6 @@ export async function POST(request: NextRequest) {
       billingFrequency: String(d.billingFrequency || ""),
       subscriptionLastServiced: String(d.subscriptionLastServiced || ""),
     }));
-
-    const dates: string[] = [];
-    for (let d = 0; d < numDays; d++) {
-      dates.push(_dateOffset(rangeStart, d));
-    }
 
     // --- 6. Call Python routing backend ---
     const mergedSettings: Record<string, unknown> = {
@@ -1637,7 +1667,11 @@ export async function POST(request: NextRequest) {
     }
 
     const shadowVehicleSlots = selectedTechs.flatMap((tech) =>
-      dates.map((routeDate) => ({ date: routeDate, tech })),
+      dates.map((routeDate) => ({
+        date: routeDate,
+        tech,
+        maxStops: maxStopsForRouteDate(maxStops, routeDate),
+      })),
     );
     let routeOptimizationShadow: RouteOptimizationShadowResult = {
       status: "disabled",
@@ -1667,7 +1701,7 @@ export async function POST(request: NextRequest) {
           date: slot.date,
           techId: slot.tech.id,
           techName: String((slot.tech as Record<string, unknown>).name || slot.tech.id),
-          maxStops,
+          maxStops: slot.maxStops,
         })),
         customRoutes: routes.map((route, index) => ({
           id: String(route.routeName || index),
@@ -1712,6 +1746,8 @@ export async function POST(request: NextRequest) {
       const dayIndex = Math.floor(i / selectedTechs.length) % numDays;
       const techIndex = i % selectedTechs.length;
       const routeDate = String(route.date || dates[dayIndex]);
+      const routeMaxStops =
+        Number(route.maxStopsParam) || maxStopsForRouteDate(maxStops, routeDate);
       const tech = selectedTechs[techIndex];
       const techId = String(route.techId || tech?.id || `route-${i}`);
       const techName =
@@ -1766,7 +1802,9 @@ export async function POST(request: NextRequest) {
             rawStatus: routeOptimizationShadow.rawStatus || "",
             warnings: routeOptimizationShadow.warnings,
           },
-          maxStopsParam: maxStops,
+          maxStopsParam: routeMaxStops,
+          baseMaxStopsParam: Number(route.baseMaxStopsParam) || maxStops,
+          tuesdayStopReduction: TUESDAY_STOP_REDUCTION,
           maxDriveTimeParam: maxDriveTime,
           confidence: 0.85,
           generatedBy: "ai",

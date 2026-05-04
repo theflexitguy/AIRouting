@@ -2187,6 +2187,7 @@ export default function RoutesPage() {
                 value={maxStops}
                 onChange={(e) => setMaxStops(Math.max(1, parseInt(e.target.value) || 16))}
                 className="h-9 w-16 text-sm"
+                title="Tuesday routes automatically use 3 fewer stops."
               />
             </label>
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">

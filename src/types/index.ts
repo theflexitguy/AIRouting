@@ -94,6 +94,9 @@ export interface Route {
   googleRouteOptimizationShadowScore?: number;
   googleRouteOptimizationRunId?: string;
   googleRouteOptimizationSummary?: Record<string, unknown>;
+  maxStopsParam?: number;
+  baseMaxStopsParam?: number;
+  tuesdayStopReduction?: number;
   generatedBy: 'human' | 'ai';
   confidence: number; // 0-1
   approved: boolean;
