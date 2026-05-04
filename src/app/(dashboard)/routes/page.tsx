@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, type ReactNode } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -12,11 +12,12 @@ import { calculateStopProductionValue, formatCurrency } from "@/lib/production-v
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
   Clock, AlertTriangle, Calendar,
-  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick, DollarSign
+  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick, DollarSign, Layers
 } from "lucide-react";
 import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
+import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Input } from "@/components/ui/input";
 import {
@@ -44,6 +45,7 @@ import { Undo2, Redo2 } from "lucide-react";
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
+const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 interface RoadRouteResult {
   path: Array<{ lat: number; lng: number }>;
@@ -64,6 +66,80 @@ function routeDropId(routeId: string) {
 
 function parseRouteDropId(id: string) {
   return id.startsWith(ROUTE_DROP_PREFIX) ? id.slice(ROUTE_DROP_PREFIX.length) : null;
+}
+
+function offsetDateString(dateStr: string, days: number) {
+  const date = new Date(`${dateStr}T00:00:00`);
+  if (!Number.isFinite(date.getTime())) return dateStr;
+  date.setDate(date.getDate() + days);
+  return format(date, "yyyy-MM-dd");
+}
+
+function normalizeMatchValue(value: unknown) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function technicianMatchTokens(tech: Technician) {
+  return [
+    tech.id,
+    tech.name,
+    tech.employeeId,
+    (tech as unknown as Record<string, unknown>).fieldRoutesEmployeeId,
+    (tech as unknown as Record<string, unknown>).fieldRoutesTechId,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+}
+
+function assignedTechBlockReason(job: Job, tech: Technician) {
+  const assigned = String(job.assignedTechId || "").trim();
+  if (!assigned) return "";
+  const assignedNormalized = normalizeMatchValue(assigned);
+  const matches = technicianMatchTokens(tech).some((token) => {
+    return token === assigned || normalizeMatchValue(token) === assignedNormalized;
+  });
+  return matches ? "" : `assigned to ${assigned}`;
+}
+
+function weekdaySet(value: string) {
+  return new Set(
+    value
+      .split(",")
+      .map((part) => part.trim().toUpperCase())
+      .filter(Boolean),
+  );
+}
+
+function weekdayLabelForDate(dateStr: string) {
+  const date = new Date(`${dateStr}T00:00:00Z`);
+  const day = date.getUTCDay();
+  return WEEKDAY_LABEL_BY_JS_DAY[Number.isFinite(day) ? day : 0];
+}
+
+function jobScheduleBlockReason(job: Job, routeDate: string) {
+  const parsed = parseSchedulingRequest(job.schedulingRequest);
+  if (!parsed.schedulingRequestClass) return "";
+
+  if (CRITICAL_CLASSES.has(parsed.schedulingRequestClass)) {
+    return parsed.schedulingConstraintNote || parsed.schedulingRequestClass;
+  }
+
+  const weekday = weekdayLabelForDate(routeDate);
+  const allowed = weekdaySet(parsed.schedulingAllowedWeekdays);
+  if (allowed.size > 0 && !allowed.has(weekday)) {
+    return `requires ${parsed.schedulingAllowedWeekdays}`;
+  }
+
+  const blocked = weekdaySet(parsed.schedulingBlockedWeekdays);
+  if (blocked.has(weekday)) {
+    return `no ${weekday}`;
+  }
+
+  return "";
 }
 
 function toRadians(value: number) {
@@ -371,6 +447,20 @@ function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>) {
   </div>`;
 }
 
+function poolJobHtml(job: Job) {
+  const stopProduction = calculateStopProductionValue(job);
+  return `<div style="color:#111;padding:8px;max-width:270px">
+    <div style="font-weight:700;margin-bottom:2px">${escapeHtml(job.customerName)}</div>
+    <div style="color:#666;font-size:12px;margin-bottom:6px">${escapeHtml(job.address)}</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+      <div><div style="color:#777">Due</div><div style="font-weight:700">${escapeHtml(job.scheduledDate || "No date")}</div></div>
+      <div><div style="color:#777">Duration</div><div style="font-weight:700">${Number(job.duration || 25)} min</div></div>
+      <div><div style="color:#777">Value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
+      <div><div style="color:#777">Assigned</div><div style="font-weight:700">${escapeHtml(job.assignedTechId || "Open")}</div></div>
+    </div>
+  </div>`;
+}
+
 interface TechRoute {
   route: Route;
   tech: Technician;
@@ -597,6 +687,7 @@ export default function RoutesPage() {
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [editMode, setEditMode] = useState(false);
+  const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
   const [leftPanelRouteId, setLeftPanelRouteId] = useState<string | null>(null);
@@ -638,6 +729,29 @@ export default function RoutesPage() {
     ? allRoutes.filter((tr) => selectedDates.includes(tr.route.date))
     : allRoutes;
   const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved);
+  const routedJobIds = useMemo(() => {
+    const ids = new Set<string>();
+    allRoutes.forEach((tr) => tr.route.stopSequence.forEach((jobId) => ids.add(jobId)));
+    return ids;
+  }, [allRoutes]);
+  const jobPoolJobs = useMemo(() => {
+    const poolEndDate = offsetDateString(endDate, 14);
+    return Object.values(allJobs)
+      .filter((job) => {
+        if (routedJobIds.has(job.id)) return false;
+        if (typeof job.lat !== "number" || typeof job.lng !== "number") return false;
+        const status = String(job.status || "pending").toLowerCase();
+        if (status === "completed" || status === "cancelled") return false;
+        const dueDate = String(job.scheduledDate || "");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
+        return dueDate <= poolEndDate;
+      })
+      .sort((a, b) => {
+        const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
+        if (dateDiff !== 0) return dateDiff;
+        return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
+      });
+  }, [allJobs, endDate, routedJobIds]);
 
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
     return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
@@ -757,6 +871,108 @@ export default function RoutesPage() {
       toast.error("Failed to move stop");
     }
   }, [allJobs, allRoutes, calculateRouteMetrics, userProfile?.companyId, userProfile?.email]);
+
+  const handleAddPoolJobToRoute = useCallback(async (
+    jobId: string,
+    toRouteId: string,
+    insertAfterJobId?: string,
+  ) => {
+    if (!userProfile?.companyId) return;
+    const job = allJobs[jobId];
+    const toRoute = allRoutes.find(r => r.route.id === toRouteId);
+    if (!job || !toRoute) return;
+    if (toRoute.route.stopSequence.includes(jobId)) return;
+
+    const assignedBlock = assignedTechBlockReason(job, toRoute.tech);
+    if (assignedBlock) {
+      toast.error(`${job.customerName || "Job"} is ${assignedBlock}, not ${toRoute.tech.name}.`);
+      return;
+    }
+
+    const scheduleBlock = jobScheduleBlockReason(job, toRoute.route.date);
+    if (scheduleBlock) {
+      toast.error(`${job.customerName || "Job"} cannot be scheduled on ${toRoute.route.date}: ${scheduleBlock}.`);
+      return;
+    }
+
+    const oldSeq = toRoute.route.stopSequence;
+    const newSeq = oldSeq.filter(id => id !== jobId);
+    const insertAfterIndex = insertAfterJobId ? newSeq.indexOf(insertAfterJobId) : -1;
+    if (insertAfterIndex >= 0) {
+      newSeq.splice(insertAfterIndex + 1, 0, jobId);
+    } else {
+      newSeq.push(jobId);
+    }
+
+    const metrics = await calculateRouteMetrics(newSeq, toRoute.route.date);
+    const previousRoutes = allRoutes;
+    const previousJob = job;
+    const now = new Date().toISOString();
+
+    setAllRoutes(allRoutes.map(r =>
+      r.route.id === toRouteId
+        ? {
+            ...r,
+            route: applyMetricsToRoute({
+              ...r.route,
+              stopSequence: newSeq,
+              generatedBy: "human" as const,
+            }, metrics),
+          }
+        : r,
+    ));
+    setAllJobs(prev => ({
+      ...prev,
+      [jobId]: {
+        ...prev[jobId],
+        assignedTechId: toRoute.tech.id,
+        status: "scheduled",
+        updatedAt: now,
+      },
+    }));
+
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
+        stopSequence: newSeq,
+        ...routeMetricUpdateFields(metrics),
+        generatedBy: "human",
+        updatedAt: now,
+      });
+      batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
+        assignedTechId: toRoute.tech.id,
+        status: "scheduled",
+        updatedAt: now,
+      });
+      await batch.commit();
+
+      pushEdit({
+        type: "addStop",
+        timestamp: Date.now(),
+        description: "Added pool stop to route",
+        before: [{ routeId: toRouteId, stopSequence: oldSeq, date: toRoute.route.date }],
+        after: [{ routeId: toRouteId, stopSequence: newSeq, date: toRoute.route.date }],
+      });
+      fetch("/api/record-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: toRouteId,
+          originalRoute: toRoute.route,
+          modifiedRoute: { ...toRoute.route, stopSequence: newSeq },
+          modifiedBy: userProfile.email,
+        }),
+      }).catch(() => {});
+
+      toast.success(`Added ${job.customerName || "job"} → ${toRoute.tech.name}`);
+    } catch (e) {
+      console.error("Add pool job error:", e);
+      setAllRoutes(previousRoutes);
+      setAllJobs(prev => ({ ...prev, [jobId]: previousJob }));
+      toast.error("Failed to add job to route");
+    }
+  }, [allJobs, allRoutes, calculateRouteMetrics, pushEdit, userProfile?.companyId, userProfile?.email]);
 
   const handlePanelDragEnd = useCallback(async (event: DragEndEvent) => {
     const { active, over } = event;
@@ -1368,6 +1584,60 @@ export default function RoutesPage() {
       }
     });
 
+    if (showJobPoolLayer) {
+      jobPoolJobs.forEach((job) => {
+        if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
+        const pos = new window.google.maps.LatLng(job.lat, job.lng);
+        bounds.extend(pos);
+        hasCoords = true;
+
+        const marker = new window.google.maps.Marker({
+          position: pos,
+          map,
+          draggable: visibleRoutes.length > 0 && !clickReorderRouteId,
+          icon: {
+            path: window.google.maps.SymbolPath.CIRCLE,
+            fillColor: "#22d3ee",
+            fillOpacity: 0.95,
+            strokeColor: "#e0f2fe",
+            strokeWeight: 2,
+            scale: 9,
+          },
+          title: `${job.customerName} — job pool`,
+          zIndex: 5,
+        });
+        const infoWindow = new window.google.maps.InfoWindow({
+          content: poolJobHtml(job),
+        });
+
+        marker.addListener("mouseover", () => {
+          infoWindow.open(map, marker);
+        });
+        marker.addListener("mouseout", () => {
+          infoWindow.close();
+        });
+        marker.addListener("click", () => {
+          infoWindow.open(map, marker);
+        });
+        marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
+          marker.setPosition(pos);
+          if (!event.latLng) return;
+          const target = findNearestRouteDropTarget(
+            { lat: event.latLng.lat(), lng: event.latLng.lng() },
+            "",
+            job.id,
+          );
+          if (!target) {
+            toast.info("Drop the pool job onto a route stop to add it.");
+            return;
+          }
+          await handleAddPoolJobToRoute(job.id, target.routeId, target.jobId);
+        });
+
+        mapMarkersRef.current.push(marker);
+      });
+    }
+
     // Only fit bounds on FIRST data load — don't jump around after that
     if (hasCoords && !hasFittedBounds.current) {
       map.fitBounds(bounds, 50);
@@ -1376,7 +1646,7 @@ export default function RoutesPage() {
     return () => {
       cancelled = true;
     };
-  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleClickOrderPick, handleMoveStop, setHoveredStop, visibleRoutes, warnRoadSnapFailure]);
+  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, jobPoolJobs, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -1800,6 +2070,20 @@ export default function RoutesPage() {
             ))}
           </div>
           <div className="flex items-center gap-2 ml-auto">
+            <Button
+              variant={showJobPoolLayer ? "default" : "outline"}
+              onClick={() => setShowJobPoolLayer(prev => !prev)}
+              className={cn(
+                "h-9 text-sm",
+                showJobPoolLayer
+                  ? "bg-cyan-500 hover:bg-cyan-600 text-slate-950"
+                  : "text-muted-foreground",
+              )}
+              title="Show due jobs and jobs due within two weeks after the selected date range"
+            >
+              <Layers className="w-4 h-4" />
+              Job Pool ({jobPoolJobs.length})
+            </Button>
             <Button
               variant={editMode ? "default" : "outline"}
               onClick={() => setEditMode(!editMode)}
