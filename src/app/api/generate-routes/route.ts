@@ -14,6 +14,7 @@ import {
   type RouteOptimizationShadowResult,
   type RoutePoint,
 } from "@/lib/google-routing";
+import { routeAddressKey } from "@/lib/route-bundles";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -194,12 +195,51 @@ function dateAssignmentPenalty(job: JobDoc, slotDate: string, rangeStart: string
   return 25;
 }
 
+function shouldBundleSameAddressJob(anchor: JobDoc, candidate: JobDoc, rangeEnd: string) {
+  const anchorKey = routeAddressKey(anchor);
+  if (!anchorKey || routeAddressKey(candidate) !== anchorKey) return false;
+  const candidateDate = String(candidate.scheduledDate || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(candidateDate)) return false;
+  const anchorMonth = String(anchor.scheduledDate || "").slice(0, 7);
+  const candidateMonth = candidateDate.slice(0, 7);
+  return candidateDate <= _dateOffset(rangeEnd, 14) || (anchorMonth && candidateMonth === anchorMonth);
+}
+
+function expandSameAddressBundlesForSelection({
+  selectedJobs,
+  allJobs,
+  selectedTechs,
+  rangeEnd,
+}: {
+  selectedJobs: JobDoc[];
+  allJobs: JobDoc[];
+  selectedTechs: Array<Record<string, unknown> & { id: string }>;
+  rangeEnd: string;
+}) {
+  const byId = new Map(selectedJobs.map((job) => [job.docId, job]));
+  const selectedSnapshot = [...selectedJobs];
+
+  for (const anchor of selectedSnapshot) {
+    const tech = selectedTechs.find((candidateTech) => jobAssignedToTech(anchor, candidateTech));
+    if (!tech) continue;
+    for (const candidate of allJobs) {
+      if (byId.has(candidate.docId)) continue;
+      if (!jobAssignedToTech(candidate, tech)) continue;
+      if (!shouldBundleSameAddressJob(anchor, candidate, rangeEnd)) continue;
+      byId.set(candidate.docId, candidate);
+    }
+  }
+
+  return Array.from(byId.values());
+}
+
 interface JobDoc {
   docId: string;
   customerId?: string;
   customerID?: string;
   customerName?: string;
   address?: string;
+  addressRaw?: string;
   lat?: number | null;
   lng?: number | null;
   scheduledDate?: string;
@@ -211,6 +251,7 @@ interface JobDoc {
   assignedTechId?: string;
   recurringFrequency?: string;
   billingFrequency?: string;
+  subscriptionLastServiced?: string;
   subscriptionCategory?: string;
   [key: string]: unknown;
 }
@@ -406,6 +447,46 @@ function orderRouteWithMatrix(jobs: JobDoc[], matrix: number[][]) {
   };
 }
 
+function keepSameAddressJobsTogether(ordered: JobDoc[]) {
+  const byAddress = new Map<string, JobDoc[]>();
+  ordered.forEach((job) => {
+    const key = routeAddressKey(job);
+    if (!key) return;
+    byAddress.set(key, [...(byAddress.get(key) || []), job]);
+  });
+
+  const emitted = new Set<string>();
+  const output: JobDoc[] = [];
+  ordered.forEach((job) => {
+    const key = routeAddressKey(job);
+    if (!key) {
+      output.push(job);
+      return;
+    }
+    if (emitted.has(key)) return;
+    emitted.add(key);
+    output.push(...(byAddress.get(key) || [job]));
+  });
+  return output;
+}
+
+function orderedDriveMinutesFromMatrix(
+  ordered: JobDoc[],
+  matrixById: Map<string, number>,
+  matrix: number[][],
+) {
+  let total = 0;
+  for (let idx = 1; idx < ordered.length; idx++) {
+    const prevIdx = matrixById.get(ordered[idx - 1].docId);
+    const currentIdx = matrixById.get(ordered[idx].docId);
+    total +=
+      prevIdx !== undefined && currentIdx !== undefined
+        ? matrix[prevIdx][currentIdx]
+        : estimateDriveMinutes(ordered[idx - 1], ordered[idx]);
+  }
+  return total;
+}
+
 function orderNearestNeighbor(jobs: JobDoc[]) {
   if (jobs.length <= 2) return jobs;
 
@@ -574,34 +655,6 @@ function routeClusterCost(jobs: JobDoc[]) {
   return routeDriveMinutes(orderRoute(jobs)) + routeSpreadMinutes(jobs) * ROUTE_SPREAD_WEIGHT;
 }
 
-function incrementalClusterCost(job: JobDoc, slotJobs: JobDoc[]) {
-  if (slotJobs.length === 0) return 0;
-  return Math.max(
-    0,
-    (routeSpreadMinutes([...slotJobs, job]) - routeSpreadMinutes(slotJobs)) *
-      ROUTE_SPREAD_WEIGHT,
-  );
-}
-
-function slotAssignmentCost(
-  job: JobDoc,
-  slotJobs: JobDoc[],
-  slotDate: string,
-  rangeStart: string,
-  rangeEnd: string,
-) {
-  if (!canScheduleJobOnDate(job, slotDate)) return Number.POSITIVE_INFINITY;
-  const datePenalty = dateAssignmentPenalty(job, slotDate, rangeStart, rangeEnd);
-  if (slotJobs.length === 0) return datePenalty;
-
-  const nearestStopCost = Math.min(
-    ...slotJobs.map((existing) => estimateDriveMinutes(job, existing)),
-  );
-  const clusterCost = incrementalClusterCost(job, slotJobs);
-  const balancePenalty = slotJobs.length * 1.5;
-  return datePenalty + clusterCost + nearestStopCost * 0.35 + balancePenalty;
-}
-
 function assignmentCost(
   assignment: SlotAssignment,
   rangeStart: string,
@@ -618,6 +671,205 @@ function assignmentCost(
   return driveCost + dateCost;
 }
 
+interface JobUnit {
+  id: string;
+  jobs: JobDoc[];
+}
+
+interface UnitAssignment {
+  slot: RouteSlot;
+  units: JobUnit[];
+}
+
+function unitJobs(units: JobUnit[]) {
+  return units.flatMap((unit) => unit.jobs);
+}
+
+function unitStopCount(units: JobUnit[]) {
+  return units.reduce((sum, unit) => sum + unit.jobs.length, 0);
+}
+
+function jobUnitId(jobs: JobDoc[]) {
+  const key = routeAddressKey(jobs[0]);
+  return key || jobs.map((job) => job.docId).join("|");
+}
+
+function buildSameAddressJobUnits(jobs: JobDoc[], rangeStart: string, rangeEnd: string) {
+  const byAddress = new Map<string, JobDoc[]>();
+  const singles: JobUnit[] = [];
+  const prioritySort = jobPriorityComparator(rangeStart, rangeEnd);
+
+  for (const job of jobs) {
+    const key = routeAddressKey(job);
+    if (!key) {
+      singles.push({ id: job.docId, jobs: [job] });
+      continue;
+    }
+    byAddress.set(key, [...(byAddress.get(key) || []), job]);
+  }
+
+  const units = [
+    ...singles,
+    ...Array.from(byAddress.values()).map((group) => ({
+      id: jobUnitId(group),
+      jobs: [...group].sort(prioritySort),
+    })),
+  ];
+
+  return units.sort((a, b) => prioritySort(a.jobs[0], b.jobs[0]));
+}
+
+function canScheduleUnitOnDate(unit: JobUnit, slotDate: string) {
+  return unit.jobs.every((job) => canScheduleJobOnDate(job, slotDate));
+}
+
+function unitAssignmentCost(
+  unit: JobUnit,
+  slotJobs: JobDoc[],
+  slotDate: string,
+  rangeStart: string,
+  rangeEnd: string,
+) {
+  if (!canScheduleUnitOnDate(unit, slotDate)) return Number.POSITIVE_INFINITY;
+  const datePenalty = unit.jobs.reduce(
+    (sum, job) => sum + dateAssignmentPenalty(job, slotDate, rangeStart, rangeEnd),
+    0,
+  );
+  if (slotJobs.length === 0) return datePenalty;
+
+  const nearestStopCost = Math.min(
+    ...unit.jobs.flatMap((job) =>
+      slotJobs.map((existing) => estimateDriveMinutes(job, existing)),
+    ),
+  );
+  const clusterCost = Math.max(
+    0,
+    (routeSpreadMinutes([...slotJobs, ...unit.jobs]) - routeSpreadMinutes(slotJobs)) *
+      ROUTE_SPREAD_WEIGHT,
+  );
+  const balancePenalty = (slotJobs.length + unit.jobs.length) * 1.5;
+  return datePenalty + clusterCost + nearestStopCost * 0.35 + balancePenalty;
+}
+
+function unitAssignmentToSlotAssignment(assignment: UnitAssignment): SlotAssignment {
+  return {
+    slot: assignment.slot,
+    jobs: unitJobs(assignment.units),
+  };
+}
+
+function unitAssignmentCostForSlot(
+  assignment: UnitAssignment,
+  rangeStart: string,
+  rangeEnd: string,
+) {
+  return assignmentCost(unitAssignmentToSlotAssignment(assignment), rangeStart, rangeEnd);
+}
+
+function optimizeUnitAssignments(
+  assignments: UnitAssignment[],
+  maxStops: number,
+  rangeStart: string,
+  rangeEnd: string,
+) {
+  let optimized = assignments.map((assignment) => ({
+    slot: assignment.slot,
+    units: [...assignment.units],
+  }));
+  let costs = optimized.map((assignment) => unitAssignmentCostForSlot(assignment, rangeStart, rangeEnd));
+  const totalJobs = optimized.reduce((sum, assignment) => sum + unitStopCount(assignment.units), 0);
+  const maxPasses = totalJobs <= 120 ? 12 : totalJobs <= 240 ? 6 : 3;
+  const maxEvaluations = totalJobs <= 120 ? 50000 : totalJobs <= 240 ? 25000 : 10000;
+
+  for (let pass = 0; pass < maxPasses; pass++) {
+    let best:
+      | {
+          delta: number;
+          aIdx: number;
+          bIdx: number;
+          nextA: JobUnit[];
+          nextB: JobUnit[];
+          nextACost: number;
+          nextBCost: number;
+        }
+      | null = null;
+    let evaluations = 0;
+
+    for (let aIdx = 0; aIdx < optimized.length; aIdx++) {
+      for (let bIdx = aIdx + 1; bIdx < optimized.length; bIdx++) {
+        const routeA = optimized[aIdx];
+        const routeB = optimized[bIdx];
+        const currentCost = costs[aIdx] + costs[bIdx];
+        const routeAStopCount = unitStopCount(routeA.units);
+        const routeBStopCount = unitStopCount(routeB.units);
+
+        for (let i = 0; i < routeA.units.length; i++) {
+          const movingA = routeA.units[i];
+          if (
+            routeBStopCount + movingA.jobs.length <= maxStops &&
+            routeA.units.length > 1 &&
+            canScheduleUnitOnDate(movingA, routeB.slot.date)
+          ) {
+            const nextAUnits = routeA.units.filter((_, idx) => idx !== i);
+            const nextBUnits = [...routeB.units, movingA];
+            const nextA = { slot: routeA.slot, units: nextAUnits };
+            const nextB = { slot: routeB.slot, units: nextBUnits };
+            const nextACost = unitAssignmentCostForSlot(nextA, rangeStart, rangeEnd);
+            const nextBCost = unitAssignmentCostForSlot(nextB, rangeStart, rangeEnd);
+            const delta = currentCost - nextACost - nextBCost;
+            evaluations++;
+            if (delta > (best?.delta ?? 0)) {
+              best = { delta, aIdx, bIdx, nextA: nextAUnits, nextB: nextBUnits, nextACost, nextBCost };
+            }
+          }
+
+          for (let j = 0; j < routeB.units.length; j++) {
+            const movingB = routeB.units[j];
+            if (
+              routeAStopCount - movingA.jobs.length + movingB.jobs.length > maxStops ||
+              routeBStopCount - movingB.jobs.length + movingA.jobs.length > maxStops ||
+              !canScheduleUnitOnDate(movingB, routeA.slot.date) ||
+              !canScheduleUnitOnDate(movingA, routeB.slot.date)
+            ) {
+              continue;
+            }
+            const nextAUnits = routeA.units.map((unit, idx) => (idx === i ? movingB : unit));
+            const nextBUnits = routeB.units.map((unit, idx) => (idx === j ? movingA : unit));
+            const nextA = { slot: routeA.slot, units: nextAUnits };
+            const nextB = { slot: routeB.slot, units: nextBUnits };
+            const nextACost = unitAssignmentCostForSlot(nextA, rangeStart, rangeEnd);
+            const nextBCost = unitAssignmentCostForSlot(nextB, rangeStart, rangeEnd);
+            const delta = currentCost - nextACost - nextBCost;
+            evaluations++;
+            if (delta > (best?.delta ?? 0)) {
+              best = { delta, aIdx, bIdx, nextA: nextAUnits, nextB: nextBUnits, nextACost, nextBCost };
+            }
+            if (evaluations >= maxEvaluations) break;
+          }
+          if (evaluations >= maxEvaluations) break;
+        }
+
+        if (evaluations >= maxEvaluations) break;
+      }
+      if (evaluations >= maxEvaluations) break;
+    }
+
+    if (!best || best.delta < 0.25) break;
+    optimized = optimized.map((assignment, idx) => {
+      if (idx === best.aIdx) return { slot: assignment.slot, units: best.nextA };
+      if (idx === best.bIdx) return { slot: assignment.slot, units: best.nextB };
+      return assignment;
+    });
+    costs = costs.map((cost, idx) => {
+      if (idx === best.aIdx) return best.nextACost;
+      if (idx === best.bIdx) return best.nextBCost;
+      return cost;
+    });
+  }
+
+  return optimized;
+}
+
 function assignJobsToTechSlots({
   jobs,
   slots,
@@ -631,158 +883,58 @@ function assignJobsToTechSlots({
   rangeStart: string;
   rangeEnd: string;
 }) {
-  const assignments: SlotAssignment[] = slots.map((slot) => ({ slot, jobs: [] }));
+  const assignments: UnitAssignment[] = slots.map((slot) => ({ slot, units: [] }));
   const unassignedJobs: Array<{ job: JobDoc; reason: string }> = [];
-  const sortedJobs = [...jobs].sort(jobPriorityComparator(rangeStart, rangeEnd));
+  const sortedUnits = buildSameAddressJobUnits(jobs, rangeStart, rangeEnd);
 
-  for (const job of sortedJobs) {
+  for (const unit of sortedUnits) {
+    if (unit.jobs.length > maxStops) {
+      unit.jobs.forEach((job) => {
+        unassignedJobs.push({
+          job,
+          reason: `same-address bundle has ${unit.jobs.length} subscriptions, over the ${maxStops}-stop route limit`,
+        });
+      });
+      continue;
+    }
     const target = assignments
       .filter((assignment) =>
-        assignment.jobs.length < maxStops &&
-        canScheduleJobOnDate(job, assignment.slot.date),
+        unitStopCount(assignment.units) + unit.jobs.length <= maxStops &&
+        canScheduleUnitOnDate(unit, assignment.slot.date),
       )
       .map((assignment) => ({
         assignment,
-        cost: slotAssignmentCost(job, assignment.jobs, assignment.slot.date, rangeStart, rangeEnd),
+        cost: unitAssignmentCost(
+          unit,
+          unitJobs(assignment.units),
+          assignment.slot.date,
+          rangeStart,
+          rangeEnd,
+        ),
       }))
       .sort((a, b) => a.cost - b.cost)[0]?.assignment;
     if (target) {
-      target.jobs.push(job);
+      target.units.push(unit);
     } else {
-      const blockedDates = slots
-        .map((slot) => `${slot.date}: ${jobScheduleBlockReason(job, slot.date)}`)
-        .filter((entry) => !entry.endsWith(": "));
-      unassignedJobs.push({
-        job,
-        reason: blockedDates.length > 0
-          ? blockedDates.join("; ")
-          : "no route capacity",
+      unit.jobs.forEach((job) => {
+        const blockedDates = slots
+          .map((slot) => `${slot.date}: ${jobScheduleBlockReason(job, slot.date)}`)
+          .filter((entry) => !entry.endsWith(": "));
+        unassignedJobs.push({
+          job,
+          reason: blockedDates.length > 0
+            ? blockedDates.join("; ")
+            : "no route capacity",
+        });
       });
     }
   }
 
   return {
-    assignments: optimizeSlotAssignments(assignments, maxStops, rangeStart, rangeEnd),
+    assignments: optimizeUnitAssignments(assignments, maxStops, rangeStart, rangeEnd)
+      .map(unitAssignmentToSlotAssignment),
     unassignedJobs,
   };
-}
-
-function optimizeSlotAssignments(
-  assignments: SlotAssignment[],
-  maxStops: number,
-  rangeStart: string,
-  rangeEnd: string,
-) {
-  let optimized = assignments.map((assignment) => ({
-    slot: assignment.slot,
-    jobs: [...assignment.jobs],
-  }));
-  let costs = optimized.map((assignment) => assignmentCost(assignment, rangeStart, rangeEnd));
-  const totalJobs = optimized.reduce((sum, assignment) => sum + assignment.jobs.length, 0);
-  const maxPasses = totalJobs <= 120 ? 12 : totalJobs <= 240 ? 6 : 3;
-  const maxEvaluations = totalJobs <= 120 ? 50000 : totalJobs <= 240 ? 25000 : 10000;
-
-  for (let pass = 0; pass < maxPasses; pass++) {
-    let best:
-      | {
-          delta: number;
-          aIdx: number;
-          bIdx: number;
-          nextA: JobDoc[];
-          nextB: JobDoc[];
-          nextACost: number;
-          nextBCost: number;
-        }
-      | null = null;
-    let evaluations = 0;
-
-    for (let aIdx = 0; aIdx < optimized.length; aIdx++) {
-      for (let bIdx = aIdx + 1; bIdx < optimized.length; bIdx++) {
-        const routeA = optimized[aIdx];
-        const routeB = optimized[bIdx];
-        const currentCost = costs[aIdx] + costs[bIdx];
-
-        for (let i = 0; i < routeA.jobs.length; i++) {
-          if (
-            routeB.jobs.length < maxStops &&
-            routeA.jobs.length > 1 &&
-            canScheduleJobOnDate(routeA.jobs[i], routeB.slot.date)
-          ) {
-            const nextAJobs = routeA.jobs.filter((_, idx) => idx !== i);
-            const nextBJobs = [...routeB.jobs, routeA.jobs[i]];
-            const nextA = { slot: routeA.slot, jobs: nextAJobs };
-            const nextB = { slot: routeB.slot, jobs: nextBJobs };
-            const nextACost = assignmentCost(nextA, rangeStart, rangeEnd);
-            const nextBCost = assignmentCost(nextB, rangeStart, rangeEnd);
-            const delta = currentCost - nextACost - nextBCost;
-            evaluations++;
-            if (delta > (best?.delta ?? 0)) {
-              best = { delta, aIdx, bIdx, nextA: nextAJobs, nextB: nextBJobs, nextACost, nextBCost };
-            }
-          }
-
-          for (let j = 0; j < routeB.jobs.length; j++) {
-            if (
-              !canScheduleJobOnDate(routeB.jobs[j], routeA.slot.date) ||
-              !canScheduleJobOnDate(routeA.jobs[i], routeB.slot.date)
-            ) {
-              continue;
-            }
-            const nextAJobs = routeA.jobs.map((job, idx) => (idx === i ? routeB.jobs[j] : job));
-            const nextBJobs = routeB.jobs.map((job, idx) => (idx === j ? routeA.jobs[i] : job));
-            const nextA = { slot: routeA.slot, jobs: nextAJobs };
-            const nextB = { slot: routeB.slot, jobs: nextBJobs };
-            const nextACost = assignmentCost(nextA, rangeStart, rangeEnd);
-            const nextBCost = assignmentCost(nextB, rangeStart, rangeEnd);
-            const delta = currentCost - nextACost - nextBCost;
-            evaluations++;
-            if (delta > (best?.delta ?? 0)) {
-              best = { delta, aIdx, bIdx, nextA: nextAJobs, nextB: nextBJobs, nextACost, nextBCost };
-            }
-            if (evaluations >= maxEvaluations) break;
-          }
-          if (evaluations >= maxEvaluations) break;
-        }
-
-        if (routeA.jobs.length < maxStops && routeB.jobs.length > 1) {
-          for (let j = 0; j < routeB.jobs.length; j++) {
-            if (!canScheduleJobOnDate(routeB.jobs[j], routeA.slot.date)) {
-              continue;
-            }
-            const nextAJobs = [...routeA.jobs, routeB.jobs[j]];
-            const nextBJobs = routeB.jobs.filter((_, idx) => idx !== j);
-            const nextA = { slot: routeA.slot, jobs: nextAJobs };
-            const nextB = { slot: routeB.slot, jobs: nextBJobs };
-            const nextACost = assignmentCost(nextA, rangeStart, rangeEnd);
-            const nextBCost = assignmentCost(nextB, rangeStart, rangeEnd);
-            const delta = currentCost - nextACost - nextBCost;
-            evaluations++;
-            if (delta > (best?.delta ?? 0)) {
-              best = { delta, aIdx, bIdx, nextA: nextAJobs, nextB: nextBJobs, nextACost, nextBCost };
-            }
-            if (evaluations >= maxEvaluations) break;
-          }
-        }
-
-        if (evaluations >= maxEvaluations) break;
-      }
-      if (evaluations >= maxEvaluations) break;
-    }
-
-    if (!best || best.delta < 0.25) break;
-    optimized = optimized.map((assignment, idx) => {
-      if (idx === best.aIdx) return { slot: assignment.slot, jobs: best.nextA };
-      if (idx === best.bIdx) return { slot: assignment.slot, jobs: best.nextB };
-      return assignment;
-    });
-    costs = costs.map((cost, idx) => {
-      if (idx === best.aIdx) return best.nextACost;
-      if (idx === best.bIdx) return best.nextBCost;
-      return cost;
-    });
-  }
-
-  return optimized;
 }
 
 async function buildFastFallbackRoutes({
@@ -846,16 +998,21 @@ async function buildFastFallbackRoutes({
       matrixSources.add(matrixResult.source);
       matrixResult.warnings.forEach((warning) => routeWarnings.add(warning));
       const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
-      const ordered = orderedResult.ordered;
+      const matrixById = new Map<string, number>();
+      picked.forEach((job, idx) => matrixById.set(job.docId, idx));
+      const ordered = keepSameAddressJobsTogether(orderedResult.ordered);
+      const orderedMatrixDriveMinutes = orderedDriveMinutesFromMatrix(
+        ordered,
+        matrixById,
+        matrixResult.matrix,
+      );
       const geometryResult = await computeRouteGeometry(ordered, { routeDate: slot.date });
       polylineSources.add(geometryResult.polylineSource);
       geometryResult.warnings.forEach((warning) => routeWarnings.add(warning));
-      const matrixById = new Map<string, number>();
-      picked.forEach((job, idx) => matrixById.set(job.docId, idx));
       const totalDriveMinutes =
         geometryResult.driveTimeSource === "routes_api_polyline"
           ? geometryResult.driveMinutes
-          : orderedResult.totalDriveMinutes;
+          : orderedMatrixDriveMinutes;
       const driveTimeSource =
         geometryResult.driveTimeSource === "routes_api_polyline"
           ? geometryResult.driveTimeSource
@@ -876,6 +1033,7 @@ async function buildFastFallbackRoutes({
           serviceDue: String(job.scheduledDate || slot.date),
           recurringFrequency: String(job.recurringFrequency || ""),
           billingFrequency: String(job.billingFrequency || ""),
+          subscriptionLastServiced: String(job.subscriptionLastServiced || ""),
         };
         if (idx > 0) {
           const prevIdx = matrixById.get(ordered[idx - 1].docId);
@@ -1220,6 +1378,14 @@ export async function POST(request: NextRequest) {
       capacityDeferred = [...jobsToRoute.slice(capacity), ...capacityDeferred];
       jobsToRoute = jobsToRoute.slice(0, capacity);
     }
+    jobsToRoute = expandSameAddressBundlesForSelection({
+      selectedJobs: jobsToRoute,
+      allJobs: allJobDocs,
+      selectedTechs,
+      rangeEnd,
+    }).sort(prioritySort);
+    const jobsToRouteIds = new Set(jobsToRoute.map((job) => job.docId));
+    capacityDeferred = capacityDeferred.filter((job) => !jobsToRouteIds.has(job.docId));
     const jobsDeferred = capacityDeferred.length;
 
     const selectedOverdueCount = jobsToRoute.filter((j) => {
@@ -1276,6 +1442,7 @@ export async function POST(request: NextRequest) {
       customerName: String(d.customerName || ""),
       recurringFrequency: String(d.recurringFrequency || ""),
       billingFrequency: String(d.billingFrequency || ""),
+      subscriptionLastServiced: String(d.subscriptionLastServiced || ""),
     }));
 
     const dates: string[] = [];

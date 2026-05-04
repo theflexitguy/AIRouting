@@ -49,6 +49,7 @@ export interface Job {
   subscriptionBalance?: string;
   subscriptionOnHold?: string;
   initialServiceDate?: string;
+  subscriptionLastServiced?: string;
   revenue?: string;
   productionValue?: string;
   subscriptionCategory?: string;

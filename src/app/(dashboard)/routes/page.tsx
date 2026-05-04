@@ -18,6 +18,7 @@ import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
+import { getSubscriptionLastServiced, routeAddressKey } from "@/lib/route-bundles";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Input } from "@/components/ui/input";
 import {
@@ -449,14 +450,16 @@ function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>) {
 
 function poolJobHtml(job: Job) {
   const stopProduction = calculateStopProductionValue(job);
+  const lastServiced = getSubscriptionLastServiced(job);
   return `<div style="color:#111;padding:8px;max-width:270px">
     <div style="font-weight:700;margin-bottom:2px">${escapeHtml(job.customerName)}</div>
     <div style="color:#666;font-size:12px;margin-bottom:6px">${escapeHtml(job.address)}</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
       <div><div style="color:#777">Due</div><div style="font-weight:700">${escapeHtml(job.scheduledDate || "No date")}</div></div>
+      <div><div style="color:#777">Last serviced</div><div style="font-weight:700">${escapeHtml(lastServiced || "-")}</div></div>
       <div><div style="color:#777">Duration</div><div style="font-weight:700">${Number(job.duration || 25)} min</div></div>
       <div><div style="color:#777">Value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
-      <div><div style="color:#777">Assigned</div><div style="font-weight:700">${escapeHtml(job.assignedTechId || "Open")}</div></div>
+      <div style="grid-column:1 / -1"><div style="color:#777">Assigned</div><div style="font-weight:700">${escapeHtml(job.assignedTechId || "Open")}</div></div>
     </div>
   </div>`;
 }
@@ -895,18 +898,44 @@ export default function RoutesPage() {
       return;
     }
 
+    const bundleKey = routeAddressKey(job);
+    const routeMonth = toRoute.route.date.slice(0, 7);
+    const bundleHorizon = offsetDateString(toRoute.route.date, 14);
+    const bundleJobs = Object.values(allJobs)
+      .filter((candidate) => {
+        if (candidate.id === jobId) return true;
+        if (!bundleKey || routeAddressKey(candidate) !== bundleKey) return false;
+        if (routedJobIds.has(candidate.id)) return false;
+        const status = String(candidate.status || "pending").toLowerCase();
+        if (status === "completed" || status === "cancelled") return false;
+        const dueDate = String(candidate.scheduledDate || "");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
+        if (dueDate > bundleHorizon && dueDate.slice(0, 7) !== routeMonth) return false;
+        if (assignedTechBlockReason(candidate, toRoute.tech)) return false;
+        if (jobScheduleBlockReason(candidate, toRoute.route.date)) return false;
+        return true;
+      })
+      .sort((a, b) => {
+        if (a.id === jobId) return -1;
+        if (b.id === jobId) return 1;
+        const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
+        if (dateDiff !== 0) return dateDiff;
+        return String(a.serviceType || a.id).localeCompare(String(b.serviceType || b.id));
+      });
+    const bundleJobIds = bundleJobs.map((candidate) => candidate.id);
+
     const oldSeq = toRoute.route.stopSequence;
-    const newSeq = oldSeq.filter(id => id !== jobId);
+    const newSeq = oldSeq.filter(id => !bundleJobIds.includes(id));
     const insertAfterIndex = insertAfterJobId ? newSeq.indexOf(insertAfterJobId) : -1;
     if (insertAfterIndex >= 0) {
-      newSeq.splice(insertAfterIndex + 1, 0, jobId);
+      newSeq.splice(insertAfterIndex + 1, 0, ...bundleJobIds);
     } else {
-      newSeq.push(jobId);
+      newSeq.push(...bundleJobIds);
     }
 
     const metrics = await calculateRouteMetrics(newSeq, toRoute.route.date);
     const previousRoutes = allRoutes;
-    const previousJob = job;
+    const previousJobs = Object.fromEntries(bundleJobs.map((bundleJob) => [bundleJob.id, bundleJob]));
     const now = new Date().toISOString();
 
     setAllRoutes(allRoutes.map(r =>
@@ -923,12 +952,17 @@ export default function RoutesPage() {
     ));
     setAllJobs(prev => ({
       ...prev,
-      [jobId]: {
-        ...prev[jobId],
-        assignedTechId: toRoute.tech.id,
-        status: "scheduled",
-        updatedAt: now,
-      },
+      ...Object.fromEntries(
+        bundleJobs.map((bundleJob) => [
+          bundleJob.id,
+          {
+            ...prev[bundleJob.id],
+            assignedTechId: toRoute.tech.id,
+            status: "scheduled",
+            updatedAt: now,
+          },
+        ]),
+      ),
     }));
 
     try {
@@ -939,10 +973,12 @@ export default function RoutesPage() {
         generatedBy: "human",
         updatedAt: now,
       });
-      batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
-        assignedTechId: toRoute.tech.id,
-        status: "scheduled",
-        updatedAt: now,
+      bundleJobs.forEach((bundleJob) => {
+        batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, bundleJob.id), {
+          assignedTechId: toRoute.tech.id,
+          status: "scheduled",
+          updatedAt: now,
+        });
       });
       await batch.commit();
 
@@ -965,14 +1001,18 @@ export default function RoutesPage() {
         }),
       }).catch(() => {});
 
-      toast.success(`Added ${job.customerName || "job"} → ${toRoute.tech.name}`);
+      toast.success(
+        bundleJobs.length > 1
+          ? `Added ${bundleJobs.length} same-address jobs → ${toRoute.tech.name}`
+          : `Added ${job.customerName || "job"} → ${toRoute.tech.name}`,
+      );
     } catch (e) {
       console.error("Add pool job error:", e);
       setAllRoutes(previousRoutes);
-      setAllJobs(prev => ({ ...prev, [jobId]: previousJob }));
+      setAllJobs(prev => ({ ...prev, ...previousJobs }));
       toast.error("Failed to add job to route");
     }
-  }, [allJobs, allRoutes, calculateRouteMetrics, pushEdit, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, calculateRouteMetrics, pushEdit, routedJobIds, userProfile?.companyId, userProfile?.email]);
 
   const handlePanelDragEnd = useCallback(async (event: DragEndEvent) => {
     const { active, over } = event;
