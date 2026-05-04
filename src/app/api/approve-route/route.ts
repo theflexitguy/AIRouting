@@ -4,19 +4,45 @@ export const maxDuration = 300;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { CRITICAL_CLASSES, parseSchedulingRequest } from "@/lib/scheduling-constraints";
+import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const APPOINTMENT_ID_FIELDS = ["appointmentID", "appointmentId", "appointment_id", "id"];
 const ROUTE_ID_FIELDS = ["routeID", "routeId", "route_id", "id"];
+const GROUP_ID_FIELDS = ["groupID", "groupId", "routeGroupID", "routeGroupId"];
 const ASSIGNED_TECH_FIELDS = ["assignedTech", "assignedTechID", "assignedTechId"];
 const CUSTOMER_FIELDS = ["customerID", "customerId", "customer_id", "customer", "accountID", "accountId"];
 const SUBSCRIPTION_FIELDS = ["subscriptionID", "subscriptionId", "subscription_id", "subscription", "subscriptionIDFk"];
 const APPOINTMENT_DATE_FIELDS = ["date", "dateStart", "serviceDate", "scheduledDate", "appointmentDate"];
 const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
 const SERVICE_TYPE_FIELDS = ["serviceID", "serviceId", "serviceTypeID", "serviceTypeId", "type"];
+const GPC_GROUP_TITLE = "GPC";
+const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+const GPC_SERVICE_CONFIG = [
+  {
+    key: "general_pest",
+    envKeys: ["FIELDROUTES_GENERAL_PEST_SERVICE_ID", "FIELDROUTES_GPC_GENERAL_PEST_SERVICE_ID"],
+    companyFields: ["fieldRoutesGeneralPestServiceId", "fieldRoutesGpcGeneralPestServiceId"],
+    patterns: [/general\s+pest/i, /\bgpc\b/i],
+  },
+  {
+    key: "mosquito",
+    envKeys: ["FIELDROUTES_MOSQUITO_SERVICE_ID", "FIELDROUTES_GPC_MOSQUITO_SERVICE_ID"],
+    companyFields: ["fieldRoutesMosquitoServiceId", "fieldRoutesGpcMosquitoServiceId"],
+    patterns: [/mosquito/i],
+  },
+  {
+    key: "outdoor_package",
+    envKeys: ["FIELDROUTES_OUTDOOR_PACKAGE_SERVICE_ID", "FIELDROUTES_GPC_OUTDOOR_PACKAGE_SERVICE_ID"],
+    companyFields: ["fieldRoutesOutdoorPackageServiceId", "fieldRoutesGpcOutdoorPackageServiceId"],
+    patterns: [/outdoor\s+package/i],
+  },
+] as const;
 
 type FieldRoutesPayload = Record<string, string | number | boolean | null | undefined>;
 type FieldRoutesRecord = Record<string, unknown>;
+type JobRecord = { id: string; data: FirebaseFirestore.DocumentData };
 
 class ApproveRouteError extends Error {
   status: number;
@@ -99,11 +125,40 @@ class FieldRoutesClient {
     return this.request("/employee/search", { includeData: 1, active: 1 });
   }
 
-  routeSearch(assignedTech: string, date: string) {
-    return this.request("/route/search", { assignedTech, date, includeData: 1 });
+  routeSearch({
+    assignedTech,
+    date,
+    dateStart,
+    dateEnd,
+    groupTitle,
+  }: {
+    assignedTech?: string;
+    date?: string;
+    dateStart?: string;
+    dateEnd?: string;
+    groupTitle?: string;
+  }) {
+    return this.request("/route/search", {
+      includeData: 1,
+      ...(assignedTech ? { assignedTech } : {}),
+      ...(date ? { date } : {}),
+      ...(dateStart ? { dateStart } : {}),
+      ...(dateEnd ? { dateEnd } : {}),
+      ...(groupTitle ? { groupTitle } : {}),
+    });
   }
 
-  routeCreate(assignedTech: string, date: string, templateId?: number) {
+  routeCreate({
+    assignedTech,
+    date,
+    templateId,
+    groupId,
+  }: {
+    assignedTech: string;
+    date: string;
+    templateId?: number;
+    groupId?: string;
+  }) {
     return this.request(
       "/route/create",
       {
@@ -111,6 +166,7 @@ class FieldRoutesClient {
         date,
         autoCreateGroup: 1,
         ...(templateId ? { templateID: templateId } : {}),
+        ...(groupId ? { groupID: groupId } : {}),
       },
       true,
     );
@@ -181,6 +237,7 @@ class FieldRoutesClient {
       {
         customerID: customerId,
         type: serviceType,
+        employeeID: assignedTech,
         routeID: routeId,
         assignedTech,
         ...(subscriptionId ? { subscriptionID: subscriptionId } : {}),
@@ -200,6 +257,38 @@ function clean(value: unknown) {
   return String(value ?? "").trim();
 }
 
+function normalizeFieldName(value: unknown) {
+  return clean(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function csvFieldValue(record: FieldRoutesRecord, names: string[]) {
+  const wanted = new Set(names.map(normalizeFieldName));
+  const csvFields = record.csvFields;
+  if (Array.isArray(csvFields)) {
+    for (const field of csvFields) {
+      if (!isRecord(field)) continue;
+      if (wanted.has(normalizeFieldName(field.name))) {
+        const value = clean(field.value);
+        if (value) return value;
+      }
+    }
+  }
+
+  const rawCsv = record.rawCsv;
+  if (isRecord(rawCsv)) {
+    for (const [name, value] of Object.entries(rawCsv)) {
+      if (wanted.has(normalizeFieldName(name))) {
+        const raw = clean(value);
+        if (raw) return raw;
+      }
+    }
+  }
+
+  return "";
+}
+
 function normalizeName(value: unknown) {
   return clean(value)
     .toLowerCase()
@@ -215,6 +304,14 @@ function normalizeDate(value: unknown) {
   const date = new Date(raw);
   if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 10);
   return raw.slice(0, 10);
+}
+
+function offsetDate(date: string, days: number) {
+  const normalized = normalizeDate(date);
+  const parsed = new Date(`${normalized}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return normalized;
+  parsed.setUTCDate(parsed.getUTCDate() + days);
+  return parsed.toISOString().slice(0, 10);
 }
 
 function dateVariants(date: string) {
@@ -348,15 +445,118 @@ function parseIntField(value: unknown) {
 }
 
 function fieldFromJob(job: FirebaseFirestore.DocumentData, fields: string[]) {
-  return clean(firstPresent(job as FieldRoutesRecord, fields));
+  const direct = clean(firstPresent(job as FieldRoutesRecord, fields));
+  if (direct) return direct;
+  return csvFieldValue(job as FieldRoutesRecord, fields);
+}
+
+function serviceTextForJob(job: FirebaseFirestore.DocumentData) {
+  return [
+    job.serviceType,
+    job.subscriptionCategory,
+    job.subscriptionName,
+    job.subscription,
+    fieldFromJob(job, ["Subscription", "Service Type", "Subscription Category"]),
+  ]
+    .map(clean)
+    .filter(Boolean)
+    .join(" ");
+}
+
+function gpcServiceKey(job: FirebaseFirestore.DocumentData) {
+  const text = serviceTextForJob(job);
+  if (!text) return "";
+  const normalized = normalizeName(text);
+  const match = GPC_SERVICE_CONFIG.find((config) => {
+    return config.patterns.some((pattern) => pattern.test(text)) || normalized.includes(config.key.replace(/_/g, " "));
+  });
+  return match?.key || "";
+}
+
+function isGpcServiceJob(job: FirebaseFirestore.DocumentData) {
+  return Boolean(gpcServiceKey(job));
+}
+
+function parseServiceIdMap(value?: unknown) {
+  if (isRecord(value)) {
+    const out = new Map<string, number>();
+    Object.entries(value).forEach(([key, rawValue]) => {
+      const normalizedKey = normalizeName(key);
+      const parsed = parseIntField(rawValue);
+      if (normalizedKey && parsed) out.set(normalizedKey, parsed);
+    });
+    return out;
+  }
+
+  const raw = clean(value || process.env.FIELDROUTES_SERVICE_ID_MAP || process.env.FIELDROUTES_SERVICE_TYPE_MAP);
+  if (!raw) return new Map<string, number>();
+
+  const out = new Map<string, number>();
+  const addEntry = (key: unknown, value: unknown) => {
+    const normalizedKey = normalizeName(key);
+    const parsed = parseIntField(value);
+    if (normalizedKey && parsed) out.set(normalizedKey, parsed);
+  };
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isRecord(parsed)) {
+      Object.entries(parsed).forEach(([key, value]) => addEntry(key, value));
+      return out;
+    }
+  } catch {
+    // Fall through to simple key=value parsing.
+  }
+
+  raw.split(/[;,]/).forEach((part) => {
+    const [key, value] = part.split(/[:=]/);
+    addEntry(key, value);
+  });
+  return out;
+}
+
+function mappedServiceTypeForJob(job: FirebaseFirestore.DocumentData) {
+  const serviceText = serviceTextForJob(job);
+  const normalizedServiceText = normalizeName(serviceText);
+  const configuredMap = parseServiceIdMap(job.fieldRoutesServiceIdMap);
+  const configuredMatch = [...configuredMap.entries()]
+    .sort((a, b) => b[0].length - a[0].length)
+    .find(([key]) => {
+      return Boolean(
+        normalizedServiceText &&
+          (normalizedServiceText === key || normalizedServiceText.includes(key) || key.includes(normalizedServiceText)),
+      );
+    });
+  if (configuredMatch) return configuredMatch[1];
+
+  const key = gpcServiceKey(job);
+  const config = GPC_SERVICE_CONFIG.find((item) => item.key === key);
+  if (config) {
+    for (const field of config.companyFields) {
+      const direct = parseIntField(job[field]);
+      if (direct) return direct;
+    }
+    for (const envKey of config.envKeys) {
+      const parsed = parseIntField(process.env[envKey]);
+      if (parsed) return parsed;
+    }
+  }
+
+  return parseIntField(job.fieldRoutesDefaultServiceId || process.env.FIELDROUTES_DEFAULT_SERVICE_ID);
 }
 
 function serviceTypeForJob(job: FirebaseFirestore.DocumentData) {
   for (const field of SERVICE_TYPE_FIELDS) {
-    const parsed = parseIntField(job[field]);
+    const parsed = parseIntField(fieldFromJob(job, [field]));
     if (parsed) return parsed;
   }
-  return parseIntField(process.env.FIELDROUTES_DEFAULT_SERVICE_ID || "2") || 2;
+  const mapped = mappedServiceTypeForJob(job);
+  if (mapped) return mapped;
+
+  throw new ApproveRouteError(
+    `No FieldRoutes service ID is configured for ${serviceTextForJob(job) || "this stop"}. Set FIELDROUTES_SERVICE_ID_MAP or the service-specific FieldRoutes service ID env vars.`,
+    400,
+  );
 }
 
 async function resolveFieldRoutesTechId(
@@ -396,35 +596,107 @@ async function resolveFieldRoutesTechId(
   throw new ApproveRouteError(`No active FieldRoutes employee matches ${name}. Set the technician employee ID in Settings.`, 404);
 }
 
+function routeGroupTitleForJobs(route: FirebaseFirestore.DocumentData, jobs: JobRecord[]) {
+  const hasGpcJobs = jobs.some(({ data }) => isGpcServiceJob(data));
+  if (hasGpcJobs) {
+    return clean(
+      route.fieldRoutesGpcRouteGroupTitle ||
+        route.fieldRoutesRouteGroupTitleGpc ||
+        process.env.FIELDROUTES_GPC_ROUTE_GROUP_TITLE ||
+        process.env.FIELDROUTES_ROUTE_GROUP_TITLE_GPC,
+    ) || GPC_GROUP_TITLE;
+  }
+  return clean(route.fieldRoutesDefaultRouteGroupTitle || process.env.FIELDROUTES_DEFAULT_ROUTE_GROUP_TITLE);
+}
+
+function routeGroupIdFromConfig(route: FirebaseFirestore.DocumentData) {
+  return clean(
+    route.fieldRoutesGroupID ||
+      route.fieldRoutesGroupId ||
+      route.fieldRoutesRouteGroupID ||
+      route.fieldRoutesGpcRouteGroupId ||
+      route.fieldRoutesGpcRouteGroupID ||
+      process.env.FIELDROUTES_GPC_ROUTE_GROUP_ID ||
+      process.env.FIELDROUTES_ROUTE_GROUP_ID_GPC ||
+      process.env.FIELDROUTES_DEFAULT_ROUTE_GROUP_ID,
+  );
+}
+
+function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData) {
+  return parseIntField(
+    route.fieldRoutesTemplateID ||
+      route.fieldRoutesTemplateId ||
+      route.fieldRoutesGpcRouteTemplateId ||
+      route.fieldRoutesGpcRouteTemplateID ||
+      process.env.FIELDROUTES_GPC_ROUTE_TEMPLATE_ID ||
+      process.env.FIELDROUTES_ROUTE_TEMPLATE_ID_GPC ||
+      process.env.FIELDROUTES_ROUTE_TEMPLATE_ID_DEFAULT,
+  );
+}
+
+async function discoverRouteGroupId(client: FieldRoutesClient, routeDate: string, groupTitle: string) {
+  if (!groupTitle) return "";
+  const payload = await client.routeSearch({
+    groupTitle,
+    dateStart: offsetDate(routeDate, -365),
+    dateEnd: offsetDate(routeDate, 365),
+  });
+  const records = extractRecords(payload, ["routes", "results", "items", "data"]);
+  const ids = records.map((record) => extractId(record, GROUP_ID_FIELDS)).filter(Boolean);
+  return [...new Set(ids)][0] || "";
+}
+
 async function resolveFieldRoutesRoute(
   client: FieldRoutesClient,
   assignedTech: string,
   routeDate: string,
   route: FirebaseFirestore.DocumentData,
+  jobs: JobRecord[],
 ) {
+  const groupTitle = routeGroupTitleForJobs(route, jobs);
   for (const date of dateVariants(routeDate)) {
-    const payload = await client.routeSearch(assignedTech, date);
+    const payload = await client.routeSearch({ assignedTech, date, groupTitle });
     const records = extractRecords(payload, ["routes", "results", "items", "data"]);
     for (const record of records) {
       const routeId = extractId(record, ROUTE_ID_FIELDS);
       const recordDate = normalizeDate(firstPresent(record, ["date", "routeDate", "serviceDate"])) || routeDate;
       const recordTech = clean(firstPresent(record, ASSIGNED_TECH_FIELDS));
       if (routeId && recordDate === routeDate && (!recordTech || recordTech === assignedTech)) {
-        return { routeId, dateInputUsed: date, status: "existing" as const };
+        return {
+          routeId,
+          dateInputUsed: date,
+          status: "existing" as const,
+          routeGroupTitle: groupTitle,
+          routeGroupId: extractId(record, GROUP_ID_FIELDS),
+        };
       }
     }
     const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
-    if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const };
+    if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
   }
 
-  const templateId = parseIntField(route.fieldRoutesTemplateID || process.env.FIELDROUTES_ROUTE_TEMPLATE_ID_DEFAULT);
+  const templateId = routeTemplateIdFromConfig(route);
+  const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
+  if (groupTitle && !groupId && !templateId) {
+    throw new ApproveRouteError(
+      `No ${groupTitle} FieldRoutes route exists for this technician/date, and no route group ID or template ID is configured to create one.`,
+      400,
+      {
+        requiredEnv: [
+          "FIELDROUTES_GPC_ROUTE_GROUP_ID",
+          "FIELDROUTES_GPC_ROUTE_TEMPLATE_ID",
+        ],
+      },
+    );
+  }
+
   for (const date of dateVariants(routeDate)) {
-    const payload = await client.routeCreate(assignedTech, date, templateId);
+    const payload = await client.routeCreate({ assignedTech, date, templateId, groupId });
     const records = extractRecords(payload, ["routes", "results", "items", "data"]);
     const fromRecord = records.map((record) => extractId(record, ROUTE_ID_FIELDS)).find(Boolean);
     const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
     const routeId = fromRecord || direct;
-    if (routeId) return { routeId, dateInputUsed: date, status: "created" as const };
+    if (routeId) return { routeId, dateInputUsed: date, status: "created" as const, routeGroupTitle: groupTitle, routeGroupId: groupId };
   }
 
   throw new ApproveRouteError("FieldRoutes route/create did not return a route ID.", 502);
@@ -518,6 +790,161 @@ function getAppointmentCandidates(
   return { matchKey: "", candidates: [] };
 }
 
+function weekdaySet(value: string) {
+  return new Set(
+    value
+      .split(",")
+      .map((part) => part.trim().toUpperCase())
+      .filter(Boolean),
+  );
+}
+
+function weekdayLabelForDate(dateStr: string) {
+  const date = new Date(`${dateStr}T00:00:00Z`);
+  return WEEKDAY_LABEL_BY_JS_DAY[date.getUTCDay()] || "";
+}
+
+function jobScheduleBlockReason(job: FirebaseFirestore.DocumentData, routeDate: string) {
+  const parsed = parseSchedulingRequest(clean(job.schedulingRequest || fieldFromJob(job, ["Special Scheduling", "Scheduling Request"])));
+  if (!parsed.schedulingRequestClass) return "";
+
+  if (CRITICAL_CLASSES.has(parsed.schedulingRequestClass)) {
+    return parsed.schedulingConstraintNote || parsed.schedulingRequestClass;
+  }
+
+  const weekday = weekdayLabelForDate(routeDate);
+  const allowed = weekdaySet(parsed.schedulingAllowedWeekdays);
+  if (allowed.size > 0 && !allowed.has(weekday)) {
+    return `requires ${parsed.schedulingAllowedWeekdays}`;
+  }
+
+  const blocked = weekdaySet(parsed.schedulingBlockedWeekdays);
+  if (blocked.has(weekday)) {
+    return `no ${weekday}`;
+  }
+
+  return "";
+}
+
+function assignedTechMatchesRoute(
+  job: FirebaseFirestore.DocumentData,
+  route: FirebaseFirestore.DocumentData,
+  tech: FirebaseFirestore.DocumentData | undefined,
+) {
+  const assigned = clean(job.assignedTechId || fieldFromJob(job, ["Preferred Tech", "assigned_tech", "Tech"]));
+  if (!assigned) return true;
+  const assignedNormalized = normalizeName(assigned);
+  const tokens = [
+    route.techId,
+    route.techName,
+    route.fieldRoutesEmployeeId,
+    route.fieldRoutesTechId,
+    tech?.id,
+    tech?.name,
+    tech?.employeeId,
+    tech?.fieldRoutesEmployeeId,
+    tech?.fieldRoutesTechId,
+  ]
+    .map(clean)
+    .filter(Boolean);
+  return tokens.some((token) => token === assigned || normalizeName(token) === assignedNormalized);
+}
+
+function sameAddressBundleEligible({
+  candidate,
+  route,
+  tech,
+  routeDate,
+  alreadyInRoute,
+}: {
+  candidate: FirebaseFirestore.DocumentData;
+  route: FirebaseFirestore.DocumentData;
+  tech?: FirebaseFirestore.DocumentData;
+  routeDate: string;
+  alreadyInRoute: boolean;
+}) {
+  if (!isGpcServiceJob(candidate)) return false;
+  const status = clean(candidate.status || "pending").toLowerCase();
+  if (status === "completed" || status === "cancelled") return false;
+  if (candidate.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(candidate)) return false;
+  if (!alreadyInRoute && clean(candidate.fieldRoutesUploadedAt || candidate.fieldRoutesRouteId)) return false;
+  const dueDate = normalizeDate(candidate.scheduledDate || fieldFromJob(candidate, ["Service Due"]));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
+  const bundleHorizon = offsetDate(routeDate, 14);
+  const routeMonth = routeDate.slice(0, 7);
+  if (dueDate > bundleHorizon && dueDate.slice(0, 7) !== routeMonth) return false;
+  if (!assignedTechMatchesRoute(candidate, route, tech)) return false;
+  return !jobScheduleBlockReason(candidate, routeDate);
+}
+
+async function expandSameAddressGpcJobs({
+  db,
+  companyId,
+  route,
+  tech,
+  jobs,
+}: {
+  db: FirebaseFirestore.Firestore;
+  companyId: string;
+  route: FirebaseFirestore.DocumentData;
+  tech?: FirebaseFirestore.DocumentData;
+  jobs: JobRecord[];
+}) {
+  const routeDate = normalizeDate(route.date);
+  const anchors = jobs.filter(({ data }) => isGpcServiceJob(data));
+  if (!routeDate || anchors.length === 0) return { jobs, added: 0 };
+
+  const allJobsSnap = await db.collection(`companies/${companyId}/jobs`).get();
+  const allJobs = allJobsSnap.docs.map((docSnap) => ({ id: docSnap.id, data: docSnap.data() || {} }));
+  const byId = new Map(jobs.map((job) => [job.id, job]));
+  const byAddress = new Map<string, JobRecord[]>();
+  for (const candidate of allJobs) {
+    const key = routeAddressKey(candidate.data);
+    if (!key) continue;
+    byAddress.set(key, [...(byAddress.get(key) || []), candidate]);
+  }
+
+  const expanded: JobRecord[] = [];
+  const pushed = new Set<string>();
+  const originalIds = new Set(jobs.map((job) => job.id));
+
+  for (const job of jobs) {
+    if (!pushed.has(job.id)) {
+      expanded.push(job);
+      pushed.add(job.id);
+    }
+
+    if (!isGpcServiceJob(job.data)) continue;
+    const addressKey = routeAddressKey(job.data);
+    const siblings = (byAddress.get(addressKey) || [])
+      .filter((candidate) => {
+        if (pushed.has(candidate.id)) return false;
+        if (candidate.id === job.id) return false;
+        return sameAddressBundleEligible({
+          candidate: candidate.data,
+          route,
+          tech,
+          routeDate,
+          alreadyInRoute: originalIds.has(candidate.id),
+        });
+      })
+      .sort((a, b) => {
+        const dueDiff = normalizeDate(a.data.scheduledDate).localeCompare(normalizeDate(b.data.scheduledDate));
+        if (dueDiff !== 0) return dueDiff;
+        return serviceTextForJob(a.data).localeCompare(serviceTextForJob(b.data));
+      });
+
+    for (const sibling of siblings) {
+      const resolved = byId.get(sibling.id) || sibling;
+      expanded.push(resolved);
+      pushed.add(sibling.id);
+      byId.set(sibling.id, resolved);
+    }
+  }
+
+  return { jobs: expanded, added: expanded.length - jobs.length };
+}
+
 async function uploadRouteToFieldRoutes({
   client,
   route,
@@ -527,13 +954,13 @@ async function uploadRouteToFieldRoutes({
   client: FieldRoutesClient;
   route: FirebaseFirestore.DocumentData;
   tech?: FirebaseFirestore.DocumentData;
-  jobs: Array<{ id: string; data: FirebaseFirestore.DocumentData }>;
+  jobs: JobRecord[];
 }) {
   const routeDate = normalizeDate(route.date);
   if (!routeDate) throw new ApproveRouteError("Route is missing a valid date.", 400);
 
   const assignedTech = await resolveFieldRoutesTechId(client, route, tech);
-  const routeInfo = await resolveFieldRoutesRoute(client, assignedTech, routeDate, route);
+  const routeInfo = await resolveFieldRoutesRoute(client, assignedTech, routeDate, route, jobs);
   const appointmentRecords = await fetchAppointmentsForDate(client, routeDate);
   const indexes = buildAppointmentIndexes(appointmentRecords, routeDate);
   const createMissing = clean(process.env.FIELDROUTES_CREATE_MISSING_APPOINTMENTS || "true").toLowerCase() !== "false";
@@ -624,6 +1051,8 @@ async function uploadRouteToFieldRoutes({
     routeId: routeInfo.routeId,
     routeStatus: routeInfo.status,
     dateInputUsed: routeInfo.dateInputUsed,
+    routeGroupTitle: routeInfo.routeGroupTitle,
+    routeGroupId: routeInfo.routeGroupId,
     assignedTech,
     updated: 0,
     created: 0,
@@ -712,7 +1141,42 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Route contains missing job records", missingJobs }, { status: 409 });
     }
 
-    const jobs = jobDocs.map((docSnap) => ({ id: docSnap.id, data: docSnap.data() || {} }));
+    const fieldRoutesConfig = {
+      fieldRoutesGpcRouteGroupId: company.fieldRoutesGpcRouteGroupId,
+      fieldRoutesGpcRouteGroupTitle: company.fieldRoutesGpcRouteGroupTitle,
+      fieldRoutesGpcRouteTemplateId: company.fieldRoutesGpcRouteTemplateId,
+      fieldRoutesServiceIdMap: company.fieldRoutesServiceIdMap,
+      fieldRoutesGeneralPestServiceId: company.fieldRoutesGeneralPestServiceId,
+      fieldRoutesMosquitoServiceId: company.fieldRoutesMosquitoServiceId,
+      fieldRoutesOutdoorPackageServiceId: company.fieldRoutesOutdoorPackageServiceId,
+      fieldRoutesDefaultServiceId: company.fieldRoutesDefaultServiceId,
+    };
+    const routeWithConfig = {
+      ...route,
+      ...fieldRoutesConfig,
+    };
+    const initialJobs = jobDocs.map((docSnap) => ({ id: docSnap.id, data: docSnap.data() || {} }));
+    const initialJobsWithConfig = initialJobs.map((job) => ({
+      ...job,
+      data: {
+        ...job.data,
+        ...fieldRoutesConfig,
+      },
+    }));
+    const tech = techDoc.exists ? techDoc.data() || undefined : undefined;
+    const expanded = await expandSameAddressGpcJobs({
+      db,
+      companyId,
+      route: routeWithConfig,
+      tech,
+      jobs: initialJobsWithConfig,
+    });
+    const jobs = expanded.jobs;
+    const expandedStopSequence = jobs.map((job) => job.id);
+    const totalServiceMinutes = jobs.reduce((sum, job) => sum + (parseIntField(job.data.duration) || 25), 0);
+    const totalDriveTimeMinutes = Number(route.totalDriveTimeMinutes || 0);
+    const totalWorkMinutes = Math.round((totalDriveTimeMinutes + totalServiceMinutes) * 10) / 10;
+
     const client = new FieldRoutesClient({
       baseUrl: clean(process.env.FIELDROUTES_BASE_URL || "https://api.fieldroutes.com"),
       authKey,
@@ -720,11 +1184,15 @@ export async function POST(request: NextRequest) {
     });
     const syncSummary = await uploadRouteToFieldRoutes({
       client,
-      route,
-      tech: techDoc.exists ? techDoc.data() || undefined : undefined,
+      route: routeWithConfig,
+      tech,
       jobs,
     });
 
+    const responseSync = {
+      bundledSameAddressStops: expanded.added,
+      ...syncSummary,
+    };
     const now = new Date().toISOString();
     const batch = db.batch();
     batch.update(routeDoc.ref, {
@@ -732,9 +1200,13 @@ export async function POST(request: NextRequest) {
       approvedAt: now,
       approvedBy: clean(approvedBy),
       updatedAt: now,
+      stopSequence: expandedStopSequence,
+      totalStops: expandedStopSequence.length,
+      totalServiceMinutes,
+      totalWorkMinutes,
       fieldRoutesSync: {
         uploadedAt: now,
-        ...syncSummary,
+        ...responseSync,
       },
     });
     jobs.forEach(({ id }, index) => {
@@ -753,7 +1225,12 @@ export async function POST(request: NextRequest) {
       success: true,
       approved: true,
       routeId,
-      sync: syncSummary,
+      stopSequence: expandedStopSequence,
+      totalStops: expandedStopSequence.length,
+      totalServiceMinutes,
+      totalWorkMinutes,
+      bundledSameAddressStops: expanded.added,
+      sync: responseSync,
     });
   } catch (error) {
     console.error("Approve route error:", error);

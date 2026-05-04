@@ -339,6 +339,14 @@ async function calculateRouteMetricsFromRoads(
 
 type RouteWithMetrics = Route;
 
+type ApproveRouteUploadResult = {
+  sync?: RouteWithMetrics["fieldRoutesSync"];
+  stopSequence?: string[];
+  totalStops?: number;
+  totalServiceMinutes?: number;
+  totalWorkMinutes?: number;
+};
+
 function getRouteServiceMinutes(stopSequence: string[], jobsById: Record<string, Job>) {
   return stopSequence.reduce((total, jobId) => {
     const job = jobsById[jobId];
@@ -1821,7 +1829,7 @@ export default function RoutesPage() {
     if (!res.ok || !data.success) {
       throw new Error(formatApproveError(data));
     }
-    return data.sync as RouteWithMetrics["fieldRoutesSync"];
+    return data as ApproveRouteUploadResult;
   };
 
   const handleApprove = async (techIndex: number, approved: boolean) => {
@@ -1856,17 +1864,24 @@ export default function RoutesPage() {
         // Remove from local state
         setAllRoutes(allRoutes.filter((_, i) => i !== allIdx));
       } else {
-        const sync = await approveRouteInFieldRoutes(tr);
+        const approval = await approveRouteInFieldRoutes(tr);
         const now = new Date().toISOString();
+        const approvedStopSequence = Array.isArray(approval.stopSequence) && approval.stopSequence.length > 0
+          ? approval.stopSequence
+          : tr.route.stopSequence;
 
         const updatedRoutes = [...allRoutes];
         updatedRoutes[allIdx] = {
           ...tr,
           route: {
             ...tr.route,
+            stopSequence: approvedStopSequence,
+            totalStops: approval.totalStops || approvedStopSequence.length,
+            totalServiceMinutes: approval.totalServiceMinutes ?? tr.route.totalServiceMinutes,
+            totalWorkMinutes: approval.totalWorkMinutes ?? tr.route.totalWorkMinutes,
             approved: true,
             updatedAt: now,
-            fieldRoutesSync: sync ? { uploadedAt: now, ...sync } : undefined,
+            fieldRoutesSync: approval.sync ? { uploadedAt: now, ...approval.sync } : undefined,
           } as RouteWithMetrics,
         };
         setAllRoutes(updatedRoutes);
@@ -1887,7 +1902,7 @@ export default function RoutesPage() {
 
     setApproving("bulk");
     try {
-      const approvedIds = new Map<string, RouteWithMetrics["fieldRoutesSync"]>();
+      const approvedIds = new Map<string, ApproveRouteUploadResult>();
       const errors: string[] = [];
       for (const tr of pending) {
         try {
@@ -1900,17 +1915,28 @@ export default function RoutesPage() {
       const now = new Date().toISOString();
       const updatedRoutes = allRoutes.map(tr =>
         approvedIds.has(tr.route.id)
-          ? {
-              ...tr,
-              route: {
-                ...tr.route,
-                approved: true,
-                updatedAt: now,
-                fieldRoutesSync: approvedIds.get(tr.route.id)
-                  ? { uploadedAt: now, ...approvedIds.get(tr.route.id) }
-                  : undefined,
-              } as RouteWithMetrics,
-            }
+          ? (() => {
+              const approval = approvedIds.get(tr.route.id);
+              const approvedStopSequence =
+                approval && Array.isArray(approval.stopSequence) && approval.stopSequence.length > 0
+                  ? approval.stopSequence
+                  : tr.route.stopSequence;
+              return {
+                ...tr,
+                route: {
+                  ...tr.route,
+                  stopSequence: approvedStopSequence,
+                  totalStops: approval?.totalStops || approvedStopSequence.length,
+                  totalServiceMinutes: approval?.totalServiceMinutes ?? tr.route.totalServiceMinutes,
+                  totalWorkMinutes: approval?.totalWorkMinutes ?? tr.route.totalWorkMinutes,
+                  approved: true,
+                  updatedAt: now,
+                  fieldRoutesSync: approval?.sync
+                    ? { uploadedAt: now, ...approval.sync }
+                    : undefined,
+                } as RouteWithMetrics,
+              };
+            })()
           : tr
       );
       setAllRoutes(updatedRoutes);

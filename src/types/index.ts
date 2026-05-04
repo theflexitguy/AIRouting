@@ -4,6 +4,13 @@ export interface Company {
   plan: 'starter' | 'pro' | 'enterprise';
   fieldRoutesApiKey?: string;
   fieldRoutesApiSecret?: string;
+  fieldRoutesGpcRouteGroupTitle?: string;
+  fieldRoutesGpcRouteGroupId?: string;
+  fieldRoutesGpcRouteTemplateId?: string;
+  fieldRoutesGeneralPestServiceId?: string;
+  fieldRoutesMosquitoServiceId?: string;
+  fieldRoutesOutdoorPackageServiceId?: string;
+  fieldRoutesDefaultServiceId?: string;
   createdAt: string;
   active: boolean;
 }
@@ -98,6 +105,9 @@ export interface Route {
     assignedTech?: string;
     routeStatus?: string;
     dateInputUsed?: string;
+    routeGroupTitle?: string;
+    routeGroupId?: string;
+    bundledSameAddressStops?: number;
   };
   createdAt: string;
   updatedAt?: string;

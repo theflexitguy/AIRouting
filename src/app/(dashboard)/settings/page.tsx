@@ -21,6 +21,11 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
+  const [gpcRouteGroupId, setGpcRouteGroupId] = useState("");
+  const [gpcRouteTemplateId, setGpcRouteTemplateId] = useState("");
+  const [generalPestServiceId, setGeneralPestServiceId] = useState("");
+  const [mosquitoServiceId, setMosquitoServiceId] = useState("");
+  const [outdoorPackageServiceId, setOutdoorPackageServiceId] = useState("");
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [techs, setTechs] = useState<Technician[]>([]);
   const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
@@ -40,6 +45,11 @@ export default function SettingsPage() {
         const data = snap.data();
         setApiKey(data.fieldRoutesApiKey ? "••••••••" + data.fieldRoutesApiKey.slice(-4) : "");
         setApiSecret(data.fieldRoutesApiSecret ? "••••" : "");
+        setGpcRouteGroupId(String(data.fieldRoutesGpcRouteGroupId || ""));
+        setGpcRouteTemplateId(String(data.fieldRoutesGpcRouteTemplateId || ""));
+        setGeneralPestServiceId(String(data.fieldRoutesGeneralPestServiceId || ""));
+        setMosquitoServiceId(String(data.fieldRoutesMosquitoServiceId || ""));
+        setOutdoorPackageServiceId(String(data.fieldRoutesOutdoorPackageServiceId || ""));
       }
       setSettingsLoaded(true);
     } catch { }
@@ -65,13 +75,19 @@ export default function SettingsPage() {
       const updateData: Record<string, unknown> = {};
       if (apiKey && !apiKey.startsWith("••")) updateData.fieldRoutesApiKey = apiKey;
       if (apiSecret && apiSecret !== "••••") updateData.fieldRoutesApiSecret = apiSecret;
+      updateData.fieldRoutesGpcRouteGroupTitle = "GPC";
+      updateData.fieldRoutesGpcRouteGroupId = gpcRouteGroupId.trim();
+      updateData.fieldRoutesGpcRouteTemplateId = gpcRouteTemplateId.trim();
+      updateData.fieldRoutesGeneralPestServiceId = generalPestServiceId.trim();
+      updateData.fieldRoutesMosquitoServiceId = mosquitoServiceId.trim();
+      updateData.fieldRoutesOutdoorPackageServiceId = outdoorPackageServiceId.trim();
       if (Object.keys(updateData).length === 0) {
         toast.error("No changes to save. Clear the field and enter your key.");
         setSaving(false);
         return;
       }
       await setDoc(doc(db, "companies", userProfile.companyId), updateData, { merge: true });
-      toast.success("API credentials saved successfully");
+      toast.success("FieldRoutes settings saved successfully");
       setSettingsLoaded(false);
     } catch (err) {
       console.error("Save credentials error:", err);
@@ -147,9 +163,31 @@ export default function SettingsPage() {
                   <Label className="text-sm">API Secret</Label>
                   <Input value={apiSecret} onChange={e => setApiSecret(e.target.value)} onFocus={() => { if (apiSecret === "••••") setApiSecret(""); }} placeholder="Enter FieldRoutes API secret" type="password" className="h-10" />
                 </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label className="text-sm">GPC Route Group ID</Label>
+                    <Input value={gpcRouteGroupId} onChange={e => setGpcRouteGroupId(e.target.value)} placeholder="FieldRoutes group ID" inputMode="numeric" className="h-10" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm">GPC Route Template ID</Label>
+                    <Input value={gpcRouteTemplateId} onChange={e => setGpcRouteTemplateId(e.target.value)} placeholder="Optional template ID" inputMode="numeric" className="h-10" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm">General Pest Service ID</Label>
+                    <Input value={generalPestServiceId} onChange={e => setGeneralPestServiceId(e.target.value)} placeholder="Service ID" inputMode="numeric" className="h-10" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm">Mosquito Service ID</Label>
+                    <Input value={mosquitoServiceId} onChange={e => setMosquitoServiceId(e.target.value)} placeholder="Service ID" inputMode="numeric" className="h-10" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm">Outdoor Package Service ID</Label>
+                    <Input value={outdoorPackageServiceId} onChange={e => setOutdoorPackageServiceId(e.target.value)} placeholder="Service ID" inputMode="numeric" className="h-10" />
+                  </div>
+                </div>
                 <Button onClick={saveApiCredentials} disabled={saving} className="bg-blue-500 hover:bg-blue-600 text-white">
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                  Save Credentials
+                  Save FieldRoutes Settings
                 </Button>
               </CardContent>
             </Card>
