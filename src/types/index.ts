@@ -60,6 +60,10 @@ export interface Job {
   subscriptionLastCompletedDate?: string;
   serviceDueAlreadyCompleted?: boolean;
   serviceDueCompletionCheck?: string;
+  fieldRoutesScheduled?: boolean;
+  fieldRoutesScheduledDate?: string;
+  fieldRoutesServicedBy?: string;
+  fieldRoutesServicedById?: string;
   revenue?: string;
   productionValue?: string;
   subscriptionCategory?: string;

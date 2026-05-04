@@ -96,14 +96,27 @@ function technicianMatchTokens(tech: Technician) {
     .filter(Boolean);
 }
 
-function assignedTechBlockReason(job: Job, tech: Technician) {
-  const assigned = String(job.assignedTechId || "").trim();
-  if (!assigned) return "";
-  const assignedNormalized = normalizeMatchValue(assigned);
-  const matches = technicianMatchTokens(tech).some((token) => {
-    return token === assigned || normalizeMatchValue(token) === assignedNormalized;
+function jobAssignedToTech(job: Job, tech: Technician) {
+  const assignedValues = [
+    job.assignedTechId,
+    job.fieldRoutesServicedBy,
+    job.fieldRoutesServicedById,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (assignedValues.length === 0) return false;
+
+  const tokens = technicianMatchTokens(tech);
+  return assignedValues.some((assigned) => {
+    const assignedNormalized = normalizeMatchValue(assigned);
+    return tokens.some((token) => token === assigned || normalizeMatchValue(token) === assignedNormalized);
   });
-  return matches ? "" : `assigned to ${assigned}`;
+}
+
+function assignedTechBlockReason(job: Job, tech: Technician) {
+  const assigned = String(job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById || "").trim();
+  if (!assigned) return "";
+  return jobAssignedToTech(job, tech) ? "" : `assigned to ${assigned}`;
 }
 
 function weekdaySet(value: string) {
@@ -754,9 +767,15 @@ export default function RoutesPage() {
     allRoutes.forEach((tr) => tr.route.stopSequence.forEach((jobId) => ids.add(jobId)));
     return ids;
   }, [allRoutes]);
+  const selectedJobPoolTechs = useMemo(
+    () => techs.filter((tech) => selectedTechIds.includes(tech.id)),
+    [selectedTechIds, techs],
+  );
   const jobPoolJobs = useMemo(() => {
     return Object.values(allJobs)
       .filter((job) => {
+        if (selectedJobPoolTechs.length === 0) return false;
+        if (!selectedJobPoolTechs.some((tech) => jobAssignedToTech(job, tech))) return false;
         if (routedJobIds.has(job.id)) return false;
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return false;
         const status = String(job.status || "pending").toLowerCase();
@@ -773,7 +792,7 @@ export default function RoutesPage() {
         if (dateDiff !== 0) return dateDiff;
         return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
       });
-  }, [allJobs, jobPoolDueEnd, jobPoolDueStart, routedJobIds]);
+  }, [allJobs, jobPoolDueEnd, jobPoolDueStart, routedJobIds, selectedJobPoolTechs]);
 
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
     return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
