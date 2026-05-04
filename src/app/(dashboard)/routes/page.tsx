@@ -691,6 +691,9 @@ export default function RoutesPage() {
   const [mapError, setMapError] = useState(false);
   const [editMode, setEditMode] = useState(false);
   const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
+  const [jobPoolDueStart, setJobPoolDueStart] = useState("");
+  const [jobPoolDueEnd, setJobPoolDueEnd] = useState(offsetDateString(endDate, 14));
+  const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
   const [leftPanelRouteId, setLeftPanelRouteId] = useState<string | null>(null);
@@ -717,6 +720,12 @@ export default function RoutesPage() {
   const mapPolylinesRef = useRef<google.maps.Polyline[]>([]);
   const roadSnapWarningsRef = useRef<Set<string>>(new Set());
 
+  useEffect(() => {
+    if (jobPoolFilterTouched) return;
+    setJobPoolDueStart("");
+    setJobPoolDueEnd(offsetDateString(endDate, 14));
+  }, [endDate, jobPoolFilterTouched]);
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
@@ -738,7 +747,6 @@ export default function RoutesPage() {
     return ids;
   }, [allRoutes]);
   const jobPoolJobs = useMemo(() => {
-    const poolEndDate = offsetDateString(endDate, 14);
     return Object.values(allJobs)
       .filter((job) => {
         if (routedJobIds.has(job.id)) return false;
@@ -748,14 +756,16 @@ export default function RoutesPage() {
         if (job.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(job)) return false;
         const dueDate = String(job.scheduledDate || "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
-        return dueDate <= poolEndDate;
+        if (jobPoolDueStart && dueDate < jobPoolDueStart) return false;
+        if (jobPoolDueEnd && dueDate > jobPoolDueEnd) return false;
+        return true;
       })
       .sort((a, b) => {
         const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
         if (dateDiff !== 0) return dateDiff;
         return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
       });
-  }, [allJobs, endDate, routedJobIds]);
+  }, [allJobs, jobPoolDueEnd, jobPoolDueStart, routedJobIds]);
 
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
     return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
@@ -2124,7 +2134,7 @@ export default function RoutesPage() {
                   ? "bg-cyan-500 hover:bg-cyan-600 text-slate-950"
                   : "text-muted-foreground",
               )}
-              title="Show due jobs and jobs due within two weeks after the selected date range"
+              title={`Show unrouted jobs due ${jobPoolDueStart || "any time"} through ${jobPoolDueEnd || "any date"}`}
             >
               <Layers className="w-4 h-4" />
               Job Pool ({jobPoolJobs.length})
@@ -2152,6 +2162,49 @@ export default function RoutesPage() {
             </Button>
           </div>
         </div>
+
+        {showJobPoolLayer && (
+          <div className="px-3 lg:px-4 py-2 border-b border-cyan-500/20 bg-cyan-500/5 flex flex-wrap items-center gap-2 no-print">
+            <span className="text-xs font-medium text-cyan-300 whitespace-nowrap">Job Pool Due</span>
+            <DatePicker
+              value={jobPoolDueStart}
+              onChange={(value) => {
+                setJobPoolFilterTouched(true);
+                setJobPoolDueStart(value);
+                if (jobPoolDueEnd && value > jobPoolDueEnd) setJobPoolDueEnd(value);
+              }}
+              placeholder="Due from"
+              className="h-8 w-[150px] text-xs"
+            />
+            <span className="text-xs text-muted-foreground">to</span>
+            <DatePicker
+              value={jobPoolDueEnd}
+              onChange={(value) => {
+                setJobPoolFilterTouched(true);
+                setJobPoolDueEnd(value);
+                if (jobPoolDueStart && value < jobPoolDueStart) setJobPoolDueStart(value);
+              }}
+              placeholder="Due through"
+              className="h-8 w-[150px] text-xs"
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-8 px-2 text-xs text-cyan-200 hover:text-cyan-100 hover:bg-cyan-500/10"
+              onClick={() => {
+                setJobPoolFilterTouched(false);
+                setJobPoolDueStart("");
+                setJobPoolDueEnd(offsetDateString(endDate, 14));
+              }}
+            >
+              Reset
+            </Button>
+            <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
+              {jobPoolJobs.length} jobs shown
+            </span>
+          </div>
+        )}
 
         {/* Generation result */}
         {genResult && (
