@@ -112,6 +112,59 @@ interface InvalidRow {
   address?: string;
 }
 
+interface PreparedJob {
+  jobId: string;
+  baseJobData: Record<string, unknown>;
+  assignedTechId: string;
+  serviceDueAlreadyCompleted: boolean;
+}
+
+function getSubscriptionLastServicedFromRow(row: CsvRow) {
+  return col(
+    row,
+    "Subscription Last Serviced",
+    "Subscription Last Completed",
+    "subscriptionLastServiced",
+    "subscriptionLastCompleted",
+    "Subscription Last Service",
+    "Last Serviced",
+    "lastServiced",
+    "Last Service Date",
+    "lastServiceDate",
+    "Last Completed",
+    "lastCompleted",
+  );
+}
+
+function resolveExistingStatus(
+  existingStatus: string,
+  serviceDueAlreadyCompleted: boolean,
+) {
+  if (serviceDueAlreadyCompleted) return "completed";
+  if (existingStatus === "scheduled" || existingStatus === "in_progress") return existingStatus;
+  return "pending";
+}
+
+async function getExistingJobDocs(
+  db: FirebaseFirestore.Firestore,
+  refs: FirebaseFirestore.DocumentReference[],
+) {
+  const existing = new Map<string, FirebaseFirestore.DocumentData>();
+  const chunks: FirebaseFirestore.DocumentReference[][] = [];
+  for (let i = 0; i < refs.length; i += 300) {
+    const chunk = refs.slice(i, i + 300);
+    if (chunk.length > 0) chunks.push(chunk);
+  }
+
+  const snapshotChunks = await Promise.all(
+    chunks.map((chunk) => db.getAll(...chunk)),
+  );
+  snapshotChunks.flat().forEach((snap) => {
+    if (snap.exists) existing.set(snap.id, snap.data() || {});
+  });
+  return existing;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -181,13 +234,12 @@ export async function POST(request: NextRequest) {
     let newCount = 0;
     let updatedCount = 0;
     let alreadyCompletedCount = 0;
+    let duplicatesSkipped = 0;
     const invalidRows: InvalidRow[] = [];
 
     const batchId = randomUUID();
     const uploadedAt = new Date().toISOString();
-
-    let batch = db.batch();
-    let batchOps = 0;
+    const preparedById = new Map<string, PreparedJob>();
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -277,9 +329,6 @@ export async function POST(request: NextRequest) {
         continue;
       }
 
-      const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
-      const existing = await jobRef.get();
-
       const lat =
         parseFloat(col(row, "Latitude", "lat", "latitude", "Lat")) || null;
       const lng =
@@ -303,25 +352,13 @@ export async function POST(request: NextRequest) {
         "assigned_tech",
         "Tech",
       );
-      const subscriptionLastServiced = col(
-        row,
-        "Subscription Last Serviced",
-        "subscriptionLastServiced",
-        "Subscription Last Service",
-        "Last Serviced",
-        "lastServiced",
-        "Last Service Date",
-        "lastServiceDate",
-        "Last Completed",
-        "lastCompleted",
-      );
+      const subscriptionLastServiced = getSubscriptionLastServicedFromRow(row);
       const subscriptionLastCompletedDate =
         normalizeServiceDate(subscriptionLastServiced) ||
         normalizeRouteDateValue(subscriptionLastServiced);
       const serviceDueAlreadyCompleted =
         Boolean(subscriptionLastCompletedDate) &&
         subscriptionLastCompletedDate >= scheduledDate;
-      if (serviceDueAlreadyCompleted) alreadyCompletedCount++;
       const baseJobData = {
         jobId,
         customerId,
@@ -388,31 +425,51 @@ export async function POST(request: NextRequest) {
         updatedAt: uploadedAt,
       };
 
-      if (existing.exists) {
-        const existingData = existing.data() || {};
-        const existingStatus = String(existingData.status || "").toLowerCase();
-        const resolvedStatus = serviceDueAlreadyCompleted
-          ? "completed"
-          : existingData.status || "pending";
-        const updateData = {
-          ...baseJobData,
+      if (preparedById.has(jobId)) duplicatesSkipped++;
+      preparedById.set(jobId, {
+        jobId,
+        baseJobData,
+        assignedTechId,
+        serviceDueAlreadyCompleted,
+      });
+    }
+
+    const preparedJobs = [...preparedById.values()];
+    alreadyCompletedCount = preparedJobs.filter((job) => job.serviceDueAlreadyCompleted).length;
+    const jobRefs = preparedJobs.map((job) => db.doc(`companies/${companyId}/jobs/${job.jobId}`));
+    const existingJobs = await getExistingJobDocs(db, jobRefs);
+    let batch = db.batch();
+    let batchOps = 0;
+
+    for (const prepared of preparedJobs) {
+      const jobRef = db.doc(`companies/${companyId}/jobs/${prepared.jobId}`);
+      const existingData = existingJobs.get(prepared.jobId);
+      const existingStatus = String(existingData?.status || "").toLowerCase();
+      const resolvedStatus = resolveExistingStatus(
+        existingStatus,
+        prepared.serviceDueAlreadyCompleted,
+      );
+      const keepExistingAssignment =
+        prepared.serviceDueAlreadyCompleted ||
+        existingStatus === "scheduled" ||
+        existingStatus === "in_progress";
+
+      batch.set(
+        jobRef,
+        {
+          ...prepared.baseJobData,
           status: resolvedStatus,
-          ...(serviceDueAlreadyCompleted
-            ? { assignedTechId: existingData.assignedTechId || assignedTechId }
-            : existingStatus && existingStatus !== "pending"
-            ? { assignedTechId: existingData.assignedTechId || assignedTechId }
-            : { assignedTechId }),
+          assignedTechId: keepExistingAssignment
+            ? existingData?.assignedTechId || prepared.assignedTechId
+            : prepared.assignedTechId,
           lastUploadBatchId: batchId,
-        };
-        batch.set(jobRef, updateData, { merge: true });
-        updatedCount++;
-      } else {
-        batch.create(jobRef, {
-          ...baseJobData,
-          createdAt: uploadedAt,
-        });
-        newCount++;
-      }
+          ...(existingData ? {} : { createdAt: uploadedAt }),
+        },
+        { merge: true },
+      );
+
+      if (existingData) updatedCount++;
+      else newCount++;
       batchOps++;
 
       if (batchOps >= 450) {
@@ -437,6 +494,7 @@ export async function POST(request: NextRequest) {
       newJobs: newCount,
       updatedJobs: updatedCount,
       alreadyCompleted: alreadyCompletedCount,
+      duplicatesSkipped,
       invalidRows: invalidRows.length,
       invalidRowsSample: invalidRows.slice(0, 20),
     });
@@ -450,10 +508,10 @@ export async function POST(request: NextRequest) {
       updated: updatedCount,
       alreadyCompleted: alreadyCompletedCount,
       skipped: 0,
-      duplicatesSkipped: 0,
+      duplicatesSkipped,
       invalid: invalidRows.length,
       invalidSample: invalidRows.slice(0, 10),
-      message: `${total} rows: ${newCount} new, ${updatedCount} updated${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
+      message: `${total} rows: ${newCount} new, ${updatedCount} updated${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${duplicatesSkipped ? `, ${duplicatesSkipped} duplicate rows merged` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
     });
   } catch (error) {
     console.error("Upload jobs error:", error);

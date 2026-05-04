@@ -12,7 +12,9 @@ type CsvBackedRecord = {
 
 const LAST_SERVICED_FIELD_NAMES = [
   "Subscription Last Serviced",
+  "Subscription Last Completed",
   "subscriptionLastServiced",
+  "subscriptionLastCompleted",
   "Subscription Last Service",
   "Last Serviced",
   "lastServiced",
