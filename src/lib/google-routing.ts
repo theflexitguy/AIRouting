@@ -240,6 +240,9 @@ function departureTimeForRouteDate(routeDate?: string) {
     Date.UTC(year, month - 1, day, localHour, localMinute, 0) -
       offsetMinutes * 60000,
   );
+  if (utcDate.getTime() <= Date.now() + 5 * 60 * 1000) {
+    return new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  }
   return utcDate.toISOString();
 }
 
