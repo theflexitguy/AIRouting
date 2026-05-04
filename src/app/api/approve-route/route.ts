@@ -399,6 +399,15 @@ function isRecord(value: unknown): value is FieldRoutesRecord {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
+function isFieldRoutesEndpointNotFound(error: unknown, endpoint: string) {
+  if (!(error instanceof ApproveRouteError)) return false;
+  const details = isRecord(error.details) ? error.details : {};
+  return (
+    String(details.endpoint || "") === endpoint &&
+    Number(details.status) === 404
+  ) || error.message.includes(`FieldRoutes ${endpoint} failed: HTTP 404`);
+}
+
 function extractApiError(payload: unknown) {
   if (!isRecord(payload)) return "";
   const status = payload.status;
@@ -636,14 +645,55 @@ function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData) {
 
 async function discoverRouteGroupId(client: FieldRoutesClient, routeDate: string, groupTitle: string) {
   if (!groupTitle) return "";
-  const payload = await client.routeSearch({
-    groupTitle,
-    dateStart: offsetDate(routeDate, -365),
-    dateEnd: offsetDate(routeDate, 365),
-  });
+  let payload: unknown;
+  try {
+    payload = await client.routeSearch({
+      groupTitle,
+      dateStart: offsetDate(routeDate, -365),
+      dateEnd: offsetDate(routeDate, 365),
+    });
+  } catch (error) {
+    if (isFieldRoutesEndpointNotFound(error, "/route/search")) return "";
+    throw error;
+  }
   const records = extractRecords(payload, ["routes", "results", "items", "data"]);
   const ids = records.map((record) => extractId(record, GROUP_ID_FIELDS)).filter(Boolean);
   return [...new Set(ids)][0] || "";
+}
+
+function inferExistingRouteFromAppointments(
+  records: FieldRoutesRecord[],
+  assignedTech: string,
+  routeDate: string,
+  groupTitle: string,
+) {
+  const byRouteId = new Map<string, { count: number; groupId: string }>();
+  for (const record of records) {
+    const routeId = extractId(record, ROUTE_ID_FIELDS);
+    if (!routeId) continue;
+
+    const recordDate = extractAppointmentDate(record) || routeDate;
+    if (recordDate !== routeDate) continue;
+
+    const recordTech = clean(firstPresent(record, ASSIGNED_TECH_FIELDS));
+    if (recordTech && recordTech !== assignedTech) continue;
+
+    const current = byRouteId.get(routeId) || { count: 0, groupId: "" };
+    byRouteId.set(routeId, {
+      count: current.count + 1,
+      groupId: current.groupId || extractId(record, GROUP_ID_FIELDS),
+    });
+  }
+
+  const best = [...byRouteId.entries()].sort((a, b) => b[1].count - a[1].count)[0];
+  if (!best) return null;
+  return {
+    routeId: best[0],
+    dateInputUsed: routeDate,
+    status: "existing_from_appointments" as const,
+    routeGroupTitle: groupTitle,
+    routeGroupId: best[1].groupId,
+  };
 }
 
 async function resolveFieldRoutesRoute(
@@ -652,10 +702,17 @@ async function resolveFieldRoutesRoute(
   routeDate: string,
   route: FirebaseFirestore.DocumentData,
   jobs: JobRecord[],
+  appointmentRecords: FieldRoutesRecord[],
 ) {
   const groupTitle = routeGroupTitleForJobs(route, jobs);
   for (const date of dateVariants(routeDate)) {
-    const payload = await client.routeSearch({ assignedTech, date, groupTitle });
+    let payload: unknown;
+    try {
+      payload = await client.routeSearch({ assignedTech, date, groupTitle });
+    } catch (error) {
+      if (isFieldRoutesEndpointNotFound(error, "/route/search")) break;
+      throw error;
+    }
     const records = extractRecords(payload, ["routes", "results", "items", "data"]);
     for (const record of records) {
       const routeId = extractId(record, ROUTE_ID_FIELDS);
@@ -674,6 +731,14 @@ async function resolveFieldRoutesRoute(
     const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
     if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
   }
+
+  const routeFromAppointments = inferExistingRouteFromAppointments(
+    appointmentRecords,
+    assignedTech,
+    routeDate,
+    groupTitle,
+  );
+  if (routeFromAppointments) return routeFromAppointments;
 
   const templateId = routeTemplateIdFromConfig(route);
   const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
@@ -960,8 +1025,15 @@ async function uploadRouteToFieldRoutes({
   if (!routeDate) throw new ApproveRouteError("Route is missing a valid date.", 400);
 
   const assignedTech = await resolveFieldRoutesTechId(client, route, tech);
-  const routeInfo = await resolveFieldRoutesRoute(client, assignedTech, routeDate, route, jobs);
   const appointmentRecords = await fetchAppointmentsForDate(client, routeDate);
+  const routeInfo = await resolveFieldRoutesRoute(
+    client,
+    assignedTech,
+    routeDate,
+    route,
+    jobs,
+    appointmentRecords,
+  );
   const indexes = buildAppointmentIndexes(appointmentRecords, routeDate);
   const createMissing = clean(process.env.FIELDROUTES_CREATE_MISSING_APPOINTMENTS || "true").toLowerCase() !== "false";
 
