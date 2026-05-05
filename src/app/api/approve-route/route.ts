@@ -751,18 +751,6 @@ async function resolveFieldRoutesRoute(
 
   const templateId = routeTemplateIdFromConfig(route);
   const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
-  if (groupTitle && !groupId && !templateId) {
-    throw new ApproveRouteError(
-      `No ${groupTitle} FieldRoutes route exists for this technician/date, and no route group ID or template ID is configured to create one.`,
-      400,
-      {
-        requiredEnv: [
-          "FIELDROUTES_GPC_ROUTE_GROUP_ID",
-          "FIELDROUTES_GPC_ROUTE_TEMPLATE_ID",
-        ],
-      },
-    );
-  }
 
   for (const date of dateVariants(routeDate)) {
     const payload = await client.routeCreate({ assignedTech, date, templateId, groupId });
