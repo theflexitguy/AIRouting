@@ -19,6 +19,7 @@ const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
 const SERVICE_TYPE_FIELDS = ["serviceID", "serviceId", "serviceTypeID", "serviceTypeId", "type"];
 const GPC_GROUP_TITLE = "GPC";
 const FIELDROUTES_NWA_BASE_URL = "https://flexpc.fieldroutes.com/api";
+const FIELDROUTES_NWA_GENERAL_PEST_SERVICE_ID = 1;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ENABLE_FIELDROUTES_ROUTE_SEARCH =
   clean(process.env.FIELDROUTES_ENABLE_ROUTE_SEARCH || "true").toLowerCase() !== "false";
@@ -28,6 +29,7 @@ const GPC_SERVICE_CONFIG = [
     envKeys: ["FIELDROUTES_GENERAL_PEST_SERVICE_ID", "FIELDROUTES_GPC_GENERAL_PEST_SERVICE_ID"],
     companyFields: ["fieldRoutesGeneralPestServiceId", "fieldRoutesGpcGeneralPestServiceId"],
     patterns: [/general\s+pest/i, /\bgpc\b/i],
+    defaultServiceId: FIELDROUTES_NWA_GENERAL_PEST_SERVICE_ID,
   },
   {
     key: "mosquito",
@@ -606,6 +608,7 @@ function mappedServiceTypeForJob(job: FirebaseFirestore.DocumentData) {
       const parsed = parseIntField(process.env[envKey]);
       if (parsed) return parsed;
     }
+    if ("defaultServiceId" in config && config.defaultServiceId) return config.defaultServiceId;
   }
 
   return parseIntField(job.fieldRoutesDefaultServiceId || process.env.FIELDROUTES_DEFAULT_SERVICE_ID);
