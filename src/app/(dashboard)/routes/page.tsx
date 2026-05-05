@@ -1903,6 +1903,57 @@ export default function RoutesPage() {
     return data as ApproveRouteUploadResult;
   };
 
+  const deleteRouteFromFieldRoutes = async (tr: TechRoute) => {
+    if (!userProfile?.companyId) throw new Error("Missing company profile");
+    const loggedRouteId = tr.route.fieldRoutesSync?.routeId;
+    if (!loggedRouteId) throw new Error("This route has no logged FieldRoutes route ID.");
+
+    const res = await fetch("/api/delete-fieldroutes-route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        companyId: userProfile.companyId,
+        routeId: tr.route.id,
+        requestedBy: userProfile.email,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || "Failed to delete FieldRoutes route");
+    }
+    return data as { fieldRoutesRouteId: string; deletedAt: string };
+  };
+
+  const handleDeleteFieldRoutesRoute = async (tr: TechRoute) => {
+    if (!userProfile?.companyId) return;
+    setApproving(tr.route.id);
+    try {
+      const result = await deleteRouteFromFieldRoutes(tr);
+      setAllRoutes(prev => prev.map(item =>
+        item.route.id === tr.route.id
+          ? {
+              ...item,
+              route: {
+                ...item.route,
+                approved: false,
+                approvedAt: undefined,
+                approvedBy: undefined,
+                fieldRoutesSync: undefined,
+                updatedAt: result.deletedAt,
+              } as RouteWithMetrics,
+            }
+          : item
+      ));
+      await loadJobsForRange(userProfile.companyId);
+      toast.success(`Deleted FieldRoutes route ${result.fieldRoutesRouteId} and unscheduled this RouteIQ route`);
+    } catch (error) {
+      console.error("Delete FieldRoutes route error:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to delete FieldRoutes route");
+    } finally {
+      setApproving(null);
+    }
+  };
+
   const handleApprove = async (techIndex: number, approved: boolean) => {
     if (!userProfile?.companyId) return;
     const visRoute = visibleRoutes[techIndex];
@@ -2470,6 +2521,9 @@ export default function RoutesPage() {
                       <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => { const tidx = visibleRoutes.indexOf(tr); if (tidx >= 0) handleApprove(tidx, false); }} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Reject</Button>
                     </>
                   )}
+                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
+                  )}
                 </div>
               </div>
             );
@@ -2594,6 +2648,9 @@ export default function RoutesPage() {
                       <Button size="sm" className="h-6 text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20" onClick={() => { const tidx = visibleRoutes.indexOf(tr); if (tidx >= 0) handleApprove(tidx, true); }} disabled={approving === tr.route.id}><CheckCircle className="w-3 h-3" /> Approve</Button>
                       <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => { const tidx = visibleRoutes.indexOf(tr); if (tidx >= 0) handleApprove(tidx, false); }} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Reject</Button>
                     </>
+                  )}
+                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
                   )}
                 </div>
               </div>
