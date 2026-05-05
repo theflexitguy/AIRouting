@@ -2011,6 +2011,51 @@ export default function RoutesPage() {
     }
   };
 
+  const handleUndoFieldRoutesStops = async (tr: TechRoute) => {
+    if (!userProfile?.companyId) return;
+    setApproving(tr.route.id);
+    try {
+      const res = await fetch("/api/undo-fieldroutes-stops", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: tr.route.id,
+          requestedBy: userProfile.email,
+        }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.success) {
+        const preview = Array.isArray(result.errors) && result.errors.length > 0
+          ? ` ${result.errors[0].customerName || result.errors[0].appointmentId}: ${result.errors[0].reason}`
+          : "";
+        throw new Error(`${result.error || "Failed to undo FieldRoutes stops"}${preview}`);
+      }
+      setAllRoutes(prev => prev.map(item =>
+        item.route.id === tr.route.id
+          ? {
+              ...item,
+              route: {
+                ...item.route,
+                approved: false,
+                approvedAt: undefined,
+                approvedBy: undefined,
+                fieldRoutesSync: undefined,
+                updatedAt: result.undoneAt || new Date().toISOString(),
+              } as RouteWithMetrics,
+            }
+          : item
+      ));
+      await loadJobsForRange(userProfile.companyId);
+      toast.success(`Undid ${result.undone?.length || 0} FieldRoutes appointment(s) and unscheduled the RouteIQ route`);
+    } catch (error) {
+      console.error("Undo FieldRoutes stops error:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to undo FieldRoutes stops");
+    } finally {
+      setApproving(null);
+    }
+  };
+
   const handleApprove = async (techIndex: number, approved: boolean) => {
     if (!userProfile?.companyId) return;
     const visRoute = visibleRoutes[techIndex];
@@ -2581,6 +2626,9 @@ export default function RoutesPage() {
                   {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus === "created" && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
                   )}
+                  {tr.route.approved && (tr.route.fieldRoutesSync?.uploadedAppointments?.length || 0) > 0 && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleUndoFieldRoutesStops(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Undo FR Stops</Button>
+                  )}
                   {tr.route.approved && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
                   )}
@@ -2711,6 +2759,9 @@ export default function RoutesPage() {
                   )}
                   {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus === "created" && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
+                  )}
+                  {tr.route.approved && (tr.route.fieldRoutesSync?.uploadedAppointments?.length || 0) > 0 && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleUndoFieldRoutesStops(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Undo FR Stops</Button>
                   )}
                   {tr.route.approved && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>

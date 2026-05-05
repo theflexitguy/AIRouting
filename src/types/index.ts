@@ -125,6 +125,20 @@ export interface Route {
       customerName?: string;
       sequence?: number;
       action?: string;
+      before?: {
+        routeId?: string;
+        assignedTech?: string;
+        date?: string;
+        sequence?: number | null;
+        status?: string;
+      };
+      after?: {
+        routeId?: string;
+        assignedTech?: string;
+        date?: string;
+        sequence?: number | null;
+        status?: string;
+      };
     }>;
     bundledSameAddressStops?: number;
   };

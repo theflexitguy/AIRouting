@@ -16,6 +16,7 @@ const ASSIGNED_TECH_FIELDS = ["assignedTech", "assignedTechID", "assignedTechId"
 const CUSTOMER_FIELDS = ["customerID", "customerId", "customer_id", "customer", "accountID", "accountId"];
 const SUBSCRIPTION_FIELDS = ["subscriptionID", "subscriptionId", "subscription_id", "subscription", "subscriptionIDFk"];
 const APPOINTMENT_DATE_FIELDS = ["date", "dateStart", "serviceDate", "scheduledDate", "appointmentDate"];
+const APPOINTMENT_STATUS_FIELDS = ["status", "appointmentStatus"];
 const ROUTE_DATE_FIELDS = ["date", "routeDate", "serviceDate"];
 const ROUTE_TIME_FIELDS = ["time", "startTime", "start", "routeTime", "scheduledTime"];
 const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
@@ -107,6 +108,22 @@ type JobRecord = { id: string; data: FirebaseFirestore.DocumentData };
 type AppointmentFetchResult = {
   records: FieldRoutesRecord[];
   appointmentSearchUnavailable: boolean;
+};
+type AppointmentAssignmentSnapshot = {
+  routeId: string;
+  assignedTech: string;
+  date: string;
+  sequence: number | null;
+  status: string;
+};
+type UploadedAppointmentLog = {
+  appointmentId: string;
+  jobId: string;
+  customerName: string;
+  sequence: number;
+  action: string;
+  before?: AppointmentAssignmentSnapshot;
+  after: AppointmentAssignmentSnapshot;
 };
 
 class ApproveRouteError extends Error {
@@ -547,6 +564,10 @@ function extractAppointmentDate(record: FieldRoutesRecord) {
   return normalizeDate(firstPresent(record, APPOINTMENT_DATE_FIELDS) || deepFindFirstKey(record, APPOINTMENT_DATE_FIELDS));
 }
 
+function extractAppointmentStatus(record: FieldRoutesRecord) {
+  return clean(firstPresent(record, APPOINTMENT_STATUS_FIELDS) || deepFindFirstKey(record, APPOINTMENT_STATUS_FIELDS));
+}
+
 function extractRouteDate(record: FieldRoutesRecord) {
   return normalizeDate(firstPresent(record, ROUTE_DATE_FIELDS) || deepFindFirstKey(record, ROUTE_DATE_FIELDS));
 }
@@ -564,6 +585,31 @@ function extractSequence(record: FieldRoutesRecord) {
   if (value === undefined) return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+}
+
+function appointmentAssignmentSnapshot(record: FieldRoutesRecord, fallbackDate: string): AppointmentAssignmentSnapshot {
+  return {
+    routeId: extractId(record, ROUTE_ID_FIELDS),
+    assignedTech: extractAssignedTech(record),
+    date: extractAppointmentDate(record) || fallbackDate,
+    sequence: extractSequence(record),
+    status: extractAppointmentStatus(record),
+  };
+}
+
+function targetAssignmentSnapshot(
+  routeId: string,
+  assignedTech: string,
+  routeDate: string,
+  sequence: number,
+): AppointmentAssignmentSnapshot {
+  return {
+    routeId,
+    assignedTech,
+    date: routeDate,
+    sequence,
+    status: "0",
+  };
 }
 
 function extractCustomerId(record: FieldRoutesRecord) {
@@ -1142,7 +1188,7 @@ async function verifyUploadedAppointments({
   routeId: string;
   assignedTech: string;
   routeDate: string;
-  uploadedAppointments: Array<{ appointmentId: string; jobId: string; customerName: string; sequence: number; action: string }>;
+  uploadedAppointments: UploadedAppointmentLog[];
 }) {
   const ids = [...new Set(uploadedAppointments.map((item) => item.appointmentId).filter(Boolean))];
   const fetched = new Map<string, FieldRoutesRecord>();
@@ -1431,6 +1477,7 @@ async function uploadRouteToFieldRoutes({
     subscriptionId?: string;
     serviceType?: number;
     duration?: number;
+    before?: AppointmentAssignmentSnapshot;
   }> = [];
   const errors: Array<{ jobId: string; customerName: string; reason: string }> = [];
   const claimedAppointments = new Set<string>();
@@ -1496,6 +1543,7 @@ async function uploadRouteToFieldRoutes({
       action: unchanged ? "unchanged" : "update",
       appointmentId,
       duration,
+      before: appointmentAssignmentSnapshot(appointment, routeDate),
     });
   });
 
@@ -1519,13 +1567,7 @@ async function uploadRouteToFieldRoutes({
     unchanged: 0,
     total: plan.length,
     appointmentIds: [] as string[],
-    uploadedAppointments: [] as Array<{
-      appointmentId: string;
-      jobId: string;
-      customerName: string;
-      sequence: number;
-      action: string;
-    }>,
+    uploadedAppointments: [] as UploadedAppointmentLog[],
     verifiedAt: "",
   };
 
@@ -1539,6 +1581,8 @@ async function uploadRouteToFieldRoutes({
           customerName: item.customerName,
           sequence: item.sequence,
           action: item.action,
+          before: item.before,
+          after: targetAssignmentSnapshot(routeInfo.routeId, assignedTech, routeDate, item.sequence),
         });
       }
       continue;
@@ -1577,6 +1621,7 @@ async function uploadRouteToFieldRoutes({
         customerName: item.customerName,
         sequence: item.sequence,
         action: item.action,
+        after: targetAssignmentSnapshot(routeInfo.routeId, assignedTech, routeDate, item.sequence),
       });
       summary.created++;
       continue;
@@ -1596,6 +1641,8 @@ async function uploadRouteToFieldRoutes({
       customerName: item.customerName,
       sequence: item.sequence,
       action: item.action,
+      before: item.before,
+      after: targetAssignmentSnapshot(routeInfo.routeId, assignedTech, routeDate, item.sequence),
     });
     summary.updated++;
   }
