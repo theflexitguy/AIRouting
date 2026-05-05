@@ -115,6 +115,25 @@ async function fieldRoutesRequest({
   });
 }
 
+function cancellationConfig(company: FirebaseFirestore.DocumentData, route: FirebaseFirestore.DocumentData) {
+  const sync = isRecord(route.fieldRoutesSync) ? route.fieldRoutesSync : {};
+  return {
+    cancelReason: clean(
+      company.fieldRoutesCancelReason ||
+        company.fieldRoutesRouteIqCancelReason ||
+        process.env.FIELDROUTES_CANCEL_REASON ||
+        "RouteIQ rollback",
+    ),
+    cancelledBy: clean(
+      company.fieldRoutesCancelledByEmployeeId ||
+        company.fieldRoutesCanceledByEmployeeId ||
+        process.env.FIELDROUTES_CANCELLED_BY_EMPLOYEE_ID ||
+        process.env.FIELDROUTES_CANCELED_BY_EMPLOYEE_ID ||
+        sync.assignedTech,
+    ),
+  };
+}
+
 function restorePayload(item: UploadedAppointmentLog) {
   const before = item.before || {};
   const payload: Record<string, unknown> = {
@@ -131,10 +150,9 @@ function restorePayload(item: UploadedAppointmentLog) {
 }
 
 function cancelPayload(item: UploadedAppointmentLog) {
-  return {
+  return Object.fromEntries(Object.entries({
     appointmentID: clean(item.appointmentId),
-    status: 2,
-  };
+  }).filter(([, value]) => value !== ""));
 }
 
 function syncDetailsFromRoute(route: FirebaseFirestore.DocumentData) {
@@ -194,6 +212,7 @@ export async function POST(request: NextRequest) {
     const undone: Array<{ appointmentId: string; customerName: string; action: string }> = [];
     const skipped: Array<{ appointmentId: string; customerName: string; reason: string }> = [];
     const baseUrl = fieldRoutesNwaBaseUrl(company);
+    const cancelConfig = cancellationConfig(company, route);
 
     for (const item of uploadedAppointments) {
       const appointmentId = clean(item.appointmentId);
@@ -207,7 +226,11 @@ export async function POST(request: NextRequest) {
       let payload: Record<string, unknown> | null = null;
       let rollbackAction = "";
       if (action === "create") {
-        payload = cancelPayload(item);
+        payload = {
+          ...cancelPayload(item),
+          cancelReason: cancelConfig.cancelReason,
+          ...(cancelConfig.cancelledBy ? { cancelledBy: Number.isFinite(Number(cancelConfig.cancelledBy)) ? Number(cancelConfig.cancelledBy) : cancelConfig.cancelledBy } : {}),
+        };
         rollbackAction = "cancelled_created_appointment";
       } else if (action === "update") {
         payload = restorePayload(item);
@@ -230,7 +253,7 @@ export async function POST(request: NextRequest) {
           baseUrl,
           authKey,
           authToken,
-          endpoint: "/appointment/update",
+          endpoint: action === "create" ? "/appointment/cancel" : "/appointment/update",
           payload,
         });
         undone.push({ appointmentId, customerName, action: rollbackAction });
