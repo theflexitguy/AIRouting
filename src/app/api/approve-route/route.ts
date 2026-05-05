@@ -19,10 +19,63 @@ const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
 const SERVICE_TYPE_FIELDS = ["serviceID", "serviceId", "serviceTypeID", "serviceTypeId", "type"];
 const GPC_GROUP_TITLE = "GPC";
 const FIELDROUTES_NWA_BASE_URL = "https://flexpc.fieldroutes.com/api";
-const FIELDROUTES_NWA_GENERAL_PEST_SERVICE_ID = 1;
+const FIELDROUTES_NWA_GENERAL_PEST_SERVICE_ID = 2;
+const FIELDROUTES_NWA_ROUTE_TEMPLATE_GPC = 34;
+const FIELDROUTES_NWA_ROUTE_TEMPLATE_TUESDAY = 26;
+const FIELDROUTES_NWA_ROUTE_TEMPLATE_SATURDAY = 5;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ENABLE_FIELDROUTES_ROUTE_SEARCH =
   clean(process.env.FIELDROUTES_ENABLE_ROUTE_SEARCH || "true").toLowerCase() !== "false";
+const FIELDROUTES_NWA_SERVICE_IDS = {
+  "bait box initial": 136,
+  "bait boxes": 135,
+  "balance forward": 38,
+  "bed bug": 22,
+  "bird exclusion": 144,
+  "boat dock": 109,
+  "cancelation fee": 143,
+  "cancellation fee": 143,
+  commercial: 43,
+  "commercial initial": 132,
+  "commercial per service": 77,
+  "flea treatment": 81,
+  "fly treatments": 15,
+  "follow up": 107,
+  "general pest": 2,
+  "general pest initial": 3,
+  "german roach": 14,
+  "habitat removal": 140,
+  "habitat removal initial": 141,
+  inspection: 133,
+  "library custom": 79,
+  mole: 28,
+  "mosquito buckets": 129,
+  "mosquito buckets initial": 130,
+  "mosquito fogging": 42,
+  "one time general pest": 5,
+  "one-time general pest": 5,
+  "one-time service": 137,
+  "one time service": 137,
+  "outdoor package": 87,
+  "payment plan": 139,
+  reservice: 4,
+  rodent: 106,
+  "round 1 late winter": 110,
+  "round 2 early spring": 112,
+  "round 3 spring fertilizer": 113,
+  "round 4 early summer": 114,
+  "round 5 fertilizer": 115,
+  "round 6 root strengthening": 116,
+  "round 7 lime": 117,
+  "termite bait stations": 32,
+  "termite initial": 131,
+  "termite pretreat": 108,
+  "termite retreat only": 121,
+  "test ignore": 142,
+  "wild life exclusion": 85,
+  "wildlife exclusion": 85,
+  "wildlife initial": 134,
+} as const;
 const GPC_SERVICE_CONFIG = [
   {
     key: "general_pest",
@@ -583,6 +636,15 @@ function parseServiceIdMap(value?: unknown) {
   return out;
 }
 
+function defaultNwaServiceTypeForJob(job: FirebaseFirestore.DocumentData) {
+  const normalizedServiceText = normalizeName(serviceTextForJob(job));
+  if (!normalizedServiceText) return undefined;
+  const match = Object.entries(FIELDROUTES_NWA_SERVICE_IDS)
+    .sort((a, b) => b[0].length - a[0].length)
+    .find(([key]) => normalizedServiceText === key || normalizedServiceText.includes(key) || key.includes(normalizedServiceText));
+  return match?.[1];
+}
+
 function mappedServiceTypeForJob(job: FirebaseFirestore.DocumentData) {
   const serviceText = serviceTextForJob(job);
   const normalizedServiceText = normalizeName(serviceText);
@@ -596,6 +658,9 @@ function mappedServiceTypeForJob(job: FirebaseFirestore.DocumentData) {
       );
     });
   if (configuredMatch) return configuredMatch[1];
+
+  const defaultNwaServiceType = defaultNwaServiceTypeForJob(job);
+  if (defaultNwaServiceType) return defaultNwaServiceType;
 
   const key = gpcServiceKey(job);
   const config = GPC_SERVICE_CONFIG.find((item) => item.key === key);
@@ -691,8 +756,8 @@ function routeGroupIdFromConfig(route: FirebaseFirestore.DocumentData) {
   );
 }
 
-function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData) {
-  return parseIntField(
+function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData, routeDate: string, groupTitle: string) {
+  const configured = parseIntField(
     route.fieldRoutesTemplateID ||
       route.fieldRoutesTemplateId ||
       route.fieldRoutesGpcRouteTemplateId ||
@@ -701,6 +766,19 @@ function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData) {
       process.env.FIELDROUTES_ROUTE_TEMPLATE_ID_GPC ||
       process.env.FIELDROUTES_ROUTE_TEMPLATE_ID_DEFAULT,
   );
+  if (configured) return configured;
+
+  const weekday = weekdayLabelForDate(routeDate);
+  if (weekday === "TUE") {
+    return parseIntField(route.fieldRoutesTuesdayRouteTemplateId || process.env.FIELDROUTES_TUESDAY_ROUTE_TEMPLATE_ID) ||
+      FIELDROUTES_NWA_ROUTE_TEMPLATE_TUESDAY;
+  }
+  if (weekday === "SAT") {
+    return parseIntField(route.fieldRoutesSaturdayRouteTemplateId || process.env.FIELDROUTES_SATURDAY_ROUTE_TEMPLATE_ID) ||
+      FIELDROUTES_NWA_ROUTE_TEMPLATE_SATURDAY;
+  }
+  if (normalizeName(groupTitle) === normalizeName(GPC_GROUP_TITLE)) return FIELDROUTES_NWA_ROUTE_TEMPLATE_GPC;
+  return undefined;
 }
 
 function fieldRoutesNwaBaseUrl(company: FirebaseFirestore.DocumentData) {
@@ -817,7 +895,7 @@ async function resolveFieldRoutesRoute(
     }
   }
 
-  const templateId = routeTemplateIdFromConfig(route);
+  const templateId = routeTemplateIdFromConfig(route, routeDate, groupTitle);
   const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
 
   for (const date of dateVariants(routeDate)) {
@@ -1336,6 +1414,8 @@ export async function POST(request: NextRequest) {
       fieldRoutesGpcRouteGroupId: company.fieldRoutesGpcRouteGroupId,
       fieldRoutesGpcRouteGroupTitle: company.fieldRoutesGpcRouteGroupTitle,
       fieldRoutesGpcRouteTemplateId: company.fieldRoutesGpcRouteTemplateId,
+      fieldRoutesTuesdayRouteTemplateId: company.fieldRoutesTuesdayRouteTemplateId,
+      fieldRoutesSaturdayRouteTemplateId: company.fieldRoutesSaturdayRouteTemplateId,
       fieldRoutesServiceIdMap: company.fieldRoutesServiceIdMap,
       fieldRoutesGeneralPestServiceId: company.fieldRoutesGeneralPestServiceId,
       fieldRoutesMosquitoServiceId: company.fieldRoutesMosquitoServiceId,
