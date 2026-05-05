@@ -19,6 +19,8 @@ const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
 const SERVICE_TYPE_FIELDS = ["serviceID", "serviceId", "serviceTypeID", "serviceTypeId", "type"];
 const GPC_GROUP_TITLE = "GPC";
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+const ENABLE_FIELDROUTES_ROUTE_SEARCH =
+  clean(process.env.FIELDROUTES_ENABLE_ROUTE_SEARCH).toLowerCase() === "true";
 const GPC_SERVICE_CONFIG = [
   {
     key: "general_pest",
@@ -645,6 +647,7 @@ function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData) {
 
 async function discoverRouteGroupId(client: FieldRoutesClient, routeDate: string, groupTitle: string) {
   if (!groupTitle) return "";
+  if (!ENABLE_FIELDROUTES_ROUTE_SEARCH) return "";
   let payload: unknown;
   try {
     payload = await client.routeSearch({
@@ -705,33 +708,6 @@ async function resolveFieldRoutesRoute(
   appointmentRecords: FieldRoutesRecord[],
 ) {
   const groupTitle = routeGroupTitleForJobs(route, jobs);
-  for (const date of dateVariants(routeDate)) {
-    let payload: unknown;
-    try {
-      payload = await client.routeSearch({ assignedTech, date, groupTitle });
-    } catch (error) {
-      if (isFieldRoutesEndpointNotFound(error, "/route/search")) break;
-      throw error;
-    }
-    const records = extractRecords(payload, ["routes", "results", "items", "data"]);
-    for (const record of records) {
-      const routeId = extractId(record, ROUTE_ID_FIELDS);
-      const recordDate = normalizeDate(firstPresent(record, ["date", "routeDate", "serviceDate"])) || routeDate;
-      const recordTech = clean(firstPresent(record, ASSIGNED_TECH_FIELDS));
-      if (routeId && recordDate === routeDate && (!recordTech || recordTech === assignedTech)) {
-        return {
-          routeId,
-          dateInputUsed: date,
-          status: "existing" as const,
-          routeGroupTitle: groupTitle,
-          routeGroupId: extractId(record, GROUP_ID_FIELDS),
-        };
-      }
-    }
-    const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
-    if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
-  }
-
   const routeFromAppointments = inferExistingRouteFromAppointments(
     appointmentRecords,
     assignedTech,
@@ -739,6 +715,35 @@ async function resolveFieldRoutesRoute(
     groupTitle,
   );
   if (routeFromAppointments) return routeFromAppointments;
+
+  if (ENABLE_FIELDROUTES_ROUTE_SEARCH) {
+    for (const date of dateVariants(routeDate)) {
+      let payload: unknown;
+      try {
+        payload = await client.routeSearch({ assignedTech, date, groupTitle });
+      } catch (error) {
+        if (isFieldRoutesEndpointNotFound(error, "/route/search")) break;
+        throw error;
+      }
+      const records = extractRecords(payload, ["routes", "results", "items", "data"]);
+      for (const record of records) {
+        const routeId = extractId(record, ROUTE_ID_FIELDS);
+        const recordDate = normalizeDate(firstPresent(record, ["date", "routeDate", "serviceDate"])) || routeDate;
+        const recordTech = clean(firstPresent(record, ASSIGNED_TECH_FIELDS));
+        if (routeId && recordDate === routeDate && (!recordTech || recordTech === assignedTech)) {
+          return {
+            routeId,
+            dateInputUsed: date,
+            status: "existing" as const,
+            routeGroupTitle: groupTitle,
+            routeGroupId: extractId(record, GROUP_ID_FIELDS),
+          };
+        }
+      }
+      const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
+      if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
+    }
+  }
 
   const templateId = routeTemplateIdFromConfig(route);
   const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
