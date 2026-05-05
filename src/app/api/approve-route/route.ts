@@ -45,6 +45,10 @@ const GPC_SERVICE_CONFIG = [
 type FieldRoutesPayload = Record<string, string | number | boolean | null | undefined>;
 type FieldRoutesRecord = Record<string, unknown>;
 type JobRecord = { id: string; data: FirebaseFirestore.DocumentData };
+type AppointmentFetchResult = {
+  records: FieldRoutesRecord[];
+  appointmentSearchUnavailable: boolean;
+};
 
 class ApproveRouteError extends Error {
   status: number;
@@ -772,12 +776,20 @@ async function resolveFieldRoutesRoute(
   throw new ApproveRouteError("FieldRoutes route/create did not return a route ID.", 502);
 }
 
-async function fetchAppointmentsForDate(client: FieldRoutesClient, routeDate: string) {
+async function fetchAppointmentsForDate(client: FieldRoutesClient, routeDate: string): Promise<AppointmentFetchResult> {
   const combined = new Map<string, FieldRoutesRecord>();
   for (const date of dateVariants(routeDate)) {
     for (const status of [0, undefined]) {
       for (let page = 1; page <= 40; page++) {
-        const payload = await client.appointmentSearch(date, date, status, page);
+        let payload: unknown;
+        try {
+          payload = await client.appointmentSearch(date, date, status, page);
+        } catch (error) {
+          if (isFieldRoutesEndpointNotFound(error, "/appointment/search")) {
+            return { records: [], appointmentSearchUnavailable: true };
+          }
+          throw error;
+        }
         const records = extractRecords(payload, ["appointments", "results", "items", "data"]);
         let newCount = 0;
         for (const record of records) {
@@ -798,7 +810,7 @@ async function fetchAppointmentsForDate(client: FieldRoutesClient, routeDate: st
   const needsHydration = records.some((record) => {
     return !extractAppointmentDate(record) || (!extractSubscriptionId(record) && !extractCustomerId(record));
   });
-  if (!needsHydration) return records;
+  if (!needsHydration) return { records, appointmentSearchUnavailable: false };
 
   const ids = records.map((record) => extractId(record, APPOINTMENT_ID_FIELDS)).filter(Boolean);
   for (let i = 0; i < ids.length; i += 500) {
@@ -808,7 +820,7 @@ async function fetchAppointmentsForDate(client: FieldRoutesClient, routeDate: st
       if (id) combined.set(id, record);
     }
   }
-  return [...combined.values()];
+  return { records: [...combined.values()], appointmentSearchUnavailable: false };
 }
 
 function buildAppointmentIndexes(records: FieldRoutesRecord[], routeDate: string) {
@@ -1030,7 +1042,8 @@ async function uploadRouteToFieldRoutes({
   if (!routeDate) throw new ApproveRouteError("Route is missing a valid date.", 400);
 
   const assignedTech = await resolveFieldRoutesTechId(client, route, tech);
-  const appointmentRecords = await fetchAppointmentsForDate(client, routeDate);
+  const appointmentFetch = await fetchAppointmentsForDate(client, routeDate);
+  const appointmentRecords = appointmentFetch.records;
   const routeInfo = await resolveFieldRoutesRoute(
     client,
     assignedTech,
@@ -1131,6 +1144,7 @@ async function uploadRouteToFieldRoutes({
     routeGroupTitle: routeInfo.routeGroupTitle,
     routeGroupId: routeInfo.routeGroupId,
     assignedTech,
+    appointmentSearchUnavailable: appointmentFetch.appointmentSearchUnavailable,
     updated: 0,
     created: 0,
     unchanged: 0,
