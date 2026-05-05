@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
-import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId, deleteField } from "firebase/firestore";
+import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -1969,36 +1969,23 @@ export default function RoutesPage() {
     }
   };
 
-  const handleClearFieldRoutesSync = async (tr: TechRoute) => {
+  const handleUnscheduleRouteIqRoute = async (tr: TechRoute) => {
     if (!userProfile?.companyId) return;
     setApproving(tr.route.id);
     try {
-      const now = new Date().toISOString();
-      const batch = writeBatch(db);
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
-        approved: false,
-        approvedAt: deleteField(),
-        approvedBy: deleteField(),
-        fieldRoutesSync: deleteField(),
-        fieldRoutesClearedSync: {
-          clearedAt: now,
-          routeId: tr.route.fieldRoutesSync?.routeId || "",
-          routeStatus: tr.route.fieldRoutesSync?.routeStatus || "",
-          reason: "Cleared local sync for existing FieldRoutes route",
+      const res = await fetch("/api/unschedule-routeiq-route", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: tr.route.id,
           requestedBy: userProfile.email,
-        },
-        updatedAt: now,
+        }),
       });
-      for (const jobId of tr.route.stopSequence) {
-        batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
-          status: "pending",
-          fieldRoutesRouteId: deleteField(),
-          fieldRoutesSequence: deleteField(),
-          fieldRoutesUploadedAt: deleteField(),
-          updatedAt: now,
-        });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.success) {
+        throw new Error(result.error || "Failed to unschedule RouteIQ route");
       }
-      await batch.commit();
       setAllRoutes(prev => prev.map(item =>
         item.route.id === tr.route.id
           ? {
@@ -2009,16 +1996,16 @@ export default function RoutesPage() {
                 approvedAt: undefined,
                 approvedBy: undefined,
                 fieldRoutesSync: undefined,
-                updatedAt: now,
+                updatedAt: result.unscheduledAt || new Date().toISOString(),
               } as RouteWithMetrics,
             }
           : item
       ));
       await loadJobsForRange(userProfile.companyId);
-      toast.success("Cleared RouteIQ upload status. FieldRoutes was not changed because this used an existing route.");
+      toast.success(`Unscheduled ${result.stopCount || tr.route.stopSequence.length} stop(s) in RouteIQ. FieldRoutes was not changed.`);
     } catch (error) {
-      console.error("Clear FieldRoutes sync error:", error);
-      toast.error(error instanceof Error ? error.message : "Failed to clear FieldRoutes sync");
+      console.error("Unschedule RouteIQ route error:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to unschedule RouteIQ route");
     } finally {
       setApproving(null);
     }
@@ -2594,8 +2581,8 @@ export default function RoutesPage() {
                   {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus === "created" && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
                   )}
-                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus !== "created" && (
-                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleClearFieldRoutesSync(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Clear FR Sync</Button>
+                  {tr.route.approved && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
                   )}
                 </div>
               </div>
@@ -2725,8 +2712,8 @@ export default function RoutesPage() {
                   {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus === "created" && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
                   )}
-                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus !== "created" && (
-                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleClearFieldRoutesSync(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Clear FR Sync</Button>
+                  {tr.route.approved && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
                   )}
                 </div>
               </div>
