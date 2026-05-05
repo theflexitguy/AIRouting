@@ -440,6 +440,28 @@ function isFieldRoutesEndpointNotFound(error: unknown, endpoint: string) {
   ) || error.message.includes(`FieldRoutes ${endpoint} failed: HTTP 404`);
 }
 
+function fieldRoutesErrorText(error: unknown) {
+  if (!(error instanceof ApproveRouteError)) return "";
+  const parts = [error.message];
+  const details = isRecord(error.details) ? error.details : {};
+  const response = details.response;
+  if (isRecord(response)) {
+    for (const key of ["errorMessage", "message", "error", "errors", "result"]) {
+      const value = response[key];
+      if (typeof value === "string" || typeof value === "number") parts.push(clean(value));
+      else if (Array.isArray(value)) parts.push(value.map(clean).filter(Boolean).join(" "));
+      else if (isRecord(value)) parts.push(JSON.stringify(value));
+    }
+  }
+  return parts.filter(Boolean).join(" ");
+}
+
+function routeIdFromExistingRouteCreateError(error: unknown) {
+  const text = fieldRoutesErrorText(error);
+  if (!/tech\s+has\s+a\s+route\s+on\s+this\s+day/i.test(text)) return "";
+  return clean(text.match(/route\s+on\s+this\s+day!?\s*#?(\d+)/i)?.[1]);
+}
+
 function extractApiError(payload: unknown) {
   if (!isRecord(payload)) return "";
   const status = payload.status;
@@ -796,7 +818,22 @@ async function resolveFieldRoutesRoute(
   const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
 
   for (const date of dateVariants(routeDate)) {
-    const payload = await client.routeCreate({ assignedTech, date, templateId, groupId });
+    let payload: unknown;
+    try {
+      payload = await client.routeCreate({ assignedTech, date, templateId, groupId });
+    } catch (error) {
+      const existingRouteId = routeIdFromExistingRouteCreateError(error);
+      if (existingRouteId) {
+        return {
+          routeId: existingRouteId,
+          dateInputUsed: date,
+          status: "existing_from_create_conflict" as const,
+          routeGroupTitle: groupTitle,
+          routeGroupId: groupId,
+        };
+      }
+      throw error;
+    }
     const records = extractRecords(payload, ["routes", "results", "items", "data"]);
     const fromRecord = records.map((record) => extractId(record, ROUTE_ID_FIELDS)).find(Boolean);
     const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
