@@ -11,6 +11,7 @@ const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const APPOINTMENT_ID_FIELDS = ["appointmentID", "appointmentId", "appointment_id", "id"];
 const ROUTE_ID_FIELDS = ["routeID", "routeId", "route_id", "id"];
 const GROUP_ID_FIELDS = ["groupID", "groupId", "routeGroupID", "routeGroupId"];
+const EMPLOYEE_ID_FIELDS = ["employeeID", "employeeId", "employee_id", "id"];
 const ASSIGNED_TECH_FIELDS = ["assignedTech", "assignedTechID", "assignedTechId"];
 const CUSTOMER_FIELDS = ["customerID", "customerId", "customer_id", "customer", "accountID", "accountId"];
 const SUBSCRIPTION_FIELDS = ["subscriptionID", "subscriptionId", "subscription_id", "subscription", "subscriptionIDFk"];
@@ -560,6 +561,12 @@ function extractSubscriptionId(record: FieldRoutesRecord) {
   return clean(firstPresent(record, SUBSCRIPTION_FIELDS) || deepFindFirstKey(record, SUBSCRIPTION_FIELDS));
 }
 
+function employeeNameFromRecord(employee: FieldRoutesRecord) {
+  const first = clean(employee.fname || employee.firstName || employee.first_name);
+  const last = clean(employee.lname || employee.lastName || employee.last_name);
+  return first || last ? `${first} ${last}`.trim() : clean(employee.name || employee.fullName);
+}
+
 function parseIntField(value: unknown) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : undefined;
@@ -698,19 +705,32 @@ async function resolveFieldRoutesTechId(
   route: FirebaseFirestore.DocumentData,
   tech: FirebaseFirestore.DocumentData | undefined,
 ) {
-  const directCandidates = [
-    tech?.employeeId,
-    tech?.fieldRoutesEmployeeId,
-    tech?.fieldRoutesTechId,
-    route.fieldRoutesEmployeeId,
-    route.fieldRoutesTechId,
-    /^\d+$/.test(clean(route.techId)) ? route.techId : "",
-  ];
-  const direct = directCandidates.map(clean).find(Boolean);
-  if (direct) return direct;
-
   const name = clean(tech?.name || route.techName);
   const normalizedName = normalizeName(name);
+  const directCandidates = [
+    tech?.fieldRoutesEmployeeId,
+    tech?.fieldRoutesTechId,
+    tech?.employeeId,
+    route.fieldRoutesEmployeeId,
+    route.fieldRoutesTechId,
+  ];
+  const direct = directCandidates.map(clean).find((value) => /^\d+$/.test(value));
+  if (direct) {
+    if (!normalizedName) return direct;
+    const employeePayload = await client.employeeSearch();
+    const employees = extractRecords(employeePayload, ["employees", "results", "items", "data"]);
+    const employee = employees.find((candidate) => clean(firstPresent(candidate, EMPLOYEE_ID_FIELDS)) === direct);
+    const employeeName = employee ? employeeNameFromRecord(employee) : "";
+    if (!employee || normalizeName(employeeName) !== normalizedName) {
+      throw new ApproveRouteError(
+        `FieldRoutes employee ID ${direct} does not belong to ${name}${employeeName ? `; it belongs to ${employeeName}` : ""}. Fix the technician's FieldRoutes employee ID before approving.`,
+        409,
+        { expectedTechName: name, fieldRoutesEmployeeId: direct, fieldRoutesEmployeeName: employeeName },
+      );
+    }
+    return direct;
+  }
+
   if (!normalizedName) {
     throw new ApproveRouteError("Technician is missing a FieldRoutes employee ID and name.", 400);
   }
@@ -718,13 +738,10 @@ async function resolveFieldRoutesTechId(
   const employeePayload = await client.employeeSearch();
   const employees = extractRecords(employeePayload, ["employees", "results", "items", "data"]);
   const matches = employees.filter((employee) => {
-    const first = clean(employee.fname || employee.firstName || employee.first_name);
-    const last = clean(employee.lname || employee.lastName || employee.last_name);
-    const fullName = first || last ? `${first} ${last}`.trim() : clean(employee.name || employee.fullName);
-    return normalizeName(fullName) === normalizedName;
+    return normalizeName(employeeNameFromRecord(employee)) === normalizedName;
   });
 
-  const ids = [...new Set(matches.map((employee) => clean(firstPresent(employee, ["employeeID", "employeeId", "id"]))).filter(Boolean))];
+  const ids = [...new Set(matches.map((employee) => clean(firstPresent(employee, EMPLOYEE_ID_FIELDS))).filter(Boolean))];
   if (ids.length === 1) return ids[0];
   if (ids.length > 1) throw new ApproveRouteError(`Multiple active FieldRoutes employees match ${name}. Set the technician employee ID.`, 409, { ids });
   throw new ApproveRouteError(`No active FieldRoutes employee matches ${name}. Set the technician employee ID in Settings.`, 404);
@@ -886,12 +903,6 @@ async function resolveFieldRoutesRoute(
           };
         }
       }
-      const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
-      if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
-      const resultDirect = isRecord(payload) && isRecord(payload.result) ? extractId(payload.result, ROUTE_ID_FIELDS) : "";
-      if (resultDirect) return { routeId: resultDirect, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
-      const routeIds = extractIdList(payload, ["routeID", "routeId", "routeIDs", "routeIds", "route_ids", "result"]);
-      if (routeIds[0]) return { routeId: routeIds[0], dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
     }
   }
 

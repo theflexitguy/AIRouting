@@ -103,6 +103,11 @@ function fieldRoutesRouteIdFromRoute(route: FirebaseFirestore.DocumentData) {
   return clean(sync.routeId || route.fieldRoutesRouteId);
 }
 
+function fieldRoutesRouteStatusFromRoute(route: FirebaseFirestore.DocumentData) {
+  const sync = isRecord(route.fieldRoutesSync) ? route.fieldRoutesSync : {};
+  return clean(sync.routeStatus);
+}
+
 async function routeIdFromStopMarkers(
   db: FirebaseFirestore.Firestore,
   companyId: string,
@@ -136,11 +141,22 @@ export async function POST(request: NextRequest) {
     const route = routeDoc.data() || {};
     const stopSequence = Array.isArray(route.stopSequence) ? route.stopSequence.map(clean).filter(Boolean) : [];
     const fieldRoutesRouteId = fieldRoutesRouteIdFromRoute(route) || await routeIdFromStopMarkers(db, companyId, stopSequence);
+    const fieldRoutesRouteStatus = fieldRoutesRouteStatusFromRoute(route);
     if (!fieldRoutesRouteId) {
       return NextResponse.json({ error: "This RouteIQ route has no logged FieldRoutes route ID to delete." }, { status: 400 });
     }
     if (!/^\d+$/.test(fieldRoutesRouteId)) {
       return NextResponse.json({ error: `Logged FieldRoutes route ID is invalid: ${fieldRoutesRouteId}` }, { status: 400 });
+    }
+    if (fieldRoutesRouteStatus !== "created") {
+      return NextResponse.json(
+        {
+          error: "This upload used an existing FieldRoutes route, so full route deletion is blocked to avoid deleting unrelated appointments.",
+          fieldRoutesRouteId,
+          fieldRoutesRouteStatus: fieldRoutesRouteStatus || "unknown",
+        },
+        { status: 409 },
+      );
     }
 
     const authKey = clean(company.fieldRoutesApiKey || process.env.FIELDROUTES_AUTH_KEY || process.env.FIELDROUTES_API_KEY);
