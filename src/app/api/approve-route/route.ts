@@ -18,9 +18,10 @@ const APPOINTMENT_DATE_FIELDS = ["date", "dateStart", "serviceDate", "scheduledD
 const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
 const SERVICE_TYPE_FIELDS = ["serviceID", "serviceId", "serviceTypeID", "serviceTypeId", "type"];
 const GPC_GROUP_TITLE = "GPC";
+const FIELDROUTES_NWA_BASE_URL = "https://flexpc.fieldroutes.com/api";
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ENABLE_FIELDROUTES_ROUTE_SEARCH =
-  clean(process.env.FIELDROUTES_ENABLE_ROUTE_SEARCH).toLowerCase() === "true";
+  clean(process.env.FIELDROUTES_ENABLE_ROUTE_SEARCH || "true").toLowerCase() !== "false";
 const GPC_SERVICE_CONFIG = [
   {
     key: "general_pest",
@@ -42,7 +43,7 @@ const GPC_SERVICE_CONFIG = [
   },
 ] as const;
 
-type FieldRoutesPayload = Record<string, string | number | boolean | null | undefined>;
+type FieldRoutesPayload = Record<string, unknown>;
 type FieldRoutesRecord = Record<string, unknown>;
 type JobRecord = { id: string; data: FirebaseFirestore.DocumentData };
 type AppointmentFetchResult = {
@@ -74,14 +75,13 @@ class FieldRoutesClient {
 
   async request(endpoint: string, payload: FieldRoutesPayload, write = false) {
     const ep = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
-    const form = new URLSearchParams();
-    form.set("authenticationKey", this.authKey);
-    form.set("authenticationToken", this.authToken);
-    Object.entries(payload).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== "") {
-        form.set(key, String(value));
-      }
-    });
+    const requestBody = Object.fromEntries(
+      Object.entries({
+        ...payload,
+        authenticationKey: this.authKey,
+        authenticationToken: this.authToken,
+      }).filter(([, value]) => value !== undefined && value !== null && value !== ""),
+    );
 
     let lastError = "";
     const maxAttempts = write ? 4 : 2;
@@ -89,8 +89,8 @@ class FieldRoutesClient {
       try {
         const response = await fetch(`${this.baseUrl}${ep}`, {
           method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: form,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
           signal: AbortSignal.timeout(30000),
         });
         const text = await response.text();
@@ -178,19 +178,24 @@ class FieldRoutesClient {
     );
   }
 
-  appointmentSearch(dateStart: string, dateEnd: string, status: number | undefined, page: number) {
+  appointmentSearch(
+    dateField: "date" | "dateCompleted" | "dateAdded" | "dateUpdated",
+    dateStart: string,
+    dateEnd: string,
+    status: number | undefined,
+    page: number,
+  ) {
     return this.request("/appointment/search", {
-      dateStart,
-      dateEnd,
+      [dateField]: { operator: "BETWEEN", value: [dateStart, dateEnd] },
       includeData: 1,
       page,
-      ...(status !== undefined ? { status } : {}),
+      ...(status !== undefined ? { status: { operator: "EQUAL", value: String(status) } } : {}),
     });
   }
 
   appointmentGet(appointmentIds: string[]) {
     return this.request("/appointment/get", {
-      appointmentID: appointmentIds.join(","),
+      appointmentIDs: appointmentIds,
       includeData: 1,
     });
   }
@@ -371,6 +376,8 @@ function extractRecords(payload: unknown, preferredKeys: string[] = []): FieldRo
     const value = payload[key];
     if (Array.isArray(value)) return value.filter(isRecord);
     if (isRecord(value)) {
+      const keyedRecords = Object.values(value).filter(isRecord);
+      if (keyedRecords.length) return keyedRecords;
       const nested = extractRecords(value);
       if (nested.length) return nested;
     }
@@ -382,6 +389,10 @@ function extractRecords(payload: unknown, preferredKeys: string[] = []): FieldRo
     for (const key of ["items", "rows", "results", "employees", "routes", "appointments"]) {
       const value = data[key];
       if (Array.isArray(value)) return value.filter(isRecord);
+      if (isRecord(value)) {
+        const keyedRecords = Object.values(value).filter(isRecord);
+        if (keyedRecords.length) return keyedRecords;
+      }
     }
   }
 
@@ -405,6 +416,21 @@ function isRecord(value: unknown): value is FieldRoutesRecord {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
+function extractIdList(payload: unknown, keys: string[]) {
+  if (!isRecord(payload)) return [];
+  for (const key of keys) {
+    const value = payload[key];
+    if (Array.isArray(value)) {
+      return value.map(clean).filter(Boolean);
+    }
+    if (typeof value === "string" || typeof value === "number") {
+      const direct = clean(value);
+      if (direct) return [direct];
+    }
+  }
+  return [];
+}
+
 function isFieldRoutesEndpointNotFound(error: unknown, endpoint: string) {
   if (!(error instanceof ApproveRouteError)) return false;
   const details = isRecord(error.details) ? error.details : {};
@@ -418,12 +444,15 @@ function extractApiError(payload: unknown) {
   if (!isRecord(payload)) return "";
   const status = payload.status;
   const success = payload.success;
+  const errorMessage = payload.errorMessage;
+  const message = payload.message;
   const error = payload.error;
   const errors = payload.errors;
-  if (success === false) return clean(error || errors || "API response marked unsuccessful.");
+  if (success === false) return clean(errorMessage || error || errors || message || "API response marked unsuccessful.");
   if ([0, "0", "error", "failed", false].includes(status as never)) {
-    return clean(error || errors || "API returned failure status.");
+    return clean(errorMessage || error || errors || message || "API returned failure status.");
   }
+  if (typeof errorMessage === "string" && errorMessage.trim()) return errorMessage.trim();
   if (typeof error === "string" && error.trim()) return error.trim();
   if (Array.isArray(errors) && errors.length) return errors.map(clean).join("; ");
   if (isRecord(errors) && Object.keys(errors).length) return JSON.stringify(errors);
@@ -649,6 +678,16 @@ function routeTemplateIdFromConfig(route: FirebaseFirestore.DocumentData) {
   );
 }
 
+function fieldRoutesNwaBaseUrl(company: FirebaseFirestore.DocumentData) {
+  return clean(
+    company.fieldRoutesNwaBaseUrl ||
+      company.fieldRoutesNWAApiBaseUrl ||
+      company.fieldRoutesApiBaseUrlNwa ||
+      process.env.FIELDROUTES_NWA_BASE_URL ||
+      FIELDROUTES_NWA_BASE_URL,
+  );
+}
+
 async function discoverRouteGroupId(client: FieldRoutesClient, routeDate: string, groupTitle: string) {
   if (!groupTitle) return "";
   if (!ENABLE_FIELDROUTES_ROUTE_SEARCH) return "";
@@ -746,6 +785,10 @@ async function resolveFieldRoutesRoute(
       }
       const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
       if (direct) return { routeId: direct, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
+      const resultDirect = isRecord(payload) && isRecord(payload.result) ? extractId(payload.result, ROUTE_ID_FIELDS) : "";
+      if (resultDirect) return { routeId: resultDirect, dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
+      const routeIds = extractIdList(payload, ["routeID", "routeId", "routeIDs", "routeIds", "route_ids", "result"]);
+      if (routeIds[0]) return { routeId: routeIds[0], dateInputUsed: date, status: "existing" as const, routeGroupTitle: groupTitle, routeGroupId: "" };
     }
   }
 
@@ -757,7 +800,9 @@ async function resolveFieldRoutesRoute(
     const records = extractRecords(payload, ["routes", "results", "items", "data"]);
     const fromRecord = records.map((record) => extractId(record, ROUTE_ID_FIELDS)).find(Boolean);
     const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
-    const routeId = fromRecord || direct;
+    const resultDirect = isRecord(payload) && isRecord(payload.result) ? extractId(payload.result, ROUTE_ID_FIELDS) : "";
+    const fromIdList = extractIdList(payload, ["routeID", "routeId", "routeIDs", "routeIds", "route_ids", "result"]).find(Boolean);
+    const routeId = fromRecord || direct || resultDirect || fromIdList;
     if (routeId) return { routeId, dateInputUsed: date, status: "created" as const, routeGroupTitle: groupTitle, routeGroupId: groupId };
   }
 
@@ -766,31 +811,43 @@ async function resolveFieldRoutesRoute(
 
 async function fetchAppointmentsForDate(client: FieldRoutesClient, routeDate: string): Promise<AppointmentFetchResult> {
   const combined = new Map<string, FieldRoutesRecord>();
-  for (const date of dateVariants(routeDate)) {
-    for (const status of [0, undefined]) {
-      for (let page = 1; page <= 40; page++) {
-        let payload: unknown;
-        try {
-          payload = await client.appointmentSearch(date, date, status, page);
-        } catch (error) {
-          if (isFieldRoutesEndpointNotFound(error, "/appointment/search")) {
-            return { records: [], appointmentSearchUnavailable: true };
-          }
-          throw error;
+  const normalizedRouteDate = normalizeDate(routeDate);
+  for (const status of [0, undefined]) {
+    for (let page = 1; page <= 40; page++) {
+      let payload: unknown;
+      try {
+        payload = await client.appointmentSearch("date", normalizedRouteDate, normalizedRouteDate, status, page);
+      } catch (error) {
+        if (isFieldRoutesEndpointNotFound(error, "/appointment/search")) {
+          return { records: [], appointmentSearchUnavailable: true };
         }
-        const records = extractRecords(payload, ["appointments", "results", "items", "data"]);
-        let newCount = 0;
-        for (const record of records) {
-          const id = extractId(record, APPOINTMENT_ID_FIELDS);
-          if (!id) continue;
-          if (!combined.has(id)) newCount++;
-          combined.set(id, record);
-        }
-        if (records.length === 0 || (page > 1 && newCount === 0)) break;
-        const totalPagesRaw = isRecord(payload) ? firstPresent(payload, ["totalPages", "pages", "lastPage"]) : undefined;
-        const totalPages = Number(totalPagesRaw);
-        if (Number.isFinite(totalPages) && page >= totalPages) break;
+        throw error;
       }
+      const records = extractRecords(payload, ["appointments", "results", "items", "data"]);
+      const searchIds = extractIdList(payload, ["appointmentIDs", "appointmentIds", "appointment_ids", "result"]);
+      let hydratedRecords: FieldRoutesRecord[] = [];
+      if (records.length === 0 && searchIds.length > 0) {
+        for (let i = 0; i < searchIds.length; i += 100) {
+          const getPayload = await client.appointmentGet(searchIds.slice(i, i + 100));
+          hydratedRecords = [
+            ...hydratedRecords,
+            ...extractRecords(getPayload, ["appointments", "results", "items", "data"]),
+          ];
+        }
+      }
+
+      const rows = records.length > 0 ? records : hydratedRecords;
+      let newCount = 0;
+      for (const record of rows) {
+        const id = extractId(record, APPOINTMENT_ID_FIELDS);
+        if (!id) continue;
+        if (!combined.has(id)) newCount++;
+        combined.set(id, record);
+      }
+      if (rows.length === 0 || (page > 1 && newCount === 0)) break;
+      const totalPagesRaw = isRecord(payload) ? firstPresent(payload, ["totalPages", "pages", "lastPage"]) : undefined;
+      const totalPages = Number(totalPagesRaw);
+      if (Number.isFinite(totalPages) && page >= totalPages) break;
     }
   }
 
@@ -1158,7 +1215,16 @@ async function uploadRouteToFieldRoutes({
         .map((record) => extractId(record, APPOINTMENT_ID_FIELDS))
         .find(Boolean);
       const direct = isRecord(payload) ? extractId(payload, APPOINTMENT_ID_FIELDS) : "";
-      if (!created && !direct) {
+      const resultDirect = isRecord(payload) && isRecord(payload.result) ? extractId(payload.result, APPOINTMENT_ID_FIELDS) : "";
+      const fromIdList = extractIdList(payload, [
+        "appointmentID",
+        "appointmentId",
+        "appointmentIDs",
+        "appointmentIds",
+        "appointment_ids",
+        "result",
+      ]).find(Boolean);
+      if (!created && !direct && !resultDirect && !fromIdList) {
         throw new ApproveRouteError(`FieldRoutes appointment/create did not return an appointment ID for ${item.customerName}.`, 502);
       }
       summary.created++;
@@ -1201,7 +1267,13 @@ export async function POST(request: NextRequest) {
     }
 
     const authKey = clean(company.fieldRoutesApiKey || process.env.FIELDROUTES_AUTH_KEY || process.env.FIELDROUTES_API_KEY);
-    const authToken = clean(company.fieldRoutesApiSecret || process.env.FIELDROUTES_AUTH_TOKEN || process.env.FIELDROUTES_API_SECRET);
+    const authToken = clean(
+      company.fieldRoutesApiToken ||
+        company.fieldRoutesApiSecret ||
+        process.env.FIELDROUTES_AUTH_TOKEN ||
+        process.env.FIELDROUTES_API_TOKEN ||
+        process.env.FIELDROUTES_API_SECRET,
+    );
     if (!authKey || !authToken) {
       return NextResponse.json({ error: "FieldRoutes credentials are not configured" }, { status: 400 });
     }
@@ -1257,7 +1329,7 @@ export async function POST(request: NextRequest) {
     const totalWorkMinutes = Math.round((totalDriveTimeMinutes + totalServiceMinutes) * 10) / 10;
 
     const client = new FieldRoutesClient({
-      baseUrl: clean(process.env.FIELDROUTES_BASE_URL || "https://api.fieldroutes.com"),
+      baseUrl: fieldRoutesNwaBaseUrl(company),
       authKey,
       authToken,
     });

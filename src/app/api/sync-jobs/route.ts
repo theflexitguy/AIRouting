@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
           companyId,
           apiKey,
           apiSecret,
-          baseUrl: process.env.FIELDROUTES_BASE_URL || "https://api.fieldroutes.com",
+          baseUrl: process.env.FIELDROUTES_NWA_BASE_URL || "https://flexpc.fieldroutes.com/api",
         }),
         signal: AbortSignal.timeout(90000),
       });

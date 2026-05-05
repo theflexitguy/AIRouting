@@ -4,6 +4,6 @@
   "devCommand": "npm run dev",
   "installCommand": "npm install",
   "env": {
-    "FIELDROUTES_BASE_URL": "https://api.fieldroutes.com"
+    "FIELDROUTES_NWA_BASE_URL": "https://flexpc.fieldroutes.com/api"
   }
 }

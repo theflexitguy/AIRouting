@@ -128,7 +128,7 @@ export const syncFieldRoutesJobs = functions
       const company = companyDoc.data()!;
       const apiKey = company.fieldRoutesApiKey || process.env.FIELDROUTES_API_KEY || "";
       const apiSecret = company.fieldRoutesApiSecret || process.env.FIELDROUTES_API_SECRET || "";
-      const baseUrl = process.env.FIELDROUTES_BASE_URL || "https://api.fieldroutes.com";
+      const baseUrl = process.env.FIELDROUTES_NWA_BASE_URL || "https://flexpc.fieldroutes.com/api";
       const googleMapsKey = process.env.GOOGLE_MAPS_API_KEY || "";
 
       if (!apiKey || !apiSecret) {
