@@ -108,6 +108,21 @@ function fieldRoutesRouteStatusFromRoute(route: FirebaseFirestore.DocumentData) 
   return clean(sync.routeStatus);
 }
 
+function fieldRoutesSyncDetails(route: FirebaseFirestore.DocumentData) {
+  const sync = isRecord(route.fieldRoutesSync) ? route.fieldRoutesSync : {};
+  return {
+    fieldRoutesRouteId: clean(sync.routeId || route.fieldRoutesRouteId),
+    fieldRoutesRouteStatus: clean(sync.routeStatus) || "unknown",
+    fieldRoutesRouteDate: clean(sync.routeDate),
+    fieldRoutesRouteTime: clean(sync.routeTime),
+    fieldRoutesDateInputUsed: clean(sync.dateInputUsed),
+    fieldRoutesAssignedTech: clean(sync.assignedTech),
+    fieldRoutesUploadedAt: clean(sync.uploadedAt),
+    fieldRoutesRouteFoundAt: clean(sync.routeFoundAt),
+    fieldRoutesVerifiedAt: clean(sync.verifiedAt),
+  };
+}
+
 async function routeIdFromStopMarkers(
   db: FirebaseFirestore.Firestore,
   companyId: string,
@@ -140,6 +155,7 @@ export async function POST(request: NextRequest) {
     const company = companyDoc.data() || {};
     const route = routeDoc.data() || {};
     const stopSequence = Array.isArray(route.stopSequence) ? route.stopSequence.map(clean).filter(Boolean) : [];
+    const syncDetails = fieldRoutesSyncDetails(route);
     const fieldRoutesRouteId = fieldRoutesRouteIdFromRoute(route) || await routeIdFromStopMarkers(db, companyId, stopSequence);
     const fieldRoutesRouteStatus = fieldRoutesRouteStatusFromRoute(route);
     if (!fieldRoutesRouteId) {
@@ -152,8 +168,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           error: "This upload used an existing FieldRoutes route, so full route deletion is blocked to avoid deleting unrelated appointments.",
+          ...syncDetails,
           fieldRoutesRouteId,
-          fieldRoutesRouteStatus: fieldRoutesRouteStatus || "unknown",
+          fieldRoutesRouteStatus: fieldRoutesRouteStatus || syncDetails.fieldRoutesRouteStatus || "unknown",
         },
         { status: 409 },
       );

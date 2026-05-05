@@ -12,10 +12,12 @@ const APPOINTMENT_ID_FIELDS = ["appointmentID", "appointmentId", "appointment_id
 const ROUTE_ID_FIELDS = ["routeID", "routeId", "route_id", "id"];
 const GROUP_ID_FIELDS = ["groupID", "groupId", "routeGroupID", "routeGroupId"];
 const EMPLOYEE_ID_FIELDS = ["employeeID", "employeeId", "employee_id", "id"];
-const ASSIGNED_TECH_FIELDS = ["assignedTech", "assignedTechID", "assignedTechId"];
+const ASSIGNED_TECH_FIELDS = ["assignedTech", "assignedTechID", "assignedTechId", "employeeID", "employeeId", "employee_id"];
 const CUSTOMER_FIELDS = ["customerID", "customerId", "customer_id", "customer", "accountID", "accountId"];
 const SUBSCRIPTION_FIELDS = ["subscriptionID", "subscriptionId", "subscription_id", "subscription", "subscriptionIDFk"];
 const APPOINTMENT_DATE_FIELDS = ["date", "dateStart", "serviceDate", "scheduledDate", "appointmentDate"];
+const ROUTE_DATE_FIELDS = ["date", "routeDate", "serviceDate"];
+const ROUTE_TIME_FIELDS = ["time", "startTime", "start", "routeTime", "scheduledTime"];
 const SEQUENCE_FIELDS = ["sequence", "sortOrder", "order"];
 const SERVICE_TYPE_FIELDS = ["serviceID", "serviceId", "serviceTypeID", "serviceTypeId", "type"];
 const GPC_GROUP_TITLE = "GPC";
@@ -210,6 +212,14 @@ class FieldRoutesClient {
     });
   }
 
+  routeGet(routeIds: string[]) {
+    return this.request("/route/get", {
+      routeIDs: routeIds,
+      routeID: routeIds.join(","),
+      includeData: 1,
+    });
+  }
+
   routeCreate({
     assignedTech,
     date,
@@ -252,6 +262,7 @@ class FieldRoutesClient {
   appointmentGet(appointmentIds: string[]) {
     return this.request("/appointment/get", {
       appointmentIDs: appointmentIds,
+      appointmentID: appointmentIds.join(","),
       includeData: 1,
     });
   }
@@ -260,12 +271,14 @@ class FieldRoutesClient {
     appointmentId,
     routeId,
     assignedTech,
+    date,
     sequence,
     duration,
   }: {
     appointmentId: string;
     routeId: string;
     assignedTech: string;
+    date: string;
     sequence: number;
     duration?: number;
   }) {
@@ -275,6 +288,7 @@ class FieldRoutesClient {
         appointmentID: appointmentId,
         routeID: routeId,
         assignedTech,
+        date,
         sequence,
         ...(duration ? { duration } : {}),
       },
@@ -287,6 +301,7 @@ class FieldRoutesClient {
     serviceType,
     routeId,
     assignedTech,
+    date,
     subscriptionId,
     sequence,
     duration,
@@ -295,6 +310,7 @@ class FieldRoutesClient {
     serviceType: number;
     routeId: string;
     assignedTech: string;
+    date: string;
     subscriptionId?: string;
     sequence: number;
     duration?: number;
@@ -307,6 +323,7 @@ class FieldRoutesClient {
         employeeID: assignedTech,
         routeID: routeId,
         assignedTech,
+        date,
         ...(subscriptionId ? { subscriptionID: subscriptionId } : {}),
         sequence,
         ...(duration ? { duration } : {}),
@@ -379,22 +396,6 @@ function offsetDate(date: string, days: number) {
   if (Number.isNaN(parsed.getTime())) return normalized;
   parsed.setUTCDate(parsed.getUTCDate() + days);
   return parsed.toISOString().slice(0, 10);
-}
-
-function dateVariants(date: string) {
-  const normalized = normalizeDate(date);
-  const variants = new Set<string>();
-  if (normalized) variants.add(normalized);
-  const parsed = new Date(`${normalized}T00:00:00`);
-  if (!Number.isNaN(parsed.getTime())) {
-    const month = parsed.getUTCMonth() + 1;
-    const day = parsed.getUTCDate();
-    const year = parsed.getUTCFullYear();
-    variants.add(`${String(month).padStart(2, "0")}/${String(day).padStart(2, "0")}/${year}`);
-    variants.add(`${month}/${day}/${year}`);
-    variants.add(`${year}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}`);
-  }
-  return [...variants];
 }
 
 function firstPresent(record: FieldRoutesRecord, keys: string[]) {
@@ -544,6 +545,18 @@ function extractId(record: FieldRoutesRecord, fields: string[]) {
 
 function extractAppointmentDate(record: FieldRoutesRecord) {
   return normalizeDate(firstPresent(record, APPOINTMENT_DATE_FIELDS) || deepFindFirstKey(record, APPOINTMENT_DATE_FIELDS));
+}
+
+function extractRouteDate(record: FieldRoutesRecord) {
+  return normalizeDate(firstPresent(record, ROUTE_DATE_FIELDS) || deepFindFirstKey(record, ROUTE_DATE_FIELDS));
+}
+
+function extractRouteTime(record: FieldRoutesRecord) {
+  return clean(firstPresent(record, ROUTE_TIME_FIELDS) || deepFindFirstKey(record, ROUTE_TIME_FIELDS));
+}
+
+function extractAssignedTech(record: FieldRoutesRecord) {
+  return clean(firstPresent(record, ASSIGNED_TECH_FIELDS) || deepFindFirstKey(record, ASSIGNED_TECH_FIELDS));
 }
 
 function extractSequence(record: FieldRoutesRecord) {
@@ -827,6 +840,72 @@ async function discoverRouteGroupId(client: FieldRoutesClient, routeDate: string
   return [...new Set(ids)][0] || "";
 }
 
+async function hydrateRouteRecords(client: FieldRoutesClient, payload: unknown) {
+  const records = extractRecords(payload, ["routes", "results", "items", "data"]);
+  const ids = new Set<string>();
+  records.map((record) => extractId(record, ROUTE_ID_FIELDS)).filter(Boolean).forEach((id) => ids.add(id));
+  extractIdList(payload, ["routeIDs", "routeIds", "route_ids", "result"]).forEach((id) => ids.add(id));
+
+  if (ids.size === 0) return records;
+
+  try {
+    const hydrated = await client.routeGet([...ids]);
+    const hydratedRecords = extractRecords(hydrated, ["routes", "results", "items", "data"]);
+    return [...records, ...hydratedRecords];
+  } catch (error) {
+    if (error instanceof ApproveRouteError) return records;
+    throw error;
+  }
+}
+
+function routeRecordMatchesTarget(record: FieldRoutesRecord, assignedTech: string, routeDate: string) {
+  const routeId = extractId(record, ROUTE_ID_FIELDS);
+  const recordDate = extractRouteDate(record);
+  const recordTech = extractAssignedTech(record);
+  return Boolean(routeId && recordDate === routeDate && recordTech === assignedTech);
+}
+
+function routeMetadataFromRecord(record: FieldRoutesRecord, fallbackRouteId = "") {
+  return {
+    routeId: extractId(record, ROUTE_ID_FIELDS) || fallbackRouteId,
+    routeDate: extractRouteDate(record),
+    routeTime: extractRouteTime(record),
+    assignedTech: extractAssignedTech(record),
+    routeGroupId: extractId(record, GROUP_ID_FIELDS),
+  };
+}
+
+async function findVerifiedRouteById(
+  client: FieldRoutesClient,
+  routeId: string,
+  assignedTech: string,
+  routeDate: string,
+) {
+  let records: FieldRoutesRecord[] = [];
+  try {
+    const payload = await client.routeGet([routeId]);
+    records = extractRecords(payload, ["routes", "results", "items", "data"]);
+  } catch (error) {
+    if (!(error instanceof ApproveRouteError)) throw error;
+  }
+
+  if (ENABLE_FIELDROUTES_ROUTE_SEARCH) {
+    try {
+      const searchPayload = await client.routeSearch({ assignedTech, date: routeDate });
+      records = [...records, ...(await hydrateRouteRecords(client, searchPayload))];
+    } catch (error) {
+      if (!isFieldRoutesEndpointNotFound(error, "/route/search")) throw error;
+    }
+  }
+
+  const matchingIdRecords = records.filter((record) => extractId(record, ROUTE_ID_FIELDS) === routeId);
+  const verified = matchingIdRecords.find((record) => routeRecordMatchesTarget(record, assignedTech, routeDate));
+  if (verified) return routeMetadataFromRecord(verified, routeId);
+
+  const found = matchingIdRecords[0];
+  return found ? routeMetadataFromRecord(found, routeId) : null;
+}
+
 function inferExistingRouteFromAppointments(
   records: FieldRoutesRecord[],
   assignedTech: string,
@@ -841,8 +920,8 @@ function inferExistingRouteFromAppointments(
     const recordDate = extractAppointmentDate(record) || routeDate;
     if (recordDate !== routeDate) continue;
 
-    const recordTech = clean(firstPresent(record, ASSIGNED_TECH_FIELDS));
-    if (recordTech && recordTech !== assignedTech) continue;
+    const recordTech = extractAssignedTech(record);
+    if (recordTech !== assignedTech) continue;
 
     const current = byRouteId.get(routeId) || { count: 0, groupId: "" };
     byRouteId.set(routeId, {
@@ -857,6 +936,9 @@ function inferExistingRouteFromAppointments(
     routeId: best[0],
     dateInputUsed: routeDate,
     status: "existing_from_appointments" as const,
+    routeDate,
+    routeTime: "",
+    routeFoundAt: new Date().toISOString(),
     routeGroupTitle: groupTitle,
     routeGroupId: best[1].groupId,
   };
@@ -880,59 +962,88 @@ async function resolveFieldRoutesRoute(
   if (routeFromAppointments) return routeFromAppointments;
 
   if (ENABLE_FIELDROUTES_ROUTE_SEARCH) {
-    for (const date of dateVariants(routeDate)) {
-      let payload: unknown;
-      try {
-        payload = await client.routeSearch({ assignedTech, date, groupTitle });
-      } catch (error) {
-        if (isFieldRoutesEndpointNotFound(error, "/route/search")) break;
-        throw error;
-      }
-      const records = extractRecords(payload, ["routes", "results", "items", "data"]);
-      for (const record of records) {
-        const routeId = extractId(record, ROUTE_ID_FIELDS);
-        const recordDate = normalizeDate(firstPresent(record, ["date", "routeDate", "serviceDate"])) || routeDate;
-        const recordTech = clean(firstPresent(record, ASSIGNED_TECH_FIELDS));
-        if (routeId && recordDate === routeDate && (!recordTech || recordTech === assignedTech)) {
-          return {
-            routeId,
-            dateInputUsed: date,
-            status: "existing" as const,
-            routeGroupTitle: groupTitle,
-            routeGroupId: extractId(record, GROUP_ID_FIELDS),
-          };
-        }
-      }
+    let payload: unknown;
+    try {
+      payload = await client.routeSearch({ assignedTech, date: routeDate });
+    } catch (error) {
+      if (!isFieldRoutesEndpointNotFound(error, "/route/search")) throw error;
+      payload = null;
+    }
+    const records = payload ? await hydrateRouteRecords(client, payload) : [];
+    for (const record of records) {
+      if (!routeRecordMatchesTarget(record, assignedTech, routeDate)) continue;
+      const metadata = routeMetadataFromRecord(record);
+      return {
+        routeId: metadata.routeId,
+        dateInputUsed: routeDate,
+        status: "existing" as const,
+        routeDate: metadata.routeDate,
+        routeTime: metadata.routeTime,
+        routeFoundAt: new Date().toISOString(),
+        routeGroupTitle: groupTitle,
+        routeGroupId: metadata.routeGroupId,
+      };
     }
   }
 
   const templateId = routeTemplateIdFromConfig(route, routeDate, groupTitle);
   const groupId = routeGroupIdFromConfig(route) || (groupTitle ? await discoverRouteGroupId(client, routeDate, groupTitle) : "");
 
-  for (const date of dateVariants(routeDate)) {
-    let payload: unknown;
-    try {
-      payload = await client.routeCreate({ assignedTech, date, templateId, groupId });
-    } catch (error) {
-      const existingRouteId = routeIdFromExistingRouteCreateError(error);
-      if (existingRouteId) {
-        return {
-          routeId: existingRouteId,
-          dateInputUsed: date,
-          status: "existing_from_create_conflict" as const,
-          routeGroupTitle: groupTitle,
-          routeGroupId: groupId,
-        };
+  let payload: unknown;
+  try {
+    payload = await client.routeCreate({ assignedTech, date: routeDate, templateId, groupId });
+  } catch (error) {
+    const existingRouteId = routeIdFromExistingRouteCreateError(error);
+    if (existingRouteId) {
+      const verified = await findVerifiedRouteById(client, existingRouteId, assignedTech, routeDate);
+      if (!verified || verified.assignedTech !== assignedTech || verified.routeDate !== routeDate) {
+        throw new ApproveRouteError(
+          `FieldRoutes reported existing route ${existingRouteId}, but RouteIQ could not verify it belongs to employee ${assignedTech} on ${routeDate}.`,
+          409,
+          { routeId: existingRouteId, expectedAssignedTech: assignedTech, expectedDate: routeDate, found: verified },
+        );
       }
-      throw error;
+      return {
+        routeId: existingRouteId,
+        dateInputUsed: routeDate,
+        status: "existing_from_create_conflict" as const,
+        routeDate: verified.routeDate,
+        routeTime: verified.routeTime,
+        routeFoundAt: new Date().toISOString(),
+        routeGroupTitle: groupTitle,
+        routeGroupId: verified.routeGroupId || groupId,
+      };
     }
-    const records = extractRecords(payload, ["routes", "results", "items", "data"]);
-    const fromRecord = records.map((record) => extractId(record, ROUTE_ID_FIELDS)).find(Boolean);
-    const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
-    const resultDirect = isRecord(payload) && isRecord(payload.result) ? extractId(payload.result, ROUTE_ID_FIELDS) : "";
-    const fromIdList = extractIdList(payload, ["routeID", "routeId", "routeIDs", "routeIds", "route_ids", "result"]).find(Boolean);
-    const routeId = fromRecord || direct || resultDirect || fromIdList;
-    if (routeId) return { routeId, dateInputUsed: date, status: "created" as const, routeGroupTitle: groupTitle, routeGroupId: groupId };
+    throw error;
+  }
+
+  const records = extractRecords(payload, ["routes", "results", "items", "data"]);
+  const fromVerifiedRecord = records.find((record) => routeRecordMatchesTarget(record, assignedTech, routeDate));
+  const verifiedMetadata = fromVerifiedRecord ? routeMetadataFromRecord(fromVerifiedRecord) : null;
+  const fromRecord = records.map((record) => extractId(record, ROUTE_ID_FIELDS)).find(Boolean);
+  const direct = isRecord(payload) ? extractId(payload, ROUTE_ID_FIELDS) : "";
+  const resultDirect = isRecord(payload) && isRecord(payload.result) ? extractId(payload.result, ROUTE_ID_FIELDS) : "";
+  const fromIdList = extractIdList(payload, ["routeID", "routeId", "routeIDs", "routeIds", "route_ids", "result"]).find(Boolean);
+  const routeId = verifiedMetadata?.routeId || fromRecord || direct || resultDirect || fromIdList;
+  if (routeId) {
+    const createdVerified = await findVerifiedRouteById(client, routeId, assignedTech, routeDate);
+    if (createdVerified && (createdVerified.assignedTech !== assignedTech || createdVerified.routeDate !== routeDate)) {
+      throw new ApproveRouteError(
+        `FieldRoutes route/create returned route ${routeId}, but that route does not belong to employee ${assignedTech} on ${routeDate}.`,
+        409,
+        { routeId, expectedAssignedTech: assignedTech, expectedDate: routeDate, found: createdVerified },
+      );
+    }
+    return {
+      routeId,
+      dateInputUsed: routeDate,
+      status: "created" as const,
+      routeDate: createdVerified?.routeDate || verifiedMetadata?.routeDate || routeDate,
+      routeTime: createdVerified?.routeTime || verifiedMetadata?.routeTime || "",
+      routeFoundAt: new Date().toISOString(),
+      routeGroupTitle: groupTitle,
+      routeGroupId: createdVerified?.routeGroupId || verifiedMetadata?.routeGroupId || groupId,
+    };
   }
 
   throw new ApproveRouteError("FieldRoutes route/create did not return a route ID.", 502);
@@ -1018,6 +1129,87 @@ function buildAppointmentIndexes(records: FieldRoutesRecord[], routeDate: string
     }
   }
   return { byId, bySubscription, byCustomer };
+}
+
+async function verifyUploadedAppointments({
+  client,
+  routeId,
+  assignedTech,
+  routeDate,
+  uploadedAppointments,
+}: {
+  client: FieldRoutesClient;
+  routeId: string;
+  assignedTech: string;
+  routeDate: string;
+  uploadedAppointments: Array<{ appointmentId: string; jobId: string; customerName: string; sequence: number; action: string }>;
+}) {
+  const ids = [...new Set(uploadedAppointments.map((item) => item.appointmentId).filter(Boolean))];
+  const fetched = new Map<string, FieldRoutesRecord>();
+  for (let i = 0; i < ids.length; i += 100) {
+    const payload = await client.appointmentGet(ids.slice(i, i + 100));
+    for (const record of extractRecords(payload, ["appointments", "results", "items", "data"])) {
+      const id = extractId(record, APPOINTMENT_ID_FIELDS);
+      if (id) fetched.set(id, record);
+    }
+  }
+
+  const errors: Array<{
+    jobId: string;
+    customerName: string;
+    appointmentId: string;
+    reason: string;
+    found?: Record<string, unknown>;
+  }> = [];
+
+  for (const item of uploadedAppointments) {
+    const record = fetched.get(item.appointmentId);
+    if (!record) {
+      errors.push({
+        jobId: item.jobId,
+        customerName: item.customerName,
+        appointmentId: item.appointmentId,
+        reason: "Appointment was not returned by FieldRoutes after upload.",
+      });
+      continue;
+    }
+
+    const foundRouteId = extractId(record, ROUTE_ID_FIELDS);
+    const foundTech = extractAssignedTech(record);
+    const foundDate = extractAppointmentDate(record);
+    const foundSequence = extractSequence(record);
+    const mismatchReasons = [
+      foundRouteId !== routeId ? `routeID ${foundRouteId || "(blank)"} does not match ${routeId}` : "",
+      foundTech !== assignedTech ? `assignedTech ${foundTech || "(blank)"} does not match ${assignedTech}` : "",
+      foundDate !== routeDate ? `date ${foundDate || "(blank)"} does not match ${routeDate}` : "",
+      foundSequence !== null && foundSequence !== item.sequence ? `sequence ${foundSequence} does not match ${item.sequence}` : "",
+    ].filter(Boolean);
+
+    if (mismatchReasons.length) {
+      errors.push({
+        jobId: item.jobId,
+        customerName: item.customerName,
+        appointmentId: item.appointmentId,
+        reason: mismatchReasons.join("; "),
+        found: {
+          routeId: foundRouteId,
+          assignedTech: foundTech,
+          date: foundDate,
+          sequence: foundSequence,
+        },
+      });
+    }
+  }
+
+  if (errors.length) {
+    throw new ApproveRouteError(
+      "FieldRoutes upload verification failed. RouteIQ did not mark this route approved because FieldRoutes did not show the stops on the expected technician/date/route.",
+      409,
+      { routeId, expectedAssignedTech: assignedTech, expectedDate: routeDate, errors },
+    );
+  }
+
+  return new Date().toISOString();
 }
 
 function getAppointmentCandidates(
@@ -1314,6 +1506,9 @@ async function uploadRouteToFieldRoutes({
   const summary = {
     routeId: routeInfo.routeId,
     routeStatus: routeInfo.status,
+    routeDate: routeInfo.routeDate || routeDate,
+    routeTime: routeInfo.routeTime || "",
+    routeFoundAt: routeInfo.routeFoundAt || new Date().toISOString(),
     dateInputUsed: routeInfo.dateInputUsed,
     routeGroupTitle: routeInfo.routeGroupTitle,
     routeGroupId: routeInfo.routeGroupId,
@@ -1323,11 +1518,29 @@ async function uploadRouteToFieldRoutes({
     created: 0,
     unchanged: 0,
     total: plan.length,
+    appointmentIds: [] as string[],
+    uploadedAppointments: [] as Array<{
+      appointmentId: string;
+      jobId: string;
+      customerName: string;
+      sequence: number;
+      action: string;
+    }>,
+    verifiedAt: "",
   };
 
   for (const item of plan) {
     if (item.action === "unchanged") {
       summary.unchanged++;
+      if (item.appointmentId) {
+        summary.uploadedAppointments.push({
+          appointmentId: item.appointmentId,
+          jobId: item.jobId,
+          customerName: item.customerName,
+          sequence: item.sequence,
+          action: item.action,
+        });
+      }
       continue;
     }
     if (item.action === "create") {
@@ -1336,6 +1549,7 @@ async function uploadRouteToFieldRoutes({
         serviceType: item.serviceType!,
         routeId: routeInfo.routeId,
         assignedTech,
+        date: routeDate,
         subscriptionId: item.subscriptionId,
         sequence: item.sequence,
         duration: item.duration,
@@ -1353,9 +1567,17 @@ async function uploadRouteToFieldRoutes({
         "appointment_ids",
         "result",
       ]).find(Boolean);
-      if (!created && !direct && !resultDirect && !fromIdList) {
+      const appointmentId = created || direct || resultDirect || fromIdList;
+      if (!appointmentId) {
         throw new ApproveRouteError(`FieldRoutes appointment/create did not return an appointment ID for ${item.customerName}.`, 502);
       }
+      summary.uploadedAppointments.push({
+        appointmentId,
+        jobId: item.jobId,
+        customerName: item.customerName,
+        sequence: item.sequence,
+        action: item.action,
+      });
       summary.created++;
       continue;
     }
@@ -1364,11 +1586,28 @@ async function uploadRouteToFieldRoutes({
       appointmentId: item.appointmentId!,
       routeId: routeInfo.routeId,
       assignedTech,
+      date: routeDate,
       sequence: item.sequence,
       duration: item.duration,
     });
+    summary.uploadedAppointments.push({
+      appointmentId: item.appointmentId!,
+      jobId: item.jobId,
+      customerName: item.customerName,
+      sequence: item.sequence,
+      action: item.action,
+    });
     summary.updated++;
   }
+
+  summary.appointmentIds = summary.uploadedAppointments.map((item) => item.appointmentId);
+  summary.verifiedAt = await verifyUploadedAppointments({
+    client,
+    routeId: routeInfo.routeId,
+    assignedTech,
+    routeDate,
+    uploadedAppointments: summary.uploadedAppointments,
+  });
 
   return summary;
 }

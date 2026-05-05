@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
-import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
+import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId, deleteField } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -501,6 +501,7 @@ function RoutePanelStats({ route, jobsById }: {
 }) {
   const stats = getRouteDisplayMetrics(route, jobsById);
   const routeWithMetrics = route as RouteWithMetrics;
+  const sync = routeWithMetrics.fieldRoutesSync;
 
   return (
     <div className="grid grid-cols-2 gap-1.5 p-2 border-b border-border/40 bg-accent/10">
@@ -520,10 +521,20 @@ function RoutePanelStats({ route, jobsById }: {
         <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Value</p>
         <p className="text-xs font-semibold text-emerald-400">{formatCurrency(stats.productionValue)}</p>
       </div>
-      {routeWithMetrics.fieldRoutesSync?.uploadedAt && (
-        <p className="col-span-2 text-[10px] text-emerald-400/80 truncate">
-          FieldRoutes uploaded · {new Date(routeWithMetrics.fieldRoutesSync.uploadedAt).toLocaleString()}
-        </p>
+      {sync?.uploadedAt && (
+        <div className="col-span-2 space-y-0.5 text-[10px] text-emerald-400/80">
+          <p className="truncate">
+            FR route #{sync.routeId || "-"} · {sync.routeDate || sync.dateInputUsed || route.date}{sync.routeTime ? ` ${sync.routeTime}` : ""}
+          </p>
+          <p className="truncate">
+            Employee {sync.assignedTech || "-"} · {sync.routeStatus || "synced"} · uploaded {new Date(sync.uploadedAt).toLocaleString()}
+          </p>
+          {sync.verifiedAt && (
+            <p className="truncate text-emerald-300/70">
+              Verified {new Date(sync.verifiedAt).toLocaleString()}
+            </p>
+          )}
+        </div>
       )}
     </div>
   );
@@ -1919,7 +1930,11 @@ export default function RoutesPage() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.success) {
-      throw new Error(data.error || "Failed to delete FieldRoutes route");
+      const fieldRoutesDate = data.fieldRoutesRouteDate || data.fieldRoutesDateInputUsed;
+      const frDetails = data.fieldRoutesRouteId
+        ? ` FR route #${data.fieldRoutesRouteId}${fieldRoutesDate ? ` on ${fieldRoutesDate}` : ""}${data.fieldRoutesRouteTime ? ` ${data.fieldRoutesRouteTime}` : ""}${data.fieldRoutesAssignedTech ? `, employee ${data.fieldRoutesAssignedTech}` : ""}.`
+        : "";
+      throw new Error(`${data.error || "Failed to delete FieldRoutes route"}${frDetails}`);
     }
     return data as { fieldRoutesRouteId: string; deletedAt: string };
   };
@@ -1949,6 +1964,61 @@ export default function RoutesPage() {
     } catch (error) {
       console.error("Delete FieldRoutes route error:", error);
       toast.error(error instanceof Error ? error.message : "Failed to delete FieldRoutes route");
+    } finally {
+      setApproving(null);
+    }
+  };
+
+  const handleClearFieldRoutesSync = async (tr: TechRoute) => {
+    if (!userProfile?.companyId) return;
+    setApproving(tr.route.id);
+    try {
+      const now = new Date().toISOString();
+      const batch = writeBatch(db);
+      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
+        approved: false,
+        approvedAt: deleteField(),
+        approvedBy: deleteField(),
+        fieldRoutesSync: deleteField(),
+        fieldRoutesClearedSync: {
+          clearedAt: now,
+          routeId: tr.route.fieldRoutesSync?.routeId || "",
+          routeStatus: tr.route.fieldRoutesSync?.routeStatus || "",
+          reason: "Cleared local sync for existing FieldRoutes route",
+          requestedBy: userProfile.email,
+        },
+        updatedAt: now,
+      });
+      for (const jobId of tr.route.stopSequence) {
+        batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
+          status: "pending",
+          fieldRoutesRouteId: deleteField(),
+          fieldRoutesSequence: deleteField(),
+          fieldRoutesUploadedAt: deleteField(),
+          updatedAt: now,
+        });
+      }
+      await batch.commit();
+      setAllRoutes(prev => prev.map(item =>
+        item.route.id === tr.route.id
+          ? {
+              ...item,
+              route: {
+                ...item.route,
+                approved: false,
+                approvedAt: undefined,
+                approvedBy: undefined,
+                fieldRoutesSync: undefined,
+                updatedAt: now,
+              } as RouteWithMetrics,
+            }
+          : item
+      ));
+      await loadJobsForRange(userProfile.companyId);
+      toast.success("Cleared RouteIQ upload status. FieldRoutes was not changed because this used an existing route.");
+    } catch (error) {
+      console.error("Clear FieldRoutes sync error:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to clear FieldRoutes sync");
     } finally {
       setApproving(null);
     }
@@ -2521,8 +2591,11 @@ export default function RoutesPage() {
                       <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => { const tidx = visibleRoutes.indexOf(tr); if (tidx >= 0) handleApprove(tidx, false); }} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Reject</Button>
                     </>
                   )}
-                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && (
+                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus === "created" && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
+                  )}
+                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus !== "created" && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleClearFieldRoutesSync(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Clear FR Sync</Button>
                   )}
                 </div>
               </div>
@@ -2649,8 +2722,11 @@ export default function RoutesPage() {
                       <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => { const tidx = visibleRoutes.indexOf(tr); if (tidx >= 0) handleApprove(tidx, false); }} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Reject</Button>
                     </>
                   )}
-                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && (
+                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus === "created" && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleDeleteFieldRoutesRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Delete FR Route</Button>
+                  )}
+                  {tr.route.approved && tr.route.fieldRoutesSync?.routeId && tr.route.fieldRoutesSync.routeStatus !== "created" && (
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleClearFieldRoutesSync(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Clear FR Sync</Button>
                   )}
                 </div>
               </div>

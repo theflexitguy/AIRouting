@@ -111,9 +111,21 @@ export interface Route {
     total?: number;
     assignedTech?: string;
     routeStatus?: string;
+    routeDate?: string;
+    routeTime?: string;
+    routeFoundAt?: string;
+    verifiedAt?: string;
     dateInputUsed?: string;
     routeGroupTitle?: string;
     routeGroupId?: string;
+    appointmentIds?: string[];
+    uploadedAppointments?: Array<{
+      appointmentId: string;
+      jobId: string;
+      customerName?: string;
+      sequence?: number;
+      action?: string;
+    }>;
     bundledSameAddressStops?: number;
   };
   createdAt: string;
