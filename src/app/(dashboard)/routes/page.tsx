@@ -691,9 +691,10 @@ export default function RoutesPage() {
     try {
       const raw = localStorage.getItem("routeiq.generateSettings.v1");
       if (!raw) return;
-      const parsed = JSON.parse(raw) as { maxStops?: number; maxDriveTime?: number };
-      if (typeof parsed.maxStops === "number" && parsed.maxStops > 0) {
-        setMaxStops(parsed.maxStops);
+      const parsed = JSON.parse(raw) as { maxStops?: number; targetStops?: number; maxDriveTime?: number };
+      const targetStops = typeof parsed.targetStops === "number" ? parsed.targetStops : parsed.maxStops;
+      if (typeof targetStops === "number" && targetStops > 0) {
+        setMaxStops(targetStops);
       }
       if (typeof parsed.maxDriveTime === "number" && parsed.maxDriveTime > 0) {
         setMaxDriveTime(parsed.maxDriveTime);
@@ -707,7 +708,7 @@ export default function RoutesPage() {
     if (typeof window === "undefined") return;
     localStorage.setItem(
       "routeiq.generateSettings.v1",
-      JSON.stringify({ maxStops, maxDriveTime }),
+      JSON.stringify({ targetStops: maxStops, maxStops, maxDriveTime }),
     );
   }, [maxStops, maxDriveTime]);
   const [selectedDates, setSelectedDates] = useState<string[]>([]); // which days to show (multi-select)
@@ -1850,6 +1851,7 @@ export default function RoutesPage() {
           techIds: selectedTechIds,
           maxStops,
           maxDriveTime,
+          requestedBy: userProfile.email,
         }),
       });
       timers.forEach(clearTimeout);
@@ -2332,7 +2334,7 @@ export default function RoutesPage() {
           </div>
           <div className="flex items-center gap-3 border-l border-border/60 pl-3">
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              Max stops
+              Target stops
               <Input
                 type="number"
                 min={1}
@@ -2340,7 +2342,7 @@ export default function RoutesPage() {
                 value={maxStops}
                 onChange={(e) => setMaxStops(Math.max(1, parseInt(e.target.value) || 16))}
                 className="h-9 w-16 text-sm"
-                title="Tuesday routes automatically use 3 fewer stops."
+                title="Tuesday routes automatically target 3 fewer stops."
               />
             </label>
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">

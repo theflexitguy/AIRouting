@@ -25,6 +25,8 @@ const JOB_CAP = 500;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
 const TUESDAY_STOP_REDUCTION = 3;
+const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000;
+const DRIVE_CAP_SLACK_MINUTES = 3;
 
 function _dateOffset(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
@@ -351,6 +353,15 @@ interface FastRouteBuildResult {
   usedPolylineSources: string[];
 }
 
+interface OrderedRouteBuild {
+  ordered: JobDoc[];
+  totalDriveMinutes: number;
+  matrixResult: DriveMatrixResult;
+  matrixById: Map<string, number>;
+  geometryResult: Awaited<ReturnType<typeof computeRouteGeometry>>;
+  driveTimeSource: string;
+}
+
 type DriveMatrixResult = {
   matrix: number[][];
   source: MatrixSource;
@@ -537,6 +548,92 @@ function orderedDriveMinutesFromMatrix(
         : estimateDriveMinutes(ordered[idx - 1], ordered[idx]);
   }
   return total;
+}
+
+async function buildOrderedRoute(
+  picked: JobDoc[],
+  routeDate: string,
+): Promise<OrderedRouteBuild> {
+  const matrixResult = await getDriveMatrix(picked, routeDate);
+  const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
+  const matrixById = new Map<string, number>();
+  picked.forEach((job, idx) => matrixById.set(job.docId, idx));
+  const ordered = keepSameAddressJobsTogether(orderedResult.ordered);
+  const orderedMatrixDriveMinutes = orderedDriveMinutesFromMatrix(
+    ordered,
+    matrixById,
+    matrixResult.matrix,
+  );
+  const geometryResult = await computeRouteGeometry(ordered, { routeDate });
+  const totalDriveMinutes =
+    geometryResult.driveTimeSource === "routes_api_polyline"
+      ? geometryResult.driveMinutes
+      : orderedMatrixDriveMinutes;
+  const driveTimeSource =
+    geometryResult.driveTimeSource === "routes_api_polyline"
+      ? geometryResult.driveTimeSource
+      : matrixResult.source;
+
+  return {
+    ordered,
+    totalDriveMinutes,
+    matrixResult,
+    matrixById,
+    geometryResult,
+    driveTimeSource,
+  };
+}
+
+function driveMinutesForOrderedSubset(
+  ordered: JobDoc[],
+  matrixById: Map<string, number>,
+  matrix: number[][],
+) {
+  return orderedDriveMinutesFromMatrix(ordered, matrixById, matrix);
+}
+
+function routeDateTier(job: JobDoc, rangeStart: string, rangeEnd: string) {
+  const tier = dateTier(job, rangeStart, rangeEnd);
+  if (tier === 2) return 0;
+  if (tier === 3) return 1;
+  if (tier === 1) return 2;
+  return 3;
+}
+
+function chooseDriveCapRemoval({
+  ordered,
+  slot,
+  selectedTechs,
+  rangeStart,
+  rangeEnd,
+  matrixById,
+  matrix,
+}: {
+  ordered: JobDoc[];
+  slot: RouteSlot;
+  selectedTechs: Array<Record<string, unknown> & { id: string }>;
+  rangeStart: string;
+  rangeEnd: string;
+  matrixById: Map<string, number>;
+  matrix: number[][];
+}) {
+  if (ordered.length <= 1) return null;
+  const currentDrive = driveMinutesForOrderedSubset(ordered, matrixById, matrix);
+  const slotKey = routeSlotKey(slot.date, slot.tech.id);
+  let best: { job: JobDoc; score: number } | null = null;
+
+  for (const job of ordered) {
+    if (pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd) === slotKey) continue;
+
+    const without = ordered.filter((candidate) => candidate.docId !== job.docId);
+    const reducedDrive = driveMinutesForOrderedSubset(without, matrixById, matrix);
+    const driveReduction = Math.max(0, currentDrive - reducedDrive);
+    const priorityPenalty = routeDateTier(job, rangeStart, rangeEnd) * 15;
+    const score = driveReduction - priorityPenalty;
+    if (!best || score > best.score) best = { job, score };
+  }
+
+  return best?.job || null;
 }
 
 function orderNearestNeighbor(jobs: JobDoc[]) {
@@ -1050,6 +1147,7 @@ async function buildFastFallbackRoutes({
   const routeWarnings = new Set<string>();
   const matrixSources = new Set<string>();
   const polylineSources = new Set<string>();
+  const driveCapDeferrals: Array<{ job: JobDoc; routeName: string; driveMinutes: number }> = [];
   let slotIndex = 0;
 
   for (const tech of selectedTechs) {
@@ -1082,32 +1180,48 @@ async function buildFastFallbackRoutes({
 
     for (const assignment of assignments) {
       const slot = assignment.slot;
-      const picked = assignment.jobs;
+      let picked = assignment.jobs;
       if (picked.length === 0) continue;
 
-      const matrixResult = await getDriveMatrix(picked, slot.date);
+      let orderedBuild = await buildOrderedRoute(picked, slot.date);
+      let driveTrimPasses = 0;
+      while (
+        maxDriveTime > 0 &&
+        orderedBuild.totalDriveMinutes > maxDriveTime + DRIVE_CAP_SLACK_MINUTES &&
+        picked.length > 1 &&
+        driveTrimPasses < 30
+      ) {
+        const removal = chooseDriveCapRemoval({
+          ordered: orderedBuild.ordered,
+          slot,
+          selectedTechs,
+          rangeStart,
+          rangeEnd,
+          matrixById: orderedBuild.matrixById,
+          matrix: orderedBuild.matrixResult.matrix,
+        });
+        if (!removal) {
+          routeWarnings.add(
+            `${String(slot.tech.name || slot.tech.id)} ${slot.date} is over the ${maxDriveTime}-minute drive target, but remaining stops are already pinned from FieldRoutes or cannot be split safely.`,
+          );
+          break;
+        }
+        deferredJobIds.add(removal.docId);
+        driveCapDeferrals.push({
+          job: removal,
+          routeName: `${String(slot.tech.name || "Route")} ${slot.date}`,
+          driveMinutes: Math.round(orderedBuild.totalDriveMinutes * 10) / 10,
+        });
+        picked = picked.filter((job) => job.docId !== removal.docId);
+        orderedBuild = await buildOrderedRoute(picked, slot.date);
+        driveTrimPasses++;
+      }
+
+      const { ordered, matrixResult, matrixById, geometryResult, totalDriveMinutes, driveTimeSource } = orderedBuild;
       matrixSources.add(matrixResult.source);
       matrixResult.warnings.forEach((warning) => routeWarnings.add(warning));
-      const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
-      const matrixById = new Map<string, number>();
-      picked.forEach((job, idx) => matrixById.set(job.docId, idx));
-      const ordered = keepSameAddressJobsTogether(orderedResult.ordered);
-      const orderedMatrixDriveMinutes = orderedDriveMinutesFromMatrix(
-        ordered,
-        matrixById,
-        matrixResult.matrix,
-      );
-      const geometryResult = await computeRouteGeometry(ordered, { routeDate: slot.date });
       polylineSources.add(geometryResult.polylineSource);
       geometryResult.warnings.forEach((warning) => routeWarnings.add(warning));
-      const totalDriveMinutes =
-        geometryResult.driveTimeSource === "routes_api_polyline"
-          ? geometryResult.driveMinutes
-          : orderedMatrixDriveMinutes;
-      const driveTimeSource =
-        geometryResult.driveTimeSource === "routes_api_polyline"
-          ? geometryResult.driveTimeSource
-          : matrixResult.source;
 
       const stops = ordered.map((job, idx) => {
         const stop: BackendStop = {
@@ -1155,6 +1269,7 @@ async function buildFastFallbackRoutes({
         techId: slot.tech.id,
         techName: String(slot.tech.name || slot.tech.id),
         maxStopsParam: slot.maxStops,
+        targetStopsParam: slot.maxStops,
         baseMaxStopsParam: maxStops,
         driveTimeSource,
         polylineSource: geometryResult.polylineSource,
@@ -1180,6 +1295,11 @@ async function buildFastFallbackRoutes({
           `${constraintDeferrals.length} job(s) deferred because scheduling notes or route capacity block the available dates. Example: ${String(constraintDeferrals[0].job.customerName || constraintDeferrals[0].job.docId)} (${constraintDeferrals[0].reason}).`,
         ]
       : []),
+    ...(driveCapDeferrals.length > 0
+      ? [
+          `${driveCapDeferrals.length} stop(s) deferred to stay near the ${maxDriveTime}-minute max drive target. Example: ${String(driveCapDeferrals[0].job.customerName || driveCapDeferrals[0].job.docId)} from ${driveCapDeferrals[0].routeName} (${driveCapDeferrals[0].driveMinutes} min before trim).`,
+        ]
+      : []),
   ];
 
   return {
@@ -1192,6 +1312,8 @@ async function buildFastFallbackRoutes({
 }
 
 export async function POST(request: NextRequest) {
+  let lockRef: FirebaseFirestore.DocumentReference | null = null;
+  let lockAcquired = false;
   try {
     const body = await request.json();
     const {
@@ -1202,6 +1324,7 @@ export async function POST(request: NextRequest) {
       techIds,
       maxStops: rawMaxStops,
       maxDriveTime: rawMaxDriveTime,
+      requestedBy,
       runSettings,
     } = body as {
       companyId: string;
@@ -1211,6 +1334,7 @@ export async function POST(request: NextRequest) {
       techIds?: string[];
       maxStops?: number;
       maxDriveTime?: number;
+      requestedBy?: string;
       runSettings?: Record<string, unknown>;
     };
 
@@ -1220,7 +1344,6 @@ export async function POST(request: NextRequest) {
         { status: 400 },
       );
     }
-
     const rangeStart = startDate || date || "";
     const rangeEnd = endDate || date || "";
 
@@ -1253,24 +1376,33 @@ export async function POST(request: NextRequest) {
 
     const db = adminDb();
 
-    // --- Generation lock (2 min timeout, auto-cleanup) ---
-    const lockRef = db.doc(`routeGeneration/${companyId}`);
+    // --- Generation lock: one active generation per company, with stale cleanup. ---
+    lockRef = db.doc(`routeGeneration/${companyId}`);
     const lockSnap = await lockRef.get();
     if (lockSnap.exists) {
       const lockData = lockSnap.data();
       const lockTime = new Date(lockData?.startedAt || 0).getTime();
-      if (Date.now() - lockTime < 2 * 60 * 1000) {
+      if (Number.isFinite(lockTime) && Date.now() - lockTime < GENERATION_LOCK_STALE_MS) {
         return NextResponse.json(
           {
-            error:
-              "Another route generation is in progress. Please wait and try again.",
+            error: "Another route generation is in progress for this company. Please wait and try again.",
+            startedAt: lockData?.startedAt || null,
+            requestedBy: lockData?.requestedBy || null,
           },
           { status: 409 },
         );
       }
       await lockRef.delete();
     }
-    await lockRef.set({ startedAt: new Date().toISOString(), companyId });
+    await lockRef.set({
+      startedAt: new Date().toISOString(),
+      companyId,
+      requestedBy: String(requestedBy || ""),
+      rangeStart,
+      rangeEnd,
+      techIds: Array.isArray(techIds) ? techIds : [],
+    });
+    lockAcquired = true;
 
     // --- 1. Fetch selected technicians ---
     const techDocs = await db
@@ -1735,7 +1867,7 @@ export async function POST(request: NextRequest) {
     const now = new Date().toISOString();
     const scheduledJobIds = new Set<string>();
     const routeWrites: Array<{
-      routeRef: typeof lockRef;
+      routeRef: FirebaseFirestore.DocumentReference;
       data: Record<string, unknown>;
     }> = [];
 
@@ -1803,6 +1935,7 @@ export async function POST(request: NextRequest) {
             warnings: routeOptimizationShadow.warnings,
           },
           maxStopsParam: routeMaxStops,
+          targetStopsParam: routeMaxStops,
           baseMaxStopsParam: Number(route.baseMaxStopsParam) || maxStops,
           tuesdayStopReduction: TUESDAY_STOP_REDUCTION,
           maxDriveTimeParam: maxDriveTime,
@@ -1902,7 +2035,7 @@ export async function POST(request: NextRequest) {
         inWindowSelected: selectedInWindowCount,
         futureSelected: selectedFutureCount,
       },
-      params: { maxStops, maxDriveTime },
+      params: { targetStops: maxStops, maxStops, maxDriveTime },
       deferredCount: totalDeferred,
       warnings: [
         ...(replacedRouteCount > 0
@@ -1931,17 +2064,7 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
-    try {
-      const cleanupDb = adminDb();
-      const body2 = await request
-        .clone()
-        .json()
-        .catch(() => ({}) as { companyId?: string });
-      if (body2.companyId)
-        await cleanupDb.doc(`routeGeneration/${body2.companyId}`).delete();
-    } catch {
-      // best effort
-    }
+    if (lockAcquired && lockRef) await lockRef.delete().catch(() => {});
 
     console.error("Generate routes API error:", error);
     return NextResponse.json(
@@ -1952,5 +2075,7 @@ export async function POST(request: NextRequest) {
       },
       { status: 500 },
     );
+  } finally {
+    if (lockAcquired && lockRef) await lockRef.delete().catch(() => {});
   }
 }
