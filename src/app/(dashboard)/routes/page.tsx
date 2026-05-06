@@ -424,6 +424,15 @@ function routeMetricUpdateFields(metrics: RouteMetricSummary) {
   };
 }
 
+function shouldClearGeneratedAssignment(route: Route, job?: Job) {
+  return (
+    route.generatedBy === "ai" &&
+    Boolean(route.updatedAt) &&
+    job?.assignedTechId === route.techId &&
+    job.updatedAt === route.updatedAt
+  );
+}
+
 function describeDirectionsStatus(status?: string) {
   if (status === "REQUEST_DENIED") {
     return "Google rejected the server Routes API request. Check that the server API key has Routes API enabled and billing active.";
@@ -749,6 +758,7 @@ export default function RoutesPage() {
   const mapMarkerByJobId = useRef<Map<string, google.maps.Marker>>(new Map());
   const hasFittedBounds = useRef(false);
   const mapInstanceRef = useRef<google.maps.Map | null>(null);
+  const openMapInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const mapMarkersRef = useRef<google.maps.Marker[]>([]);
   const mapPolylinesRef = useRef<google.maps.Polyline[]>([]);
   const roadSnapWarningsRef = useRef<Set<string>>(new Set());
@@ -1064,6 +1074,90 @@ export default function RoutesPage() {
       toast.error("Failed to add job to route");
     }
   }, [allJobs, allRoutes, calculateRouteMetrics, pushEdit, routedJobIds, userProfile?.companyId, userProfile?.email]);
+
+  const handleRemoveStop = useCallback(async (tr: TechRoute, jobId: string) => {
+    if (!userProfile?.companyId) return;
+    if (tr.route.approved) {
+      toast.error("Approved routes must be undone or unscheduled before editing stops.");
+      return;
+    }
+
+    const job = allJobs[jobId];
+    const oldSeq = tr.route.stopSequence;
+    if (!oldSeq.includes(jobId)) return;
+
+    const newSeq = oldSeq.filter(id => id !== jobId);
+    const metrics = await calculateRouteMetrics(newSeq, tr.route.date);
+    const previousRoutes = allRoutes;
+    const previousJob = job ? { ...job } : null;
+    const now = new Date().toISOString();
+
+    setAllRoutes(allRoutes.map(r =>
+      r.route.id === tr.route.id
+        ? {
+            ...r,
+            route: applyMetricsToRoute({
+              ...r.route,
+              stopSequence: newSeq,
+              generatedBy: "human" as const,
+            }, metrics),
+          }
+        : r,
+    ));
+    if (job) {
+      setAllJobs(prev => ({
+        ...prev,
+        [jobId]: {
+          ...prev[jobId],
+          status: "pending",
+          assignedTechId: "",
+          updatedAt: now,
+        },
+      }));
+    }
+
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
+        stopSequence: newSeq,
+        ...routeMetricUpdateFields(metrics),
+        generatedBy: "human",
+        updatedAt: now,
+      });
+      batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
+        status: "pending",
+        assignedTechId: "",
+        updatedAt: now,
+      });
+      await batch.commit();
+
+      pushEdit({
+        type: "removeStop",
+        timestamp: Date.now(),
+        description: "Removed stop from route",
+        before: [{ routeId: tr.route.id, stopSequence: oldSeq, date: tr.route.date }],
+        after: [{ routeId: tr.route.id, stopSequence: newSeq, date: tr.route.date }],
+      });
+      fetch("/api/record-feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          routeId: tr.route.id,
+          originalRoute: tr.route,
+          modifiedRoute: { ...tr.route, stopSequence: newSeq },
+          modifiedBy: userProfile.email,
+        }),
+      }).catch(() => {});
+
+      toast.success(`Removed ${job?.customerName || "stop"} - returned to pending`);
+    } catch (e) {
+      console.error("Remove stop error:", e);
+      setAllRoutes(previousRoutes);
+      if (previousJob) setAllJobs(prev => ({ ...prev, [jobId]: previousJob }));
+      toast.error("Failed to remove stop");
+    }
+  }, [allJobs, allRoutes, calculateRouteMetrics, pushEdit, userProfile?.companyId, userProfile?.email]);
 
   const handlePanelDragEnd = useCallback(async (event: DragEndEvent) => {
     const { active, over } = event;
@@ -1550,6 +1644,8 @@ export default function RoutesPage() {
     // Clear old overlays
     mapMarkersRef.current.forEach(m => m.setMap(null));
     mapPolylinesRef.current.forEach(p => p.setMap(null));
+    openMapInfoWindowRef.current?.close();
+    openMapInfoWindowRef.current = null;
     mapMarkersRef.current = [];
     mapPolylinesRef.current = [];
     mapMarkerByJobId.current.clear();
@@ -1596,39 +1692,63 @@ export default function RoutesPage() {
             strokeWeight: clickOrderActive ? 3 : 2,
             scale: clickOrderActive ? 16 : 14,
           },
-          title: clickOrderActive
-            ? `Click to set order: ${job.customerName}`
-            : `${idx + 1}. ${job.customerName} — ${tr.tech.name}`,
         });
+
+        const infoContent = document.createElement("div");
+        infoContent.style.cssText = "color:#111;padding:8px;max-width:270px";
+        infoContent.innerHTML = `
+          <div style="font-weight:700;margin-bottom:2px">${idx + 1}. ${escapeHtml(job.customerName)}</div>
+          <div style="color:#666;font-size:12px;margin-bottom:6px">${escapeHtml(job.address)}</div>
+          <div style="font-size:12px;margin-bottom:8px">
+            ${job.serviceType ? `${escapeHtml(job.serviceType)} · ` : ""}${Number(job.duration || 25)} min at stop
+          </div>
+          <div style="border-top:1px solid #e5e7eb;padding-top:7px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+            <div><div style="color:#777">Due</div><div style="font-weight:700">${escapeHtml(job.scheduledDate || "-")}</div></div>
+            <div><div style="color:#777">Last serviced</div><div style="font-weight:700">${escapeHtml(lastServiced || "-")}</div></div>
+            <div><div style="color:#777">Stop value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
+            <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(routeStats.productionValue)}</div></div>
+            <div><div style="color:#777">Route drive</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>
+            <div><div style="color:#777">Full day</div><div style="font-weight:700">${formatTime(routeStats.workMinutes)}</div></div>
+          </div>
+          <div style="color:${color};font-weight:700;font-size:12px;margin-top:8px">${escapeHtml(tr.tech.name)} · ${escapeHtml(tr.route.date)}</div>
+          <div style="color:#999;font-size:11px;margin-top:5px">L+click = left panel · R+click = right panel</div>
+        `;
+        if (editMode) {
+          const removeButton = document.createElement("button");
+          removeButton.type = "button";
+          removeButton.textContent = "Remove from route";
+          removeButton.style.cssText = [
+            "margin-top:10px",
+            "width:100%",
+            "border:1px solid #fecaca",
+            "border-radius:6px",
+            "background:#fef2f2",
+            "color:#b91c1c",
+            "font-size:12px",
+            "font-weight:700",
+            "padding:7px 8px",
+            "cursor:pointer",
+          ].join(";");
+          removeButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            openMapInfoWindowRef.current?.close();
+            openMapInfoWindowRef.current = null;
+            void handleRemoveStop(tr, job.id);
+          });
+          infoContent.appendChild(removeButton);
+        }
 
         const infoWindow = new window.google.maps.InfoWindow({
-          content: `<div style="color:#111;padding:8px;max-width:270px">
-            <div style="font-weight:700;margin-bottom:2px">${idx + 1}. ${escapeHtml(job.customerName)}</div>
-            <div style="color:#666;font-size:12px;margin-bottom:6px">${escapeHtml(job.address)}</div>
-            <div style="font-size:12px;margin-bottom:8px">
-              ${job.serviceType ? `${escapeHtml(job.serviceType)} · ` : ""}${Number(job.duration || 25)} min at stop
-            </div>
-            <div style="border-top:1px solid #e5e7eb;padding-top:7px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
-              <div><div style="color:#777">Due</div><div style="font-weight:700">${escapeHtml(job.scheduledDate || "-")}</div></div>
-              <div><div style="color:#777">Last serviced</div><div style="font-weight:700">${escapeHtml(lastServiced || "-")}</div></div>
-              <div><div style="color:#777">Stop value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
-              <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(routeStats.productionValue)}</div></div>
-              <div><div style="color:#777">Route drive</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>
-              <div><div style="color:#777">Full day</div><div style="font-weight:700">${formatTime(routeStats.workMinutes)}</div></div>
-            </div>
-            <div style="color:${color};font-weight:700;font-size:12px;margin-top:8px">${escapeHtml(tr.tech.name)} · ${escapeHtml(tr.route.date)}</div>
-            <div style="color:#999;font-size:11px;margin-top:5px">L+click = left panel · R+click = right panel</div>
-          </div>`,
+          content: infoContent,
+          disableAutoPan: true,
         });
 
-        // Hover sync: map → sidebar
+        // Hover sync: map -> sidebar highlight only. Popups open on click.
         marker.addListener("mouseover", () => {
           setHoveredStop(job.id);
-          infoWindow.open(map, marker);
         });
         marker.addListener("mouseout", () => {
           setHoveredStop(null);
-          infoWindow.close();
         });
 
         marker.addListener("dragstart", () => setHoveredStop(job.id));
@@ -1667,9 +1787,9 @@ export default function RoutesPage() {
             toast.info(`${tr.tech.name} → right panel`);
             return;
           }
-          // Default: open info window + assign to left panel
-          setLeftPanelRouteId(routeId);
-          infoWindow.open(map, marker);
+          openMapInfoWindowRef.current?.close();
+          openMapInfoWindowRef.current = infoWindow;
+          infoWindow.open({ map, anchor: marker, shouldFocus: false });
         });
 
         mapMarkersRef.current.push(marker);
@@ -1688,6 +1808,7 @@ export default function RoutesPage() {
         });
         const routeInfoWindow = new window.google.maps.InfoWindow({
           content: routeStatsHtml(tr, allJobs),
+          disableAutoPan: true,
         });
         polyline.addListener("click", (event: google.maps.MapMouseEvent) => {
           if (heldKeyRef.current === "r") {
@@ -1696,7 +1817,9 @@ export default function RoutesPage() {
             setLeftPanelRouteId(tr.route.id);
           }
           routeInfoWindow.setPosition(event.latLng || path[Math.floor(path.length / 2)]);
-          routeInfoWindow.open(map);
+          openMapInfoWindowRef.current?.close();
+          openMapInfoWindowRef.current = routeInfoWindow;
+          routeInfoWindow.open({ map, shouldFocus: false });
         });
         mapPolylinesRef.current.push(polyline);
 
@@ -1761,21 +1884,17 @@ export default function RoutesPage() {
             strokeWeight: 2,
             scale: 9,
           },
-          title: `${job.customerName} — job pool`,
           zIndex: 5,
         });
         const infoWindow = new window.google.maps.InfoWindow({
           content: poolJobHtml(job),
+          disableAutoPan: true,
         });
 
-        marker.addListener("mouseover", () => {
-          infoWindow.open(map, marker);
-        });
-        marker.addListener("mouseout", () => {
-          infoWindow.close();
-        });
         marker.addListener("click", () => {
-          infoWindow.open(map, marker);
+          openMapInfoWindowRef.current?.close();
+          openMapInfoWindowRef.current = infoWindow;
+          infoWindow.open({ map, anchor: marker, shouldFocus: false });
         });
         marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
           marker.setPosition(pos);
@@ -1804,7 +1923,7 @@ export default function RoutesPage() {
     return () => {
       cancelled = true;
     };
-  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, jobPoolJobs, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
+  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -1874,16 +1993,6 @@ export default function RoutesPage() {
     } finally {
       setTimeout(() => { setGenerating(false); setGenStage(""); }, 1500);
     }
-  };
-
-
-  const shouldClearGeneratedAssignment = (route: Route, job?: Job) => {
-    return (
-      route.generatedBy === "ai" &&
-      Boolean(route.updatedAt) &&
-      job?.assignedTechId === route.techId &&
-      job.updatedAt === route.updatedAt
-    );
   };
 
   const formatApproveError = (data: { error?: string; details?: unknown }) => {
@@ -2213,50 +2322,6 @@ export default function RoutesPage() {
       toast.error("Failed to reject routes");
     } finally {
       setApproving(null);
-    }
-  };
-
-  const handleRemoveStop = async (tr: TechRoute, jobId: string) => {
-    if (!userProfile?.companyId) return;
-    const job = allJobs[jobId];
-    const newSeq = tr.route.stopSequence.filter(id => id !== jobId);
-    const metrics = await calculateRouteMetrics(newSeq, tr.route.date);
-    const previousRoutes = allRoutes;
-
-    // Optimistic update
-    const updated = allRoutes.map(r =>
-      r.route.id === tr.route.id
-        ? {
-            ...r,
-            route: applyMetricsToRoute({
-              ...r.route,
-              stopSequence: newSeq,
-              generatedBy: "human" as const,
-            }, metrics),
-          }
-        : r
-    );
-    setAllRoutes(updated);
-
-    try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, tr.route.id), {
-        stopSequence: newSeq,
-        ...routeMetricUpdateFields(metrics),
-        generatedBy: "human",
-        updatedAt: new Date().toISOString(),
-      });
-      batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
-        status: "pending",
-        assignedTechId: "",
-        updatedAt: new Date().toISOString(),
-      });
-      await batch.commit();
-      toast.success(`Removed ${job?.customerName || "stop"} — returned to pending`);
-    } catch (e) {
-      console.error("Remove stop error:", e);
-      setAllRoutes(previousRoutes);
-      toast.error("Failed to remove stop");
     }
   };
 
