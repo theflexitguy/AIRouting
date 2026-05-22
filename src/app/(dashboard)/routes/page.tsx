@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
-import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
+import { collection, getDoc, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -750,6 +750,7 @@ export default function RoutesPage() {
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [editMode, setEditMode] = useState(false);
+  const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
   const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
   const [jobPoolDueStart, setJobPoolDueStart] = useState(startDate);
   const [jobPoolDueEnd, setJobPoolDueEnd] = useState(endDate);
@@ -945,6 +946,10 @@ export default function RoutesPage() {
       calculateRouteMetricsFromRoads(stopSequence, allJobs, routeDate),
     [allJobs],
   );
+  const canAssignJobToRoute = useCallback((job: Job | undefined, tr: TechRoute) => {
+    if (!job || allowCrossTechRouteEdits) return true;
+    return !assignedTechBlockReason(job, tr.tech);
+  }, [allowCrossTechRouteEdits]);
 
   const handleMoveStop = useCallback(async (
     jobId: string,
@@ -956,6 +961,12 @@ export default function RoutesPage() {
     const fromRoute = displayRoutes.find(r => r.route.id === fromRouteId);
     const toRoute = allRoutes.find(r => r.route.id === toRouteId);
     if (!fromRoute || !toRoute) return;
+    const job = allJobs[jobId];
+    const assignedBlock = !allowCrossTechRouteEdits && job ? assignedTechBlockReason(job, toRoute.tech) : "";
+    if (assignedBlock) {
+      toast.error(`${job?.customerName || "Stop"} is ${assignedBlock}, not ${toRoute.tech.name}.`);
+      return;
+    }
 
     const fromRouteIsVirtual = isFieldRoutesScheduledRoute(fromRoute.route);
     const newFromSeq = fromRoute.route.stopSequence.filter(id => id !== jobId);
@@ -1069,7 +1080,6 @@ export default function RoutesPage() {
         }),
       }).catch(() => {});
 
-      const job = allJobs[jobId];
       toast.success(`Moved ${job?.customerName || "stop"} → ${toRoute.tech.name}`);
     } catch (e) {
       console.error("Move stop error:", e);
@@ -1077,7 +1087,7 @@ export default function RoutesPage() {
       if (previousJob) setAllJobs(prev => ({ ...prev, [jobId]: previousJob }));
       toast.error("Failed to move stop");
     }
-  }, [allJobs, allRoutes, calculateRouteMetrics, displayRoutes, leftPanelRouteId, rightPanelRouteId, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, allowCrossTechRouteEdits, calculateRouteMetrics, displayRoutes, leftPanelRouteId, rightPanelRouteId, userProfile?.companyId, userProfile?.email]);
 
   const handleAddPoolJobToRoute = useCallback(async (
     jobId: string,
@@ -1090,7 +1100,7 @@ export default function RoutesPage() {
     if (!job || !toRoute) return;
     if (toRoute.route.stopSequence.includes(jobId)) return;
 
-    const assignedBlock = assignedTechBlockReason(job, toRoute.tech);
+    const assignedBlock = !allowCrossTechRouteEdits ? assignedTechBlockReason(job, toRoute.tech) : "";
     if (assignedBlock) {
       toast.error(`${job.customerName || "Job"} is ${assignedBlock}, not ${toRoute.tech.name}.`);
       return;
@@ -1116,7 +1126,7 @@ export default function RoutesPage() {
         const dueDate = String(candidate.scheduledDate || "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
         if (dueDate > bundleHorizon && dueDate.slice(0, 7) !== routeMonth) return false;
-        if (assignedTechBlockReason(candidate, toRoute.tech)) return false;
+        if (!allowCrossTechRouteEdits && assignedTechBlockReason(candidate, toRoute.tech)) return false;
         if (jobScheduleBlockReason(candidate, toRoute.route.date)) return false;
         return true;
       })
@@ -1217,7 +1227,7 @@ export default function RoutesPage() {
       setAllJobs(prev => ({ ...prev, ...previousJobs }));
       toast.error("Failed to add job to route");
     }
-  }, [allJobs, allRoutes, calculateRouteMetrics, pushEdit, routedJobIds, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, allowCrossTechRouteEdits, calculateRouteMetrics, pushEdit, routedJobIds, userProfile?.companyId, userProfile?.email]);
 
   const handleRemoveStop = useCallback(async (tr: TechRoute, jobId: string) => {
     if (!userProfile?.companyId) return;
@@ -1613,6 +1623,20 @@ export default function RoutesPage() {
   }, [userProfile]);
 
   useEffect(() => {
+    if (!userProfile?.companyId) return;
+    let cancelled = false;
+    getDoc(doc(db, "companies", userProfile.companyId))
+      .then((snap) => {
+        if (cancelled || !snap.exists()) return;
+        setAllowCrossTechRouteEdits(snap.data().allowCrossTechRouteEdits !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setAllowCrossTechRouteEdits(true);
+      });
+    return () => { cancelled = true; };
+  }, [userProfile?.companyId]);
+
+  useEffect(() => {
     if (!userProfile?.companyId || !startDate || !endDate) return;
     loadJobsForRange(userProfile.companyId);
 
@@ -1767,10 +1791,12 @@ export default function RoutesPage() {
     const zoom = mapInstanceRef.current?.getZoom() ?? 11;
     const maxDropMiles = zoom >= 14 ? 0.35 : zoom >= 12 ? 0.75 : 1.5;
     let best: { routeId: string; jobId: string; techName: string; distance: number } | null = null;
+    const sourceJob = allJobs[sourceJobId];
 
     for (const tr of visibleRoutes) {
       if (isFieldRoutesScheduledRoute(tr.route)) continue;
       if (tr.route.id === sourceRouteId) continue;
+      if (!canAssignJobToRoute(sourceJob, tr)) continue;
       for (const targetJob of getJobsForRoute(tr)) {
         if (targetJob.id === sourceJobId || targetJob.lat === undefined || targetJob.lng === undefined) continue;
         const distance = distanceMiles(droppedAt, { lat: targetJob.lat, lng: targetJob.lng });
@@ -1786,7 +1812,7 @@ export default function RoutesPage() {
     }
 
     return best && best.distance <= maxDropMiles ? best : null;
-  }, [getJobsForRoute, visibleRoutes]);
+  }, [allJobs, canAssignJobToRoute, getJobsForRoute, visibleRoutes]);
 
   // Update markers and polylines when routes/jobs change (without recreating the map)
   useEffect(() => {
@@ -2820,7 +2846,7 @@ export default function RoutesPage() {
                           onHoverStart={() => setHoveredStop(job.id)}
                           onHoverEnd={() => setHoveredStop(null)}
                           onRemove={editMode && !routeReadOnly ? () => handleRemoveStop(tr, job.id) : undefined}
-                          moveTargets={editMode && !routeReadOnly ? visibleRoutes.filter(o => o.route.id !== tr.route.id && !isFieldRoutesScheduledRoute(o.route)).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                          moveTargets={editMode && !routeReadOnly ? visibleRoutes.filter(o => o.route.id !== tr.route.id && !isFieldRoutesScheduledRoute(o.route) && canAssignJobToRoute(job, o)).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
                           onMoveTo={editMode && !routeReadOnly ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
                         />
                       );
@@ -2961,7 +2987,7 @@ export default function RoutesPage() {
                           onHoverStart={() => setHoveredStop(job.id)}
                           onHoverEnd={() => setHoveredStop(null)}
                           onRemove={editMode && !routeReadOnly ? () => handleRemoveStop(tr, job.id) : undefined}
-                          moveTargets={editMode && !routeReadOnly ? visibleRoutes.filter(o => o.route.id !== tr.route.id && !isFieldRoutesScheduledRoute(o.route)).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                          moveTargets={editMode && !routeReadOnly ? visibleRoutes.filter(o => o.route.id !== tr.route.id && !isFieldRoutesScheduledRoute(o.route) && canAssignJobToRoute(job, o)).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
                           onMoveTo={editMode && !routeReadOnly ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
                         />
                       );

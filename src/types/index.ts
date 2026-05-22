@@ -11,6 +11,7 @@ export interface Company {
   fieldRoutesMosquitoServiceId?: string;
   fieldRoutesOutdoorPackageServiceId?: string;
   fieldRoutesDefaultServiceId?: string;
+  allowCrossTechRouteEdits?: boolean;
   createdAt: string;
   active: boolean;
 }

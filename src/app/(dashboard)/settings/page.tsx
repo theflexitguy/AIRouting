@@ -13,7 +13,7 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Technician } from "@/types";
-import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell } from "lucide-react";
+import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal } from "lucide-react";
 import { toast } from "sonner";
 
 export default function SettingsPage() {
@@ -30,6 +30,8 @@ export default function SettingsPage() {
   const [techs, setTechs] = useState<Technician[]>([]);
   const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
   const [addingTech, setAddingTech] = useState(false);
+  const [savingRouting, setSavingRouting] = useState(false);
+  const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
   const [emailNotifications, setEmailNotifications] = useState(true);
 
   useEffect(() => {
@@ -50,6 +52,7 @@ export default function SettingsPage() {
         setGeneralPestServiceId(String(data.fieldRoutesGeneralPestServiceId || ""));
         setMosquitoServiceId(String(data.fieldRoutesMosquitoServiceId || ""));
         setOutdoorPackageServiceId(String(data.fieldRoutesOutdoorPackageServiceId || ""));
+        setAllowCrossTechRouteEdits(data.allowCrossTechRouteEdits !== false);
       }
       setSettingsLoaded(true);
     } catch { }
@@ -136,6 +139,24 @@ export default function SettingsPage() {
     } catch { }
   }
 
+  async function saveRoutingSettings() {
+    if (!userProfile?.companyId) return;
+    setSavingRouting(true);
+    try {
+      await setDoc(
+        doc(db, "companies", userProfile.companyId),
+        { allowCrossTechRouteEdits },
+        { merge: true },
+      );
+      toast.success("Routing settings saved");
+    } catch (err) {
+      console.error("Save routing settings error:", err);
+      toast.error("Failed to save routing settings.");
+    } finally {
+      setSavingRouting(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-full">
       <TopBar title="Settings" />
@@ -144,6 +165,7 @@ export default function SettingsPage() {
           <TabsList className="mb-6">
             <TabsTrigger value="api"><Key className="w-4 h-4 mr-2" />API Keys</TabsTrigger>
             <TabsTrigger value="techs"><Users className="w-4 h-4 mr-2" />Technicians</TabsTrigger>
+            <TabsTrigger value="routing"><SlidersHorizontal className="w-4 h-4 mr-2" />Routing</TabsTrigger>
             <TabsTrigger value="billing"><CreditCard className="w-4 h-4 mr-2" />Billing</TabsTrigger>
             <TabsTrigger value="notifications"><Bell className="w-4 h-4 mr-2" />Notifications</TabsTrigger>
           </TabsList>
@@ -258,6 +280,34 @@ export default function SettingsPage() {
                     </div>
                   )}
                 </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="routing" className="space-y-4">
+            <Card className="border-border/40">
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold">Route Editing</CardTitle>
+                <CardDescription className="text-xs">Control how strictly RouteIQ enforces technician assignment while manually editing routes.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center justify-between gap-4 rounded-lg bg-accent/15 p-4">
+                  <div>
+                    <Label htmlFor="allowCrossTechRouteEdits" className="font-medium text-sm cursor-pointer">Allow cross-technician route edits</Label>
+                    <p className="text-xs text-muted-foreground/50 mt-1">
+                      When enabled, stops can be dragged or added to any editable route even if FieldRoutes assigned them to another technician.
+                    </p>
+                  </div>
+                  <Switch
+                    id="allowCrossTechRouteEdits"
+                    checked={allowCrossTechRouteEdits}
+                    onCheckedChange={setAllowCrossTechRouteEdits}
+                  />
+                </div>
+                <Button onClick={saveRoutingSettings} disabled={savingRouting} className="bg-blue-500 hover:bg-blue-600 text-white">
+                  {savingRouting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  Save Routing Settings
+                </Button>
               </CardContent>
             </Card>
           </TabsContent>
