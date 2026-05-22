@@ -953,10 +953,11 @@ export default function RoutesPage() {
     insertAfterJobId?: string,
   ) => {
     if (!userProfile?.companyId || fromRouteId === toRouteId) return;
-    const fromRoute = allRoutes.find(r => r.route.id === fromRouteId);
+    const fromRoute = displayRoutes.find(r => r.route.id === fromRouteId);
     const toRoute = allRoutes.find(r => r.route.id === toRouteId);
     if (!fromRoute || !toRoute) return;
 
+    const fromRouteIsVirtual = isFieldRoutesScheduledRoute(fromRoute.route);
     const newFromSeq = fromRoute.route.stopSequence.filter(id => id !== jobId);
     const newToSeq = toRoute.route.stopSequence.filter(id => id !== jobId);
     const insertAfterIndex = insertAfterJobId ? newToSeq.indexOf(insertAfterJobId) : -1;
@@ -966,14 +967,16 @@ export default function RoutesPage() {
       newToSeq.push(jobId);
     }
 
-    const shouldDeleteEmptySourceRoute = newFromSeq.length === 0 && !fromRoute.route.approved;
+    const shouldDeleteEmptySourceRoute = !fromRouteIsVirtual && newFromSeq.length === 0 && !fromRoute.route.approved;
     const [fromMetrics, toMetrics] = await Promise.all([
-      shouldDeleteEmptySourceRoute
+      fromRouteIsVirtual || shouldDeleteEmptySourceRoute
         ? Promise.resolve<RouteMetricSummary | null>(null)
         : calculateRouteMetrics(newFromSeq, fromRoute.route.date),
       calculateRouteMetrics(newToSeq, toRoute.route.date),
     ]);
     const previousRoutes = allRoutes;
+    const previousJob = allJobs[jobId] ? { ...allJobs[jobId] } : null;
+    const now = new Date().toISOString();
 
     setAllRoutes(allRoutes.flatMap(r => {
       if (r.route.id === fromRouteId) {
@@ -999,24 +1002,34 @@ export default function RoutesPage() {
       }
       return [r];
     }));
-    if (shouldDeleteEmptySourceRoute) {
+    setAllJobs(prev => ({
+      ...prev,
+      [jobId]: {
+        ...prev[jobId],
+        assignedTechId: toRoute.tech.id,
+        status: "scheduled",
+        updatedAt: now,
+      },
+    }));
+    if (shouldDeleteEmptySourceRoute || (fromRouteIsVirtual && newFromSeq.length === 0)) {
       if (leftPanelRouteId === fromRouteId) setLeftPanelRouteId(null);
       if (rightPanelRouteId === fromRouteId) setRightPanelRouteId(null);
     }
 
     try {
       const batch = writeBatch(db);
-      const now = new Date().toISOString();
-      const fromRouteRef = doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId);
-      if (shouldDeleteEmptySourceRoute) {
-        batch.delete(fromRouteRef);
-      } else {
-        batch.update(fromRouteRef, {
-          stopSequence: newFromSeq,
-          ...routeMetricUpdateFields(fromMetrics as RouteMetricSummary),
-          generatedBy: "human",
-          updatedAt: now,
-        });
+      if (!fromRouteIsVirtual) {
+        const fromRouteRef = doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId);
+        if (shouldDeleteEmptySourceRoute) {
+          batch.delete(fromRouteRef);
+        } else {
+          batch.update(fromRouteRef, {
+            stopSequence: newFromSeq,
+            ...routeMetricUpdateFields(fromMetrics as RouteMetricSummary),
+            generatedBy: "human",
+            updatedAt: now,
+          });
+        }
       }
       batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
         stopSequence: newToSeq,
@@ -1031,17 +1044,19 @@ export default function RoutesPage() {
       });
       await batch.commit();
 
-      fetch("/api/record-feedback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          companyId: userProfile.companyId,
-          routeId: fromRouteId,
-          originalRoute: fromRoute.route,
-          modifiedRoute: { ...fromRoute.route, stopSequence: newFromSeq },
-          modifiedBy: userProfile.email,
-        }),
-      }).catch(() => {});
+      if (!fromRouteIsVirtual) {
+        fetch("/api/record-feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            companyId: userProfile.companyId,
+            routeId: fromRouteId,
+            originalRoute: fromRoute.route,
+            modifiedRoute: { ...fromRoute.route, stopSequence: newFromSeq },
+            modifiedBy: userProfile.email,
+          }),
+        }).catch(() => {});
+      }
       fetch("/api/record-feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1059,9 +1074,10 @@ export default function RoutesPage() {
     } catch (e) {
       console.error("Move stop error:", e);
       setAllRoutes(previousRoutes);
+      if (previousJob) setAllJobs(prev => ({ ...prev, [jobId]: previousJob }));
       toast.error("Failed to move stop");
     }
-  }, [allJobs, allRoutes, calculateRouteMetrics, leftPanelRouteId, rightPanelRouteId, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, calculateRouteMetrics, displayRoutes, leftPanelRouteId, rightPanelRouteId, userProfile?.companyId, userProfile?.email]);
 
   const handleAddPoolJobToRoute = useCallback(async (
     jobId: string,
@@ -1815,7 +1831,7 @@ export default function RoutesPage() {
         const marker = new window.google.maps.Marker({
           position: pos,
           map,
-          draggable: editMode && !clickReorderRouteId && !routeReadOnly,
+          draggable: editMode && !clickReorderRouteId,
           label: {
             text: String(clickOrderRank || idx + 1),
             color: "white",
