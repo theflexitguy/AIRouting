@@ -46,6 +46,7 @@ import { Undo2, Redo2 } from "lucide-react";
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
+const FIELDROUTES_SCHEDULED_ROUTE_PREFIX = "fieldroutes-scheduled:";
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 interface RoadRouteResult {
@@ -67,6 +68,15 @@ function routeDropId(routeId: string) {
 
 function parseRouteDropId(id: string) {
   return id.startsWith(ROUTE_DROP_PREFIX) ? id.slice(ROUTE_DROP_PREFIX.length) : null;
+}
+
+function fieldRoutesScheduledRouteId(date: string, techId: string) {
+  return `${FIELDROUTES_SCHEDULED_ROUTE_PREFIX}${date}:${techId}`;
+}
+
+function isFieldRoutesScheduledRoute(routeOrId: Route | string) {
+  const id = typeof routeOrId === "string" ? routeOrId : routeOrId.id;
+  return id.startsWith(FIELDROUTES_SCHEDULED_ROUTE_PREFIX);
 }
 
 function offsetDateString(dateStr: string, days: number) {
@@ -117,6 +127,14 @@ function assignedTechBlockReason(job: Job, tech: Technician) {
   const assigned = String(job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById || "").trim();
   if (!assigned) return "";
   return jobAssignedToTech(job, tech) ? "" : `assigned to ${assigned}`;
+}
+
+function fieldRoutesScheduledDateForJob(job: Job) {
+  return String(job.fieldRoutesScheduledDate || job.scheduledDate || "").trim();
+}
+
+function isFieldRoutesScheduledJob(job: Job) {
+  return Boolean(job.fieldRoutesScheduled || job.fieldRoutesServicedBy || job.fieldRoutesServicedById);
 }
 
 function weekdaySet(value: string) {
@@ -777,14 +795,7 @@ export default function RoutesPage() {
 
   const { pushEdit, undo, redo, canUndo, canRedo } = useEditHistory();
 
-  // Get unique dates that have routes
-  const routeDates = [...new Set(allRoutes.map((tr) => tr.route.date))].sort();
-  // Routes for selected dates (show all if none specifically selected)
-  const visibleRoutes = selectedDates.length > 0
-    ? allRoutes.filter((tr) => selectedDates.includes(tr.route.date))
-    : allRoutes;
-  const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved);
-  const routedJobIds = useMemo(() => {
+  const actualRoutedJobIds = useMemo(() => {
     const ids = new Set<string>();
     allRoutes.forEach((tr) => tr.route.stopSequence.forEach((jobId) => ids.add(jobId)));
     return ids;
@@ -793,6 +804,96 @@ export default function RoutesPage() {
     () => techs.filter((tech) => selectedTechIds.includes(tech.id)),
     [selectedTechIds, techs],
   );
+  const scheduledFieldRoutes = useMemo<TechRoute[]>(() => {
+    if (!userProfile?.companyId || selectedJobPoolTechs.length === 0) return [];
+    const companyId = userProfile.companyId;
+
+    const groups = new Map<string, { date: string; tech: Technician; jobs: Job[]; color: string }>();
+    Object.values(allJobs).forEach((job) => {
+      if (!isFieldRoutesScheduledJob(job) || actualRoutedJobIds.has(job.id)) return;
+      const routeDate = fieldRoutesScheduledDateForJob(job);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(routeDate)) return;
+      if (routeDate < startDate || routeDate > endDate) return;
+      if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
+
+      const techIndex = selectedJobPoolTechs.findIndex((tech) => jobAssignedToTech(job, tech));
+      if (techIndex < 0) return;
+      const tech = selectedJobPoolTechs[techIndex];
+      const key = `${routeDate}:${tech.id}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          date: routeDate,
+          tech,
+          jobs: [],
+          color: TECH_COLORS[techIndex % TECH_COLORS.length],
+        });
+      }
+      groups.get(key)?.jobs.push(job);
+    });
+
+    return Array.from(groups.values())
+      .sort((a, b) => a.date.localeCompare(b.date) || a.tech.name.localeCompare(b.tech.name))
+      .map((group) => {
+        const jobs = group.jobs.sort((a, b) => {
+          const dueDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
+          if (dueDiff !== 0) return dueDiff;
+          return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
+        });
+        const stopSequence = jobs.map((job) => job.id);
+        const metrics = estimateRouteMetrics(stopSequence, allJobs);
+        return {
+          route: {
+            id: fieldRoutesScheduledRouteId(group.date, group.tech.id),
+            companyId,
+            date: group.date,
+            techId: group.tech.id,
+            stopSequence,
+            totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
+            totalServiceMinutes: getRouteServiceMinutes(stopSequence, allJobs),
+            totalWorkMinutes: metrics.totalWorkMinutes,
+            totalStops: stopSequence.length,
+            driveTimeSource: metrics.driveTimeSource,
+            polylineSource: metrics.polylineSource,
+            encodedPolyline: metrics.encodedPolyline,
+            routePolyline: metrics.routePolyline,
+            polylineStatus: metrics.polylineStatus,
+            failedRouteSegments: metrics.failedRouteSegments,
+            generatedBy: "human",
+            confidence: 1,
+            approved: true,
+            fieldRoutesSync: {
+              routeStatus: "scheduled_csv",
+              routeDate: group.date,
+              assignedTech: group.tech.name,
+              total: stopSequence.length,
+            },
+            createdAt: `${group.date}T00:00:00.000Z`,
+            updatedAt: `${group.date}T00:00:00.000Z`,
+          } as Route,
+          tech: group.tech,
+          jobs,
+          color: group.color,
+          expanded: true,
+        };
+      });
+  }, [actualRoutedJobIds, allJobs, endDate, selectedJobPoolTechs, startDate, userProfile?.companyId]);
+  const displayRoutes = useMemo(
+    () => [...allRoutes, ...scheduledFieldRoutes],
+    [allRoutes, scheduledFieldRoutes],
+  );
+  // Get unique dates that have routes
+  const routeDates = [...new Set(displayRoutes.map((tr) => tr.route.date))].sort();
+  const routeDateKey = routeDates.join("|");
+  // Routes for selected dates (show all if none specifically selected)
+  const visibleRoutes = selectedDates.length > 0
+    ? displayRoutes.filter((tr) => selectedDates.includes(tr.route.date))
+    : displayRoutes;
+  const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved && !isFieldRoutesScheduledRoute(tr.route));
+  const routedJobIds = useMemo(() => {
+    const ids = new Set<string>();
+    displayRoutes.forEach((tr) => tr.route.stopSequence.forEach((jobId) => ids.add(jobId)));
+    return ids;
+  }, [displayRoutes]);
   const jobPoolJobs = useMemo(() => {
     return Object.values(allJobs)
       .filter((job) => {
@@ -819,6 +920,19 @@ export default function RoutesPage() {
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
     return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
   }, [allJobs]);
+
+  useEffect(() => {
+    const dates = routeDateKey ? routeDateKey.split("|") : [];
+    if (dates.length === 0) {
+      setSelectedDates([]);
+      return;
+    }
+    setSelectedDates((prev) => {
+      const stillVisible = prev.filter((date) => dates.includes(date));
+      const next = stillVisible.length > 0 ? stillVisible : dates;
+      return next.length === prev.length && next.every((date, idx) => date === prev[idx]) ? prev : next;
+    });
+  }, [routeDateKey]);
 
   const warnRoadSnapFailure = useCallback((routeId: string, message: string) => {
     if (roadSnapWarningsRef.current.has(routeId)) return;
@@ -1404,13 +1518,21 @@ export default function RoutesPage() {
 
   const loadJobsForRange = useCallback(async (companyId: string) => {
     try {
-      const snap = await getDocs(query(
-        collection(db, `companies/${companyId}/jobs`),
-        where("scheduledDate", ">=", startDate),
-        where("scheduledDate", "<=", endDate),
-      ));
+      const jobsCollection = collection(db, `companies/${companyId}/jobs`);
+      const [dueSnap, fieldRoutesScheduledSnap] = await Promise.all([
+        getDocs(query(
+          jobsCollection,
+          where("scheduledDate", ">=", startDate),
+          where("scheduledDate", "<=", endDate),
+        )),
+        getDocs(query(
+          jobsCollection,
+          where("fieldRoutesScheduledDate", ">=", startDate),
+          where("fieldRoutesScheduledDate", "<=", endDate),
+        )),
+      ]);
       const jobMap: { [id: string]: Job } = {};
-      snap.docs.forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
+      [...dueSnap.docs, ...fieldRoutesScheduledSnap.docs].forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
       setAllJobs(jobMap);
     } catch {
       setAllJobs({});
@@ -1617,6 +1739,7 @@ export default function RoutesPage() {
     let best: { routeId: string; jobId: string; techName: string; distance: number } | null = null;
 
     for (const tr of visibleRoutes) {
+      if (isFieldRoutesScheduledRoute(tr.route)) continue;
       if (tr.route.id === sourceRouteId) continue;
       for (const targetJob of getJobsForRoute(tr)) {
         if (targetJob.id === sourceJobId || targetJob.lat === undefined || targetJob.lng === undefined) continue;
@@ -1655,6 +1778,7 @@ export default function RoutesPage() {
 
     visibleRoutes.forEach((tr) => {
       const color = tr.color;
+      const routeReadOnly = isFieldRoutesScheduledRoute(tr.route);
       const path: google.maps.LatLng[] = [];
       const jobs = getJobsForRoute(tr);
 
@@ -1677,7 +1801,7 @@ export default function RoutesPage() {
         const marker = new window.google.maps.Marker({
           position: pos,
           map,
-          draggable: editMode && !clickReorderRouteId,
+          draggable: editMode && !clickReorderRouteId && !routeReadOnly,
           label: {
             text: String(clickOrderRank || idx + 1),
             color: "white",
@@ -1711,9 +1835,10 @@ export default function RoutesPage() {
             <div><div style="color:#777">Full day</div><div style="font-weight:700">${formatTime(routeStats.workMinutes)}</div></div>
           </div>
           <div style="color:${color};font-weight:700;font-size:12px;margin-top:8px">${escapeHtml(tr.tech.name)} · ${escapeHtml(tr.route.date)}</div>
+          ${routeReadOnly ? `<div style="color:#059669;font-weight:700;font-size:11px;margin-top:4px">Already scheduled in FieldRoutes</div>` : ""}
           <div style="color:#999;font-size:11px;margin-top:5px">L+click = left panel · R+click = right panel</div>
         `;
-        if (editMode) {
+        if (editMode && !routeReadOnly) {
           const removeButton = document.createElement("button");
           removeButton.type = "button";
           removeButton.textContent = "Remove from route";
@@ -1866,6 +1991,7 @@ export default function RoutesPage() {
     });
 
     if (showJobPoolLayer) {
+      const hasEditableRoute = visibleRoutes.some((tr) => !isFieldRoutesScheduledRoute(tr.route));
       jobPoolJobs.forEach((job) => {
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
         const pos = new window.google.maps.LatLng(job.lat, job.lng);
@@ -1875,7 +2001,7 @@ export default function RoutesPage() {
         const marker = new window.google.maps.Marker({
           position: pos,
           map,
-          draggable: visibleRoutes.length > 0 && !clickReorderRouteId,
+          draggable: hasEditableRoute && !clickReorderRouteId,
           icon: {
             path: window.google.maps.SymbolPath.CIRCLE,
             fillColor: "#22d3ee",
@@ -2620,8 +2746,9 @@ export default function RoutesPage() {
 
           {/* LEFT PANEL — shows route assigned via click or L+click */}
           {leftPanelRouteId && (() => {
-            const tr = allRoutes.find(r => r.route.id === leftPanelRouteId);
+            const tr = visibleRoutes.find(r => r.route.id === leftPanelRouteId);
             if (!tr) return null;
+            const routeReadOnly = isFieldRoutesScheduledRoute(tr.route);
             const panelJobs = getJobsForRoute(tr);
             return (
               <div className="w-72 shrink-0 border-r border-border/60 overflow-y-auto bg-background animate-fade-in">
@@ -2640,8 +2767,13 @@ export default function RoutesPage() {
                     <Pencil className="w-2.5 h-2.5" /> Edit mode active
                   </div>
                 )}
+                {routeReadOnly && (
+                  <div className="px-2 py-1.5 bg-emerald-500/10 border-b border-emerald-500/20 text-emerald-300 text-[10px] flex items-center gap-1.5">
+                    <Calendar className="w-2.5 h-2.5" /> Already scheduled in FieldRoutes
+                  </div>
+                )}
                 <RoutePanelStats route={tr.route} jobsById={allJobs} />
-                <DroppableStopList routeId={tr.route.id} enabled={editMode}>
+                <DroppableStopList routeId={tr.route.id} enabled={editMode && !routeReadOnly}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {
                       const clickOrderRank =
@@ -2651,15 +2783,15 @@ export default function RoutesPage() {
                       return (
                         <SortableStop
                           key={job.id} job={job} index={idx} color={tr.color}
-                          dragDisabled={!editMode || clickReorderRouteId === tr.route.id}
+                          dragDisabled={!editMode || routeReadOnly || clickReorderRouteId === tr.route.id}
                           clickOrderActive={clickReorderRouteId === tr.route.id}
                           clickOrderRank={clickOrderRank || undefined}
-                          onClick={clickReorderRouteId === tr.route.id ? () => handleClickOrderPick(tr.route.id, job.id) : undefined}
+                          onClick={!routeReadOnly && clickReorderRouteId === tr.route.id ? () => handleClickOrderPick(tr.route.id, job.id) : undefined}
                           onHoverStart={() => setHoveredStop(job.id)}
                           onHoverEnd={() => setHoveredStop(null)}
-                          onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
-                          moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
-                          onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
+                          onRemove={editMode && !routeReadOnly ? () => handleRemoveStop(tr, job.id) : undefined}
+                          moveTargets={editMode && !routeReadOnly ? visibleRoutes.filter(o => o.route.id !== tr.route.id && !isFieldRoutesScheduledRoute(o.route)).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                          onMoveTo={editMode && !routeReadOnly ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
                         />
                       );
                     })}
@@ -2668,7 +2800,7 @@ export default function RoutesPage() {
                 </DroppableStopList>
                 {/* Route actions */}
                 <div className="p-2 border-t border-border/40 flex flex-wrap gap-1">
-                  {editMode && (
+                  {editMode && !routeReadOnly && (
                     clickReorderRouteId === tr.route.id ? (
                       <>
                         <Button size="sm" className="h-6 text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20" onClick={() => applyClickReorder(tr.route.id)}><CheckCircle className="w-3 h-3" /> Apply ({clickReorderSequence.length}/{tr.route.stopSequence.length})</Button>
@@ -2696,7 +2828,7 @@ export default function RoutesPage() {
                   {tr.route.approved && (tr.route.fieldRoutesSync?.uploadedAppointments?.length || 0) > 0 && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleUndoFieldRoutesStops(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Undo FR Stops</Button>
                   )}
-                  {tr.route.approved && (
+                  {tr.route.approved && !routeReadOnly && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
                   )}
                 </div>
@@ -2755,8 +2887,9 @@ export default function RoutesPage() {
 
           {/* RIGHT PANEL — shows route assigned via R+click */}
           {rightPanelRouteId && (() => {
-            const tr = allRoutes.find(r => r.route.id === rightPanelRouteId);
+            const tr = visibleRoutes.find(r => r.route.id === rightPanelRouteId);
             if (!tr) return null;
+            const routeReadOnly = isFieldRoutesScheduledRoute(tr.route);
             const panelJobs = getJobsForRoute(tr);
             return (
               <div className="w-72 shrink-0 border-l border-border/60 overflow-y-auto bg-background animate-fade-in">
@@ -2775,8 +2908,13 @@ export default function RoutesPage() {
                     <Pencil className="w-2.5 h-2.5" /> Edit mode active
                   </div>
                 )}
+                {routeReadOnly && (
+                  <div className="px-2 py-1.5 bg-emerald-500/10 border-b border-emerald-500/20 text-emerald-300 text-[10px] flex items-center gap-1.5">
+                    <Calendar className="w-2.5 h-2.5" /> Already scheduled in FieldRoutes
+                  </div>
+                )}
                 <RoutePanelStats route={tr.route} jobsById={allJobs} />
-                <DroppableStopList routeId={tr.route.id} enabled={editMode}>
+                <DroppableStopList routeId={tr.route.id} enabled={editMode && !routeReadOnly}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {
                       const clickOrderRank =
@@ -2786,15 +2924,15 @@ export default function RoutesPage() {
                       return (
                         <SortableStop
                           key={job.id} job={job} index={idx} color={tr.color}
-                          dragDisabled={!editMode || clickReorderRouteId === tr.route.id}
+                          dragDisabled={!editMode || routeReadOnly || clickReorderRouteId === tr.route.id}
                           clickOrderActive={clickReorderRouteId === tr.route.id}
                           clickOrderRank={clickOrderRank || undefined}
-                          onClick={clickReorderRouteId === tr.route.id ? () => handleClickOrderPick(tr.route.id, job.id) : undefined}
+                          onClick={!routeReadOnly && clickReorderRouteId === tr.route.id ? () => handleClickOrderPick(tr.route.id, job.id) : undefined}
                           onHoverStart={() => setHoveredStop(job.id)}
                           onHoverEnd={() => setHoveredStop(null)}
-                          onRemove={editMode ? () => handleRemoveStop(tr, job.id) : undefined}
-                          moveTargets={editMode ? visibleRoutes.filter(o => o.route.id !== tr.route.id).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
-                          onMoveTo={editMode ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
+                          onRemove={editMode && !routeReadOnly ? () => handleRemoveStop(tr, job.id) : undefined}
+                          moveTargets={editMode && !routeReadOnly ? visibleRoutes.filter(o => o.route.id !== tr.route.id && !isFieldRoutesScheduledRoute(o.route)).map(o => ({ routeId: o.route.id, techName: o.tech.name, color: o.color, date: o.route.date })) : undefined}
+                          onMoveTo={editMode && !routeReadOnly ? (tid) => handleMoveStop(job.id, tr.route.id, tid) : undefined}
                         />
                       );
                     })}
@@ -2802,7 +2940,7 @@ export default function RoutesPage() {
                   {panelJobs.length === 0 && <p className="text-xs text-muted-foreground/50 text-center py-4">{tr.route.stopSequence.length} stops</p>}
                 </DroppableStopList>
                 <div className="p-2 border-t border-border/40 flex flex-wrap gap-1">
-                  {editMode && (
+                  {editMode && !routeReadOnly && (
                     clickReorderRouteId === tr.route.id ? (
                       <>
                         <Button size="sm" className="h-6 text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/20" onClick={() => applyClickReorder(tr.route.id)}><CheckCircle className="w-3 h-3" /> Apply ({clickReorderSequence.length}/{tr.route.stopSequence.length})</Button>
@@ -2830,7 +2968,7 @@ export default function RoutesPage() {
                   {tr.route.approved && (tr.route.fieldRoutesSync?.uploadedAppointments?.length || 0) > 0 && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleUndoFieldRoutesStops(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Undo FR Stops</Button>
                   )}
-                  {tr.route.approved && (
+                  {tr.route.approved && !routeReadOnly && (
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
                   )}
                 </div>
