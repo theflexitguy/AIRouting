@@ -966,54 +966,68 @@ export default function RoutesPage() {
       newToSeq.push(jobId);
     }
 
+    const shouldDeleteEmptySourceRoute = newFromSeq.length === 0 && !fromRoute.route.approved;
     const [fromMetrics, toMetrics] = await Promise.all([
-      calculateRouteMetrics(newFromSeq, fromRoute.route.date),
+      shouldDeleteEmptySourceRoute
+        ? Promise.resolve<RouteMetricSummary | null>(null)
+        : calculateRouteMetrics(newFromSeq, fromRoute.route.date),
       calculateRouteMetrics(newToSeq, toRoute.route.date),
     ]);
     const previousRoutes = allRoutes;
 
-    setAllRoutes(allRoutes.map(r => {
+    setAllRoutes(allRoutes.flatMap(r => {
       if (r.route.id === fromRouteId) {
-        return {
+        if (shouldDeleteEmptySourceRoute) return [];
+        return [{
           ...r,
           route: applyMetricsToRoute({
             ...r.route,
             stopSequence: newFromSeq,
             generatedBy: "human" as const,
-          }, fromMetrics),
-        };
+          }, fromMetrics as RouteMetricSummary),
+        }];
       }
       if (r.route.id === toRouteId) {
-        return {
+        return [{
           ...r,
           route: applyMetricsToRoute({
             ...r.route,
             stopSequence: newToSeq,
             generatedBy: "human" as const,
           }, toMetrics),
-        };
+        }];
       }
-      return r;
+      return [r];
     }));
+    if (shouldDeleteEmptySourceRoute) {
+      if (leftPanelRouteId === fromRouteId) setLeftPanelRouteId(null);
+      if (rightPanelRouteId === fromRouteId) setRightPanelRouteId(null);
+    }
 
     try {
       const batch = writeBatch(db);
-      batch.update(doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId), {
-        stopSequence: newFromSeq,
-        ...routeMetricUpdateFields(fromMetrics),
-        generatedBy: "human",
-        updatedAt: new Date().toISOString(),
-      });
+      const now = new Date().toISOString();
+      const fromRouteRef = doc(db, `companies/${userProfile.companyId}/routes`, fromRouteId);
+      if (shouldDeleteEmptySourceRoute) {
+        batch.delete(fromRouteRef);
+      } else {
+        batch.update(fromRouteRef, {
+          stopSequence: newFromSeq,
+          ...routeMetricUpdateFields(fromMetrics as RouteMetricSummary),
+          generatedBy: "human",
+          updatedAt: now,
+        });
+      }
       batch.update(doc(db, `companies/${userProfile.companyId}/routes`, toRouteId), {
         stopSequence: newToSeq,
         ...routeMetricUpdateFields(toMetrics),
         generatedBy: "human",
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
       });
       batch.update(doc(db, `companies/${userProfile.companyId}/jobs`, jobId), {
         assignedTechId: toRoute.tech.id,
         status: "scheduled",
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
       });
       await batch.commit();
 
@@ -1047,7 +1061,7 @@ export default function RoutesPage() {
       setAllRoutes(previousRoutes);
       toast.error("Failed to move stop");
     }
-  }, [allJobs, allRoutes, calculateRouteMetrics, userProfile?.companyId, userProfile?.email]);
+  }, [allJobs, allRoutes, calculateRouteMetrics, leftPanelRouteId, rightPanelRouteId, userProfile?.companyId, userProfile?.email]);
 
   const handleAddPoolJobToRoute = useCallback(async (
     jobId: string,
