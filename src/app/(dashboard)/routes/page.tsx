@@ -11,7 +11,7 @@ import { formatTime, cn } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
-  Clock, AlertTriangle, Calendar,
+  Clock, AlertTriangle, Calendar, RefreshCw,
   Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick, DollarSign, Layers
 } from "lucide-react";
 import { format, addDays } from "date-fns";
@@ -746,6 +746,9 @@ export default function RoutesPage() {
   const [generating, setGenerating] = useState(false);
   const [genStage, setGenStage] = useState("");
   const [genResult, setGenResult] = useState<string | null>(null);
+  const [genError, setGenError] = useState<string | null>(null);
+  const [isRunConflict, setIsRunConflict] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [approving, setApproving] = useState<string | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
@@ -2125,6 +2128,8 @@ export default function RoutesPage() {
     if (!userProfile?.companyId) return;
     setGenerating(true);
     setGenResult(null);
+    setGenError(null);
+    setIsRunConflict(false);
     setGenStage("Fetching jobs and technicians...");
 
     // Progress stages on a timer to show activity
@@ -2165,7 +2170,15 @@ export default function RoutesPage() {
         warnings.forEach((w: string) => toast.warning(w, { duration: 8000 }));
         await loadJobsForRange(userProfile.companyId);
       } else {
-        toast.error(data.error || "Route generation failed");
+        const errorText = data.error || "Route generation failed";
+        const conflict = res.status === 409 || errorText.includes("in progress");
+        setIsRunConflict(conflict);
+        setGenError(
+          conflict
+            ? "A previous route generation is still running or got stuck. Reset it below, then try again."
+            : errorText
+        );
+        toast.error(conflict ? "Route generation blocked — another run in progress" : errorText);
         setGenResult(null);
       }
     } catch (e) {
@@ -2174,6 +2187,30 @@ export default function RoutesPage() {
       toast.error("Failed to generate routes. Check connection.");
     } finally {
       setTimeout(() => { setGenerating(false); setGenStage(""); }, 1500);
+    }
+  };
+
+  const resetRouting = async () => {
+    if (!userProfile?.companyId) return;
+    setResetting(true);
+    try {
+      const res = await fetch("/api/reset-routing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companyId: userProfile.companyId }),
+      });
+      if (res.ok) {
+        setGenError(null);
+        setIsRunConflict(false);
+        toast.success("Routing engine reset. You can generate routes now.");
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error || "Reset failed");
+      }
+    } catch {
+      toast.error("Could not reach the routing engine.");
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -2703,6 +2740,32 @@ export default function RoutesPage() {
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
               {jobPoolJobs.length} jobs shown
             </span>
+          </div>
+        )}
+
+        {/* Run-in-progress conflict banner */}
+        {genError && (
+          <div className="px-4 py-3 border-b border-red-500/20 bg-red-500/8 flex items-center gap-3 no-print animate-scale-in">
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+            <p className="text-sm text-red-400 flex-1">{genError}</p>
+            {isRunConflict && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="text-red-400 border-red-500/30 hover:bg-red-500/10 h-8 text-xs shrink-0"
+                onClick={resetRouting}
+                disabled={resetting}
+              >
+                {resetting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                Reset Engine
+              </Button>
+            )}
+            <button
+              className="text-red-400/60 hover:text-red-400 transition-colors"
+              onClick={() => { setGenError(null); setIsRunConflict(false); }}
+            >
+              <XCircle className="w-4 h-4" />
+            </button>
           </div>
         )}
 

@@ -1,19 +1,21 @@
 /** @type {import('next').NextConfig} */
+import { dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
 const nextConfig = {
   output: 'standalone',
   reactStrictMode: true,
-  eslint: {
-    // Lint errors don't block production builds — fix in CI separately
-    ignoreDuringBuilds: true,
-  },
   typescript: {
     ignoreBuildErrors: true,
   },
   images: {
     domains: ['lh3.googleusercontent.com', 'firebasestorage.googleapis.com'],
   },
-  experimental: {
-    serverComponentsExternalPackages: ['firebase-admin'],
+  serverExternalPackages: ['firebase-admin'],
+  turbopack: {
+    root: __dirname,
   },
 };
 
