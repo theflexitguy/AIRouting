@@ -1364,16 +1364,6 @@ export async function POST(request: NextRequest) {
         ? Math.min(600, Math.floor(rawMaxDriveTime as number))
         : DEFAULT_MAX_DRIVE_MINUTES;
 
-    if (!BACKEND_URL) {
-      return NextResponse.json(
-        {
-          error:
-            "Routing backend not configured. Set BACKEND_URL and run the Python service.",
-        },
-        { status: 503 },
-      );
-    }
-
     const db = adminDb();
 
     // --- Generation lock: one active generation per company, with stale cleanup. ---
@@ -1736,7 +1726,7 @@ export async function POST(request: NextRequest) {
           jobsRequested: jobsToRoute.length,
         },
       };
-    } else {
+    } else if (BACKEND_URL) {
       const backendRes = await fetch(`${BACKEND_URL}/routeiq/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1773,6 +1763,12 @@ export async function POST(request: NextRequest) {
       } else {
         result = (await backendRes.json()) as typeof result;
       }
+    } else {
+      await lockRef!.delete().catch(() => {});
+      return NextResponse.json(
+        { success: false, error: "Routing backend not configured and custom routing is disabled." },
+        { status: 503 },
+      );
     }
 
     const routes = result.routes || [];
