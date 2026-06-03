@@ -25,7 +25,7 @@ const JOB_CAP = 500;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
 const TUESDAY_STOP_REDUCTION = 3;
-const GENERATION_LOCK_STALE_MS = 20 * 60 * 1000;
+const GENERATION_LOCK_STALE_MS = 5 * 60 * 1000;
 const DRIVE_CAP_SLACK_MINUTES = 3;
 
 function _dateOffset(dateStr: string, days: number): string {
@@ -1326,6 +1326,7 @@ export async function POST(request: NextRequest) {
       maxDriveTime: rawMaxDriveTime,
       requestedBy,
       runSettings,
+      force,
     } = body as {
       companyId: string;
       startDate?: string;
@@ -1336,6 +1337,7 @@ export async function POST(request: NextRequest) {
       maxDriveTime?: number;
       requestedBy?: string;
       runSettings?: Record<string, unknown>;
+      force?: boolean;
     };
 
     if (!companyId) {
@@ -1372,7 +1374,8 @@ export async function POST(request: NextRequest) {
     if (lockSnap.exists) {
       const lockData = lockSnap.data();
       const lockTime = new Date(lockData?.startedAt || 0).getTime();
-      if (Number.isFinite(lockTime) && Date.now() - lockTime < GENERATION_LOCK_STALE_MS) {
+      const isStale = !Number.isFinite(lockTime) || Date.now() - lockTime >= GENERATION_LOCK_STALE_MS;
+      if (!isStale && !force) {
         return NextResponse.json(
           {
             error: "Another route generation is in progress for this company. Please wait and try again.",
@@ -1384,6 +1387,9 @@ export async function POST(request: NextRequest) {
       }
       await lockRef.delete();
     }
+    // Set lockAcquired BEFORE .set() so that if .set() throws after writing
+    // to Firestore, the finally block still attempts cleanup.
+    lockAcquired = true;
     await lockRef.set({
       startedAt: new Date().toISOString(),
       companyId,
@@ -1392,7 +1398,6 @@ export async function POST(request: NextRequest) {
       rangeEnd,
       techIds: Array.isArray(techIds) ? techIds : [],
     });
-    lockAcquired = true;
 
     // --- 1. Fetch selected technicians ---
     const techDocs = await db

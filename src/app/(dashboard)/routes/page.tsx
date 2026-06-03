@@ -2158,6 +2158,7 @@ export default function RoutesPage() {
           maxStops,
           maxDriveTime,
           requestedBy: userProfile.email,
+          force: isRunConflict,
         }),
       });
       timers.forEach(clearTimeout);
@@ -2199,16 +2200,17 @@ export default function RoutesPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ companyId: userProfile.companyId }),
       });
-      if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
         setGenError(null);
         setIsRunConflict(false);
         toast.success("Routing engine reset. You can generate routes now.");
       } else {
-        const data = await res.json().catch(() => ({}));
-        toast.error(data.error || "Reset failed");
+        const detail = data.firestoreLock || data.error || "Reset failed";
+        toast.error(`Reset problem: ${detail}. Try clicking Generate Routes — it will force through.`);
       }
     } catch {
-      toast.error("Could not reach the routing engine.");
+      toast.error("Could not reach the server. Try clicking Generate Routes — it will force through.");
     } finally {
       setResetting(false);
     }
