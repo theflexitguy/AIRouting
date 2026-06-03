@@ -1412,6 +1412,7 @@ export async function POST(request: NextRequest) {
     console.log(`[generate-routes] Lock acquired`);
 
     // --- 1. Fetch selected technicians ---
+    console.log(`[generate-routes] STEP 1: Fetching technicians`);
     const techDocs = await db
       .collection(`companies/${companyId}/technicians`)
       .where("active", "==", true)
@@ -1421,6 +1422,7 @@ export async function POST(request: NextRequest) {
       techIds && techIds.length > 0
         ? allTechs.filter((t) => techIds.includes(t.id))
         : allTechs;
+    console.log(`[generate-routes] STEP 1 DONE: ${allTechs.length} total, ${selectedTechs.length} selected`);
 
     if (selectedTechs.length === 0) {
       await lockRef.delete().catch(() => {});
@@ -1431,6 +1433,7 @@ export async function POST(request: NextRequest) {
     }
 
     // --- 2. Stage existing unapproved routes in this range for selected techs ---
+    console.log(`[generate-routes] STEP 2: Staging existing routes`);
     const selectedTechIdSet = new Set(selectedTechs.map((t) => t.id));
     const releasedJobIds = new Set<string>();
     const generatedAssignmentByJobId = new Map<
@@ -1464,8 +1467,10 @@ export async function POST(request: NextRequest) {
       });
     }
     const replacedRouteCount = routeDocsToReplace.length;
+    console.log(`[generate-routes] STEP 2 DONE: ${replacedRouteCount} routes to replace, ${releasedJobIds.size} released jobs`);
 
     // --- 3. Fetch pending jobs for selected techs ---
+    console.log(`[generate-routes] STEP 3: Fetching pending jobs`);
     const isGeneratedRouteAssignment = (d: JobDoc) => {
       const generated = generatedAssignmentByJobId.get(d.docId);
       if (!generated) return false;
@@ -1517,6 +1522,7 @@ export async function POST(request: NextRequest) {
     }
 
     const allJobDocs = Array.from(jobDocMap.values());
+    console.log(`[generate-routes] STEP 3 DONE: ${allJobDocs.length} job docs, ${releasedJobDocMap.size} released job docs`);
 
     if (allJobDocs.length === 0) {
       await lockRef.delete().catch(() => {});
@@ -1718,6 +1724,7 @@ export async function POST(request: NextRequest) {
 
     const shouldUseCustomRouting = true;
     if (shouldUseCustomRouting) {
+      console.log(`[generate-routes] STEP 6: buildFastFallbackRoutes starting (${jobsToRoute.length} jobs, ${selectedTechs.length} techs, ${dates.length} dates)`);
       const fastResult = await buildFastFallbackRoutes({
         jobsToRoute,
         selectedTechs,
@@ -1743,6 +1750,7 @@ export async function POST(request: NextRequest) {
           jobsRequested: jobsToRoute.length,
         },
       };
+      console.log(`[generate-routes] STEP 6 DONE: ${fastResult.routes.length} routes built`);
     } else if (BACKEND_URL) {
       const backendRes = await fetch(`${BACKEND_URL}/routeiq/generate`, {
         method: "POST",
@@ -1877,6 +1885,7 @@ export async function POST(request: NextRequest) {
     }
 
     // --- 7. Save routes + mark jobs scheduled ---
+    console.log(`[generate-routes] STEP 7: Saving ${routes.length} routes to Firestore`);
     const now = new Date().toISOString();
     const scheduledJobIds = new Set<string>();
     const routeWrites: Array<{
@@ -1994,11 +2003,12 @@ export async function POST(request: NextRequest) {
 
     for (const jobId of Array.from(releasedJobIds)) {
       if (scheduledJobIds.has(jobId)) continue;
-      const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       const releasedJobDoc = releasedJobDocMap.get(jobId);
+      if (!releasedJobDoc) continue;
+      const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       batch.update(jobRef, {
-        status: releasedJobDoc && isFieldRoutesScheduledJob(releasedJobDoc) ? "scheduled" : "pending",
-        ...(releasedJobDoc && isGeneratedRouteAssignment(releasedJobDoc) && !isFieldRoutesScheduledJob(releasedJobDoc)
+        status: isFieldRoutesScheduledJob(releasedJobDoc) ? "scheduled" : "pending",
+        ...(isGeneratedRouteAssignment(releasedJobDoc) && !isFieldRoutesScheduledJob(releasedJobDoc)
           ? { assignedTechId: "" }
           : {}),
         updatedAt: now,
@@ -2012,6 +2022,7 @@ export async function POST(request: NextRequest) {
     }
 
     for (const jobId of Array.from(scheduledJobIds)) {
+      if (!jobDocMap.has(jobId) && !releasedJobDocMap.has(jobId)) continue;
       const jobRef = db.doc(`companies/${companyId}/jobs/${jobId}`);
       batch.update(jobRef, {
         status: "scheduled",
