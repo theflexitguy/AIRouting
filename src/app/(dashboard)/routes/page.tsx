@@ -1703,10 +1703,16 @@ export default function RoutesPage() {
       return;
     }
     if (window.google?.maps) { setMapLoaded(true); return; }
+
+    // Use the recommended async loading to avoid console warnings and key exposure
+    const callback = `__gmapsInit_${Date.now()}`;
+    (window as Record<string, unknown>)[callback] = () => {
+      setMapLoaded(true);
+      delete (window as Record<string, unknown>)[callback];
+    };
     const script = document.createElement("script");
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=geometry`;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=geometry&loading=async&callback=${callback}`;
     script.async = true;
-    script.onload = () => setMapLoaded(true);
     script.onerror = () => setMapError(true);
     document.head.appendChild(script);
   }, []);
@@ -2162,7 +2168,10 @@ export default function RoutesPage() {
         }),
       });
       timers.forEach(clearTimeout);
-      const data = await res.json();
+      const rawText = await res.text();
+      let data: Record<string, unknown> = {};
+      try { data = JSON.parse(rawText); } catch { data = { _raw: rawText.slice(0, 500) }; }
+      console.log(`[generate-routes] status=${res.status} response=`, data);
       if (data.success) {
         setGenStage(`Done! ${data.routeCount} routes with ${data.stopCount} stops`);
         toast.success(`Generated ${data.routeCount} routes with ${data.stopCount} stops`);
@@ -2171,7 +2180,7 @@ export default function RoutesPage() {
         warnings.forEach((w: string) => toast.warning(w, { duration: 8000 }));
         await loadJobsForRange(userProfile.companyId);
       } else {
-        const errorText = data.error || "Route generation failed";
+        const errorText = String(data.error || "Route generation failed");
         const conflict = res.status === 409 || errorText.includes("in progress");
         const lockAge = data.lockAgeSeconds ? ` (lock age: ${data.lockAgeSeconds}s)` : "";
         const requestedBy = data.requestedBy ? ` (started by: ${data.requestedBy})` : "";
@@ -2179,15 +2188,16 @@ export default function RoutesPage() {
         setGenError(
           conflict
             ? `Route generation blocked — another run in progress${lockAge}${requestedBy}. Click Generate Routes again to force through.`
-            : errorText
+            : `[${res.status}] ${errorText}`
         );
         toast.error(conflict ? `Blocked by active lock${lockAge}` : errorText);
-        console.error("[generate-routes] Response:", JSON.stringify(data));
         setGenResult(null);
       }
     } catch (e) {
       timers.forEach(clearTimeout);
-      console.error("Generate routes error:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("Generate routes error:", msg);
+      setGenError(`Network error: ${msg}`);
       toast.error("Failed to generate routes. Check connection.");
     } finally {
       setTimeout(() => { setGenerating(false); setGenStage(""); }, 1500);
