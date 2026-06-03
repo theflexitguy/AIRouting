@@ -2083,11 +2083,13 @@ export async function POST(request: NextRequest) {
       await lockRef.delete().catch((e) => console.error(`[generate-routes] Failed to delete lock in catch:`, e));
     }
 
+    const errorMessage = error instanceof Error ? error.message : "Failed to generate routes";
+    const errorStack = error instanceof Error ? error.stack?.split("\n").slice(0, 5).join("\n") : undefined;
     return NextResponse.json(
       {
         success: false,
-        error:
-          error instanceof Error ? error.message : "Failed to generate routes",
+        error: errorMessage,
+        debugStack: errorStack,
       },
       { status: 500 },
     );

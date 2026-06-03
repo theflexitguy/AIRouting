@@ -2171,7 +2171,8 @@ export default function RoutesPage() {
       const rawText = await res.text();
       let data: Record<string, unknown> = {};
       try { data = JSON.parse(rawText); } catch { data = { _raw: rawText.slice(0, 500) }; }
-      console.log(`[generate-routes] status=${res.status} response=`, data);
+      console.log(`[generate-routes] status=${res.status}`, data);
+      if (!res.ok && data.debugStack) console.error(`[generate-routes] server stack:\n${data.debugStack}`);
       if (data.success) {
         setGenStage(`Done! ${data.routeCount} routes with ${data.stopCount} stops`);
         toast.success(`Generated ${data.routeCount} routes with ${data.stopCount} stops`);
