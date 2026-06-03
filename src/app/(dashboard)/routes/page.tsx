@@ -2173,13 +2173,16 @@ export default function RoutesPage() {
       } else {
         const errorText = data.error || "Route generation failed";
         const conflict = res.status === 409 || errorText.includes("in progress");
+        const lockAge = data.lockAgeSeconds ? ` (lock age: ${data.lockAgeSeconds}s)` : "";
+        const requestedBy = data.requestedBy ? ` (started by: ${data.requestedBy})` : "";
         setIsRunConflict(conflict);
         setGenError(
           conflict
-            ? "A previous route generation is still running or got stuck. Reset it below, then try again."
+            ? `Route generation blocked — another run in progress${lockAge}${requestedBy}. Click Generate Routes again to force through.`
             : errorText
         );
-        toast.error(conflict ? "Route generation blocked — another run in progress" : errorText);
+        toast.error(conflict ? `Blocked by active lock${lockAge}` : errorText);
+        console.error("[generate-routes] Response:", JSON.stringify(data));
         setGenResult(null);
       }
     } catch (e) {

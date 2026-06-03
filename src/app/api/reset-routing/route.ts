@@ -11,22 +11,40 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
   const { companyId } = body as { companyId?: string };
 
+  console.log(`[reset-routing] START companyId=${companyId || "MISSING"}`);
+
   if (!companyId) {
+    console.log(`[reset-routing] ERROR: no companyId`);
     return NextResponse.json(
       { success: false, error: "companyId is required" },
       { status: 400 },
     );
   }
 
-  const results: { firestoreLock?: string; backend?: string } = {};
+  const results: { firestoreLock?: string; lockData?: unknown; backend?: string } = {};
   let hasError = false;
 
   try {
     const db = adminDb();
-    await db.doc(`routeGeneration/${companyId}`).delete();
-    results.firestoreLock = "cleared";
+    console.log(`[reset-routing] Firebase Admin initialized OK`);
+
+    const lockRef = db.doc(`routeGeneration/${companyId}`);
+    const lockSnap = await lockRef.get();
+    if (lockSnap.exists) {
+      const lockData = lockSnap.data();
+      console.log(`[reset-routing] Lock found:`, JSON.stringify(lockData));
+      results.lockData = lockData;
+      await lockRef.delete();
+      console.log(`[reset-routing] Lock deleted`);
+      results.firestoreLock = "cleared";
+    } else {
+      console.log(`[reset-routing] No lock document found`);
+      results.firestoreLock = "no lock found";
+    }
   } catch (err) {
-    results.firestoreLock = `failed: ${err instanceof Error ? err.message : "unknown error"}`;
+    const msg = err instanceof Error ? err.message : "unknown error";
+    console.error(`[reset-routing] Firestore error:`, err);
+    results.firestoreLock = `failed: ${msg}`;
     hasError = true;
   }
 
@@ -42,6 +60,7 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  console.log(`[reset-routing] DONE success=${!hasError}`, JSON.stringify(results));
   return NextResponse.json(
     { success: !hasError, ...results },
     { status: hasError ? 502 : 200 },

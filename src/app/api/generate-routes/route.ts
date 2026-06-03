@@ -1366,6 +1366,8 @@ export async function POST(request: NextRequest) {
         ? Math.min(600, Math.floor(rawMaxDriveTime as number))
         : DEFAULT_MAX_DRIVE_MINUTES;
 
+    console.log(`[generate-routes] START companyId=${companyId} range=${rangeStart}..${rangeEnd} force=${!!force} techIds=${techIds?.length ?? "all"}`);
+
     const db = adminDb();
 
     // --- Generation lock: one active generation per company, with stale cleanup. ---
@@ -1374,18 +1376,27 @@ export async function POST(request: NextRequest) {
     if (lockSnap.exists) {
       const lockData = lockSnap.data();
       const lockTime = new Date(lockData?.startedAt || 0).getTime();
-      const isStale = !Number.isFinite(lockTime) || Date.now() - lockTime >= GENERATION_LOCK_STALE_MS;
+      const lockAgeMs = Date.now() - lockTime;
+      const isStale = !Number.isFinite(lockTime) || lockAgeMs >= GENERATION_LOCK_STALE_MS;
+      console.log(`[generate-routes] LOCK EXISTS startedAt=${lockData?.startedAt} age=${Math.round(lockAgeMs / 1000)}s isStale=${isStale} force=${!!force} requestedBy=${lockData?.requestedBy}`);
       if (!isStale && !force) {
+        console.log(`[generate-routes] BLOCKED by active lock`);
         return NextResponse.json(
           {
             error: "Another route generation is in progress for this company. Please wait and try again.",
             startedAt: lockData?.startedAt || null,
             requestedBy: lockData?.requestedBy || null,
+            lockAgeSeconds: Math.round(lockAgeMs / 1000),
+            staleLimitSeconds: GENERATION_LOCK_STALE_MS / 1000,
+            hint: "Click Generate Routes again to force through, or wait for the lock to expire.",
           },
           { status: 409 },
         );
       }
+      console.log(`[generate-routes] Deleting stale/forced lock`);
       await lockRef.delete();
+    } else {
+      console.log(`[generate-routes] No existing lock`);
     }
     // Set lockAcquired BEFORE .set() so that if .set() throws after writing
     // to Firestore, the finally block still attempts cleanup.
@@ -1398,6 +1409,7 @@ export async function POST(request: NextRequest) {
       rangeEnd,
       techIds: Array.isArray(techIds) ? techIds : [],
     });
+    console.log(`[generate-routes] Lock acquired`);
 
     // --- 1. Fetch selected technicians ---
     const techDocs = await db
@@ -2065,9 +2077,12 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
-    if (lockAcquired && lockRef) await lockRef.delete().catch(() => {});
+    console.error(`[generate-routes] ERROR lockAcquired=${lockAcquired}:`, error);
+    if (lockAcquired && lockRef) {
+      console.log(`[generate-routes] Deleting lock in catch block`);
+      await lockRef.delete().catch((e) => console.error(`[generate-routes] Failed to delete lock in catch:`, e));
+    }
 
-    console.error("Generate routes API error:", error);
     return NextResponse.json(
       {
         success: false,
@@ -2077,6 +2092,9 @@ export async function POST(request: NextRequest) {
       { status: 500 },
     );
   } finally {
-    if (lockAcquired && lockRef) await lockRef.delete().catch(() => {});
+    if (lockAcquired && lockRef) {
+      console.log(`[generate-routes] Deleting lock in finally block`);
+      await lockRef.delete().catch((e) => console.error(`[generate-routes] Failed to delete lock in finally:`, e));
+    }
   }
 }
