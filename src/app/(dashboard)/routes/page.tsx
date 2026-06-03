@@ -801,7 +801,7 @@ export default function RoutesPage() {
 
   const actualRoutedJobIds = useMemo(() => {
     const ids = new Set<string>();
-    allRoutes.forEach((tr) => tr.route.stopSequence.forEach((jobId) => ids.add(jobId)));
+    allRoutes.forEach((tr) => (tr.route.stopSequence || []).forEach((jobId) => ids.add(jobId)));
     return ids;
   }, [allRoutes]);
   const selectedJobPoolTechs = useMemo(
@@ -895,7 +895,7 @@ export default function RoutesPage() {
   const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved && !isFieldRoutesScheduledRoute(tr.route));
   const routedJobIds = useMemo(() => {
     const ids = new Set<string>();
-    displayRoutes.forEach((tr) => tr.route.stopSequence.forEach((jobId) => ids.add(jobId)));
+    displayRoutes.forEach((tr) => (tr.route.stopSequence || []).forEach((jobId) => ids.add(jobId)));
     return ids;
   }, [displayRoutes]);
   const jobPoolJobs = useMemo(() => {
@@ -922,7 +922,7 @@ export default function RoutesPage() {
   }, [allJobs, jobPoolDueEnd, jobPoolDueStart, routedJobIds, selectedJobPoolTechs]);
 
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
-    return tr.route.stopSequence.map(id => allJobs[id]).filter(Boolean) as Job[];
+    return (tr.route.stopSequence || []).map(id => allJobs[id]).filter(Boolean) as Job[];
   }, [allJobs]);
 
   useEffect(() => {
@@ -1101,7 +1101,7 @@ export default function RoutesPage() {
     const job = allJobs[jobId];
     const toRoute = allRoutes.find(r => r.route.id === toRouteId);
     if (!job || !toRoute) return;
-    if (toRoute.route.stopSequence.includes(jobId)) return;
+    if ((toRoute.route.stopSequence || []).includes(jobId)) return;
 
     const assignedBlock = !allowCrossTechRouteEdits ? assignedTechBlockReason(job, toRoute.tech) : "";
     if (assignedBlock) {
@@ -1142,7 +1142,7 @@ export default function RoutesPage() {
       });
     const bundleJobIds = bundleJobs.map((candidate) => candidate.id);
 
-    const oldSeq = toRoute.route.stopSequence;
+    const oldSeq = toRoute.route.stopSequence || [];
     const newSeq = oldSeq.filter(id => !bundleJobIds.includes(id));
     const insertAfterIndex = insertAfterJobId ? newSeq.indexOf(insertAfterJobId) : -1;
     if (insertAfterIndex >= 0) {
@@ -1240,7 +1240,7 @@ export default function RoutesPage() {
     }
 
     const job = allJobs[jobId];
-    const oldSeq = tr.route.stopSequence;
+    const oldSeq = tr.route.stopSequence || [];
     if (!oldSeq.includes(jobId)) return;
 
     const newSeq = oldSeq.filter(id => id !== jobId);
@@ -1322,13 +1322,13 @@ export default function RoutesPage() {
 
     const activeId = String(active.id);
     const overId = String(over.id);
-    const sourceRoute = allRoutes.find(r => r.route.stopSequence.includes(activeId));
+    const sourceRoute = allRoutes.find(r => (r.route.stopSequence || []).includes(activeId));
     if (!sourceRoute) return;
 
     const droppedRouteId = parseRouteDropId(overId);
     const targetRoute = droppedRouteId
       ? allRoutes.find(r => r.route.id === droppedRouteId)
-      : allRoutes.find(r => r.route.stopSequence.includes(overId));
+      : allRoutes.find(r => (r.route.stopSequence || []).includes(overId));
     if (!targetRoute) return;
 
     if (sourceRoute.route.id !== targetRoute.route.id) {
@@ -1414,7 +1414,7 @@ export default function RoutesPage() {
     const tr = allRoutes.find((route) => route.route.id === routeId);
     if (!tr) return;
 
-    const oldSeq = tr.route.stopSequence;
+    const oldSeq = tr.route.stopSequence || [];
     const picked = pickedSequence.filter(
       (jobId, index) =>
         oldSeq.includes(jobId) && pickedSequence.indexOf(jobId) === index,
@@ -1484,7 +1484,7 @@ export default function RoutesPage() {
   const handleClickOrderPick = useCallback((routeId: string, jobId: string) => {
     if (clickReorderRouteId !== routeId) return;
     const tr = allRoutes.find((route) => route.route.id === routeId);
-    if (!tr || !tr.route.stopSequence.includes(jobId)) return;
+    if (!tr || !(tr.route.stopSequence || []).includes(jobId)) return;
 
     const alreadyPicked = clickReorderSequence.includes(jobId);
     const next = alreadyPicked
@@ -1659,8 +1659,8 @@ export default function RoutesPage() {
 
       let colorIdx = 0;
       const routes = snap.docs.map((d) => {
-        const route = { id: d.id, ...d.data() } as Route;
         const routeData = d.data();
+        const route = { id: d.id, ...routeData, stopSequence: Array.isArray(routeData.stopSequence) ? routeData.stopSequence : [] } as Route;
         const tech = techMap[route.techId] || {
           id: route.techId, name: routeData.techName || route.techId,
           employeeId: "", active: true, maxStopsPerDay: 20, companyId: userProfile.companyId!,
@@ -2176,8 +2176,8 @@ export default function RoutesPage() {
         setGenStage(`Done! ${data.routeCount} routes with ${data.stopCount} stops`);
         toast.success(`Generated ${data.routeCount} routes with ${data.stopCount} stops`);
         setGenResult(null);
-        const warnings = data.warnings as string[] || [];
-        warnings.forEach((w: string) => toast.warning(w, { duration: 8000 }));
+        const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+        warnings.forEach((w) => toast.warning(String(w), { duration: 8000 }));
         await loadJobsForRange(userProfile.companyId);
       } else {
         const errorText = String(data.error || "Route generation failed");
