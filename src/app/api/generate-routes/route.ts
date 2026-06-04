@@ -77,7 +77,7 @@ function jobAssignedToTech(
   ]
     .map((value) => String(value || "").trim())
     .filter(Boolean);
-  if (assignedValues.length === 0) return false;
+  if (assignedValues.length === 0) return true;
 
   const tokens = techMatchTokens(tech);
   return assignedValues.some((assigned) => {
