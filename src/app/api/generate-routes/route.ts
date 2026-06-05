@@ -25,7 +25,6 @@ const JOB_CAP = 500;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
 const TUESDAY_STOP_REDUCTION = 3;
-const GENERATION_LOCK_STALE_MS = 5 * 60 * 1000;
 const DRIVE_CAP_SLACK_MINUTES = 3;
 
 function _dateOffset(dateStr: string, days: number): string {
@@ -1326,7 +1325,6 @@ export async function POST(request: NextRequest) {
       maxDriveTime: rawMaxDriveTime,
       requestedBy,
       runSettings,
-      force,
     } = body as {
       companyId: string;
       startDate?: string;
@@ -1337,7 +1335,6 @@ export async function POST(request: NextRequest) {
       maxDriveTime?: number;
       requestedBy?: string;
       runSettings?: Record<string, unknown>;
-      force?: boolean;
     };
 
     if (!companyId) {
@@ -1366,40 +1363,18 @@ export async function POST(request: NextRequest) {
         ? Math.min(600, Math.floor(rawMaxDriveTime as number))
         : DEFAULT_MAX_DRIVE_MINUTES;
 
-    console.log(`[generate-routes] START companyId=${companyId} range=${rangeStart}..${rangeEnd} force=${!!force} techIds=${techIds?.length ?? "all"}`);
+    console.log(`[generate-routes] START companyId=${companyId} range=${rangeStart}..${rangeEnd} techIds=${techIds?.length ?? "all"}`);
 
     const db = adminDb();
 
-    // --- Generation lock: one active generation per company, with stale cleanup. ---
+    // --- Generation lock: always take over from any previous run. ---
     lockRef = db.doc(`routeGeneration/${companyId}`);
     const lockSnap = await lockRef.get();
     if (lockSnap.exists) {
       const lockData = lockSnap.data();
-      const lockTime = new Date(lockData?.startedAt || 0).getTime();
-      const lockAgeMs = Date.now() - lockTime;
-      const isStale = !Number.isFinite(lockTime) || lockAgeMs >= GENERATION_LOCK_STALE_MS;
-      console.log(`[generate-routes] LOCK EXISTS startedAt=${lockData?.startedAt} age=${Math.round(lockAgeMs / 1000)}s isStale=${isStale} force=${!!force} requestedBy=${lockData?.requestedBy}`);
-      if (!isStale && !force) {
-        console.log(`[generate-routes] BLOCKED by active lock`);
-        return NextResponse.json(
-          {
-            error: "Another route generation is in progress for this company. Please wait and try again.",
-            startedAt: lockData?.startedAt || null,
-            requestedBy: lockData?.requestedBy || null,
-            lockAgeSeconds: Math.round(lockAgeMs / 1000),
-            staleLimitSeconds: GENERATION_LOCK_STALE_MS / 1000,
-            hint: "Click Generate Routes again to force through, or wait for the lock to expire.",
-          },
-          { status: 409 },
-        );
-      }
-      console.log(`[generate-routes] Deleting stale/forced lock`);
+      console.log(`[generate-routes] Replacing existing lock startedAt=${lockData?.startedAt} requestedBy=${lockData?.requestedBy}`);
       await lockRef.delete();
-    } else {
-      console.log(`[generate-routes] No existing lock`);
     }
-    // Set lockAcquired BEFORE .set() so that if .set() throws after writing
-    // to Firestore, the finally block still attempts cleanup.
     lockAcquired = true;
     await lockRef.set({
       startedAt: new Date().toISOString(),
