@@ -748,6 +748,7 @@ export default function RoutesPage() {
   const [genResult, setGenResult] = useState<string | null>(null);
   const [genError, setGenError] = useState<string | null>(null);
   const [approving, setApproving] = useState<string | null>(null);
+  const [geocodingStops, setGeocodingStops] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [editMode, setEditMode] = useState(false);
@@ -879,6 +880,26 @@ export default function RoutesPage() {
         };
       });
   }, [actualRoutedJobIds, allJobs, endDate, selectedJobPoolTechs, startDate, userProfile?.companyId]);
+  // Scheduled FieldRoutes stops that fall in the selected range + tech but get
+  // silently dropped from the virtual route (e.g. failed geocoding). Surfacing
+  // these explains why a route can show fewer stops here than in FieldRoutes.
+  const hiddenScheduledStops = useMemo<Array<{ job: Job; techName: string; date: string; reason: string }>>(() => {
+    if (selectedJobPoolTechs.length === 0) return [];
+    const hidden: Array<{ job: Job; techName: string; date: string; reason: string }> = [];
+    Object.values(allJobs).forEach((job) => {
+      if (!isFieldRoutesScheduledJob(job) || actualRoutedJobIds.has(job.id)) return;
+      const routeDate = fieldRoutesScheduledDateForJob(job);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(routeDate)) return;
+      if (routeDate < startDate || routeDate > endDate) return;
+      const tech = selectedJobPoolTechs.find((t) => jobAssignedToTech(job, t));
+      if (!tech) return;
+      if (typeof job.lat !== "number" || typeof job.lng !== "number") {
+        hidden.push({ job, techName: tech.name, date: routeDate, reason: "missing map coordinates (address not geocoded)" });
+      }
+    });
+    return hidden;
+  }, [actualRoutedJobIds, allJobs, endDate, selectedJobPoolTechs, startDate]);
+
   const displayRoutes = useMemo(
     () => [...allRoutes, ...scheduledFieldRoutes],
     [allRoutes, scheduledFieldRoutes],
@@ -2281,6 +2302,31 @@ export default function RoutesPage() {
     }
   };
 
+  const handleGeocodeHiddenStops = async () => {
+    if (!userProfile?.companyId || hiddenScheduledStops.length === 0) return;
+    setGeocodingStops(true);
+    try {
+      const res = await fetch("/api/geocode-jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          jobIds: hiddenScheduledStops.map((s) => s.job.id),
+        }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.success) {
+        throw new Error(result.error || "Failed to geocode stops");
+      }
+      toast.success(result.message || "Coordinates updated");
+      await loadJobsForRange(userProfile.companyId);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to geocode stops");
+    } finally {
+      setGeocodingStops(false);
+    }
+  };
+
   const handleUnscheduleRouteIqRoute = async (tr: TechRoute) => {
     if (!userProfile?.companyId) return;
     setApproving(tr.route.id);
@@ -2786,6 +2832,35 @@ export default function RoutesPage() {
                 {visibleRoutes.length} routes · {visibleRoutes.reduce((s, r) => s + r.route.totalStops, 0)} stops · {formatCurrency(visibleRoutes.reduce((total, r) => total + getRouteProductionValue(r.route.stopSequence, allJobs), 0))}
               </span>
             </div>
+
+            {hiddenScheduledStops.length > 0 && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-300">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium">
+                    {hiddenScheduledStops.length} scheduled stop{hiddenScheduledStops.length === 1 ? "" : "s"} hidden from the map
+                  </div>
+                  <Button
+                    size="sm"
+                    className="h-6 text-[10px] px-2 bg-amber-500/20 text-amber-200 border border-amber-500/30 hover:bg-amber-500/30"
+                    onClick={handleGeocodeHiddenStops}
+                    disabled={geocodingStops}
+                  >
+                    {geocodingStops ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                    Fix coordinates
+                  </Button>
+                </div>
+                <ul className="mt-1 space-y-0.5 text-amber-200/80">
+                  {hiddenScheduledStops.slice(0, 8).map(({ job, techName, date, reason }) => (
+                    <li key={job.id}>
+                      {job.customerName || job.address || job.id} — {techName}, {date}: {reason}
+                    </li>
+                  ))}
+                  {hiddenScheduledStops.length > 8 && (
+                    <li>…and {hiddenScheduledStops.length - 8} more</li>
+                  )}
+                </ul>
+              </div>
+            )}
 
             {/* Editing toolbar — undo/redo + bulk actions */}
             <div className="flex items-center gap-2">

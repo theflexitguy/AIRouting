@@ -812,3 +812,107 @@ export async function runRouteOptimizationShadow({
     };
   }
 }
+
+// --- Geocoding -------------------------------------------------------------
+
+export interface GeocodeResult {
+  lat: number;
+  lng: number;
+  source: "google_geocode" | "cache";
+}
+
+const GEOCODE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const geocodeCache = new Map<string, CacheEntry<GeocodeResult | null>>();
+
+function normalizeAddressKey(address: string) {
+  return address.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Geocode a single address to coordinates via the Google Geocoding API.
+ * Returns null when the address can't be resolved or no API key is set.
+ * Results (including misses) are cached in-process to avoid repeat calls.
+ */
+export async function geocodeAddress(address: string): Promise<GeocodeResult | null> {
+  const trimmed = String(address || "").trim();
+  if (!trimmed) return null;
+
+  const apiKey = getGoogleMapsServerApiKey();
+  if (!apiKey) return null;
+
+  const key = normalizeAddressKey(trimmed);
+  const cached = geocodeCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    const value = await cached.value;
+    return value ? { ...value, source: "cache" } : null;
+  }
+
+  const promise = (async (): Promise<GeocodeResult | null> => {
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(trimmed)}&key=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      status?: string;
+      results?: Array<{ geometry?: { location?: { lat?: number; lng?: number } } }>;
+    };
+    if (data.status !== "OK" || !data.results?.length) return null;
+    const loc = data.results[0]?.geometry?.location;
+    if (typeof loc?.lat !== "number" || typeof loc?.lng !== "number") return null;
+    return { lat: loc.lat, lng: loc.lng, source: "google_geocode" };
+  })();
+
+  geocodeCache.set(key, { expiresAt: Date.now() + GEOCODE_CACHE_TTL_MS, value: promise });
+  if (geocodeCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = geocodeCache.keys().next().value;
+    if (oldest) geocodeCache.delete(oldest);
+  }
+
+  try {
+    return await promise;
+  } catch {
+    geocodeCache.delete(key);
+    return null;
+  }
+}
+
+/**
+ * Geocode many addresses with bounded concurrency. Deduplicates identical
+ * addresses and returns a map keyed by the original address strings.
+ */
+export async function geocodeAddresses(
+  addresses: string[],
+  options: { concurrency?: number; maxRequests?: number } = {},
+): Promise<Map<string, GeocodeResult>> {
+  const concurrency = Math.max(1, options.concurrency ?? 8);
+  const maxRequests = options.maxRequests ?? 1000;
+  const results = new Map<string, GeocodeResult>();
+
+  if (!getGoogleMapsServerApiKey()) return results;
+
+  // Unique, non-empty addresses preserving the first-seen original casing.
+  const uniqueByKey = new Map<string, string>();
+  for (const addr of addresses) {
+    const trimmed = String(addr || "").trim();
+    if (!trimmed) continue;
+    const key = normalizeAddressKey(trimmed);
+    if (!uniqueByKey.has(key)) uniqueByKey.set(key, trimmed);
+  }
+
+  const queue = Array.from(uniqueByKey.values()).slice(0, maxRequests);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < queue.length) {
+      const idx = cursor++;
+      const original = queue[idx];
+      const result = await geocodeAddress(original);
+      if (result) results.set(original, result);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, queue.length) }, () => worker()),
+  );
+
+  return results;
+}
