@@ -1421,11 +1421,18 @@ export async function POST(request: NextRequest) {
       .where("date", "<=", rangeEnd)
       .get();
     const routeDocsToReplace: typeof existingRoutesSnap.docs = [];
+    const approvedRoutesBySlot = new Map<string, { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData; stopSequence: string[] }>();
 
     for (const routeDoc of existingRoutesSnap.docs) {
       const route = routeDoc.data();
-      if (route.approved) continue;
       if (!selectedTechIdSet.has(String(route.techId || ""))) continue;
+
+      const slotKey = `${route.date}::${route.techId}`;
+      if (route.approved) {
+        const stopSequence = Array.isArray(route.stopSequence) ? route.stopSequence : [];
+        approvedRoutesBySlot.set(slotKey, { ref: routeDoc.ref, data: route, stopSequence });
+        continue;
+      }
 
       routeDocsToReplace.push(routeDoc);
       const stopSequence = Array.isArray(route.stopSequence)
@@ -1860,13 +1867,17 @@ export async function POST(request: NextRequest) {
     }
 
     // --- 7. Save routes + mark jobs scheduled ---
-    console.log(`[generate-routes] STEP 7: Saving ${routes.length} routes to Firestore`);
+    // Enforce one route per tech per day. If an approved route already exists
+    // for this tech+date (e.g. from FieldRoutes import), merge new stops into it.
+    console.log(`[generate-routes] STEP 7: Saving ${routes.length} routes to Firestore (${approvedRoutesBySlot.size} approved routes to merge into)`);
     const now = new Date().toISOString();
     const scheduledJobIds = new Set<string>();
     const routeWrites: Array<{
       routeRef: FirebaseFirestore.DocumentReference;
       data: Record<string, unknown>;
+      isUpdate?: boolean;
     }> = [];
+    const seenSlots = new Set<string>();
 
     for (let i = 0; i < routes.length; i++) {
       const route = routes[i];
@@ -1885,66 +1896,95 @@ export async function POST(request: NextRequest) {
         route.routeName ||
         `Route ${i + 1}`;
 
+      const slotKey = `${routeDate}::${techId}`;
+      if (seenSlots.has(slotKey)) continue;
+      seenSlots.add(slotKey);
+
       const stopIds = stops.map((s) => String(s.id || s.customerID || ""));
       stopIds.forEach((id) => {
         if (!id) return;
         scheduledJobIds.add(id);
       });
 
-      const routeRef = db
-        .collection(`companies/${companyId}/routes`)
-        .doc(`${routeDate}-${techId}-${i}`);
+      const existingApproved = approvedRoutesBySlot.get(slotKey);
+      if (existingApproved) {
+        const existingStopIds = existingApproved.stopSequence;
+        const existingSet = new Set(existingStopIds);
+        const newStops = stopIds.filter((id) => id && !existingSet.has(id));
+        const mergedStopIds = [...existingStopIds, ...newStops];
+        existingStopIds.forEach((id) => { if (id) scheduledJobIds.add(id); });
 
-      routeWrites.push({
-        routeRef,
-        data: {
-          date: routeDate,
-          techId,
-          techName,
-          stopSequence: stopIds,
-          totalStops: stops.length,
-          totalDriveTimeMinutes: Math.round(
-            Number(route.totalDriveMinutes) || 0,
-          ),
-          totalWorkMinutes: Math.round(
-            Number(route.totalWorkMinutes) ||
-              Number(route.totalDriveMinutes) ||
-              0,
-          ),
-          totalServiceMinutes: Math.round(Number(route.totalServiceMinutes) || 0),
-          driveTimeSource: String(route.driveTimeSource || "haversine_fallback"),
-          polylineSource: String(route.polylineSource || "haversine_fallback"),
-          encodedPolyline: String(route.encodedPolyline || ""),
-          routePolyline: Array.isArray(route.routePolyline) ? route.routePolyline : [],
-          polylineStatus: String(route.polylineStatus || ""),
-          failedRouteSegments: Number(route.failedRouteSegments || 0),
-          googleRouteOptimizationRunId: routeOptimizationShadow.runId || "",
-          ...(typeof routeOptimizationShadow.score === "number"
-            ? { googleRouteOptimizationShadowScore: routeOptimizationShadow.score }
-            : {}),
-          googleRouteOptimizationSummary: {
-            status: routeOptimizationShadow.status,
-            score: routeOptimizationShadow.score ?? null,
-            googleDriveMinutes: routeOptimizationShadow.googleDriveMinutes ?? null,
-            customDriveMinutes: routeOptimizationShadow.customDriveMinutes ?? null,
-            routeCount: routeOptimizationShadow.routeCount ?? routes.length,
-            rawStatus: routeOptimizationShadow.rawStatus || "",
-            warnings: routeOptimizationShadow.warnings,
+        console.log(`[generate-routes] Merging ${newStops.length} new stops into approved route for ${techName} ${routeDate} (${existingStopIds.length} existing)`);
+
+        routeWrites.push({
+          routeRef: existingApproved.ref,
+          isUpdate: true,
+          data: {
+            stopSequence: mergedStopIds,
+            totalStops: mergedStopIds.length,
+            totalDriveTimeMinutes: Math.round(Number(route.totalDriveMinutes) || 0),
+            totalWorkMinutes: Math.round(Number(route.totalWorkMinutes) || Number(route.totalDriveMinutes) || 0),
+            totalServiceMinutes: Math.round(Number(route.totalServiceMinutes) || 0),
+            driveTimeSource: String(route.driveTimeSource || "haversine_fallback"),
+            polylineSource: String(route.polylineSource || "haversine_fallback"),
+            encodedPolyline: String(route.encodedPolyline || ""),
+            routePolyline: Array.isArray(route.routePolyline) ? route.routePolyline : [],
+            polylineStatus: String(route.polylineStatus || ""),
+            failedRouteSegments: Number(route.failedRouteSegments || 0),
+            maxStopsParam: routeMaxStops,
+            updatedAt: now,
           },
-          maxStopsParam: routeMaxStops,
-          targetStopsParam: routeMaxStops,
-          baseMaxStopsParam: Number(route.baseMaxStopsParam) || maxStops,
-          tuesdayStopReduction: TUESDAY_STOP_REDUCTION,
-          maxDriveTimeParam: maxDriveTime,
-          confidence: 0.85,
-          generatedBy: "ai",
-          approved: false,
-          stops,
-          companyId,
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
+        });
+      } else {
+        const routeRef = db
+          .collection(`companies/${companyId}/routes`)
+          .doc(`${routeDate}-${techId}`);
+
+        routeWrites.push({
+          routeRef,
+          data: {
+            date: routeDate,
+            techId,
+            techName,
+            stopSequence: stopIds,
+            totalStops: stops.length,
+            totalDriveTimeMinutes: Math.round(Number(route.totalDriveMinutes) || 0),
+            totalWorkMinutes: Math.round(Number(route.totalWorkMinutes) || Number(route.totalDriveMinutes) || 0),
+            totalServiceMinutes: Math.round(Number(route.totalServiceMinutes) || 0),
+            driveTimeSource: String(route.driveTimeSource || "haversine_fallback"),
+            polylineSource: String(route.polylineSource || "haversine_fallback"),
+            encodedPolyline: String(route.encodedPolyline || ""),
+            routePolyline: Array.isArray(route.routePolyline) ? route.routePolyline : [],
+            polylineStatus: String(route.polylineStatus || ""),
+            failedRouteSegments: Number(route.failedRouteSegments || 0),
+            googleRouteOptimizationRunId: routeOptimizationShadow.runId || "",
+            ...(typeof routeOptimizationShadow.score === "number"
+              ? { googleRouteOptimizationShadowScore: routeOptimizationShadow.score }
+              : {}),
+            googleRouteOptimizationSummary: {
+              status: routeOptimizationShadow.status,
+              score: routeOptimizationShadow.score ?? null,
+              googleDriveMinutes: routeOptimizationShadow.googleDriveMinutes ?? null,
+              customDriveMinutes: routeOptimizationShadow.customDriveMinutes ?? null,
+              routeCount: routeOptimizationShadow.routeCount ?? routes.length,
+              rawStatus: routeOptimizationShadow.rawStatus || "",
+              warnings: routeOptimizationShadow.warnings,
+            },
+            maxStopsParam: routeMaxStops,
+            targetStopsParam: routeMaxStops,
+            baseMaxStopsParam: Number(route.baseMaxStopsParam) || maxStops,
+            tuesdayStopReduction: TUESDAY_STOP_REDUCTION,
+            maxDriveTimeParam: maxDriveTime,
+            confidence: 0.85,
+            generatedBy: "ai",
+            approved: false,
+            stops,
+            companyId,
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+      }
     }
 
     const routeWritePaths = new Set(
@@ -1966,7 +2006,11 @@ export async function POST(request: NextRequest) {
     }
 
     for (const write of routeWrites) {
-      batch.set(write.routeRef, write.data);
+      if (write.isUpdate) {
+        batch.update(write.routeRef, write.data);
+      } else {
+        batch.set(write.routeRef, write.data);
+      }
       batchOps++;
 
       if (batchOps >= 450) {
