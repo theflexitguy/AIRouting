@@ -75,6 +75,10 @@ function col(row: CsvRow, ...names: string[]): string {
   return "";
 }
 
+function hasCol(row: CsvRow, ...names: string[]): boolean {
+  return names.some((n) => row[n] !== undefined);
+}
+
 function safeCsvColumnKey(name: string, fallbackIndex: number) {
   const cleaned = String(name || "")
     .trim()
@@ -219,24 +223,7 @@ export async function POST(request: NextRequest) {
       "Service Type",
       "Subscription Category",
     );
-    const testScheduledFor = col(
-      first,
-      "Scheduled For",
-      "scheduledFor",
-      "Scheduled Date",
-      "Appointment Date",
-      "Start Date",
-      "Route Date",
-    );
-    const testServicedBy = col(
-      first,
-      "Serviced By",
-      "servicedBy",
-      "ServicedBy",
-      "Service By",
-      "Scheduled On",
-      "Route Assigned To",
-    );
+
 
     if (!testAddr || !testDate || !testSvc) {
       const missing = [
@@ -255,10 +242,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (isScheduledJobsUpload && (!testScheduledFor || !testServicedBy)) {
+    const hasScheduledFor = hasCol(first, "Scheduled For", "scheduledFor", "Scheduled Date", "Appointment Date", "Start Date", "Route Date");
+    const hasServicedBy = hasCol(first, "Serviced By", "servicedBy", "ServicedBy", "Service By", "Scheduled On", "Route Assigned To");
+    if (isScheduledJobsUpload && (!hasScheduledFor || !hasServicedBy)) {
       const missing = [
-        !testScheduledFor && "Scheduled For",
-        !testServicedBy && "Serviced By",
+        !hasScheduledFor && "Scheduled For",
+        !hasServicedBy && "Serviced By",
       ]
         .filter(Boolean)
         .join(", ");
