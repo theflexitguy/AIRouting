@@ -748,6 +748,7 @@ export default function RoutesPage() {
   const [genResult, setGenResult] = useState<string | null>(null);
   const [genError, setGenError] = useState<string | null>(null);
   const [approving, setApproving] = useState<string | null>(null);
+  const [geocodingStops, setGeocodingStops] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [editMode, setEditMode] = useState(false);
@@ -2301,6 +2302,31 @@ export default function RoutesPage() {
     }
   };
 
+  const handleGeocodeHiddenStops = async () => {
+    if (!userProfile?.companyId || hiddenScheduledStops.length === 0) return;
+    setGeocodingStops(true);
+    try {
+      const res = await fetch("/api/geocode-jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          companyId: userProfile.companyId,
+          jobIds: hiddenScheduledStops.map((s) => s.job.id),
+        }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.success) {
+        throw new Error(result.error || "Failed to geocode stops");
+      }
+      toast.success(result.message || "Coordinates updated");
+      await loadJobsForRange(userProfile.companyId);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to geocode stops");
+    } finally {
+      setGeocodingStops(false);
+    }
+  };
+
   const handleUnscheduleRouteIqRoute = async (tr: TechRoute) => {
     if (!userProfile?.companyId) return;
     setApproving(tr.route.id);
@@ -2809,8 +2835,19 @@ export default function RoutesPage() {
 
             {hiddenScheduledStops.length > 0 && (
               <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-300">
-                <div className="font-medium">
-                  {hiddenScheduledStops.length} scheduled stop{hiddenScheduledStops.length === 1 ? "" : "s"} hidden from the map
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-medium">
+                    {hiddenScheduledStops.length} scheduled stop{hiddenScheduledStops.length === 1 ? "" : "s"} hidden from the map
+                  </div>
+                  <Button
+                    size="sm"
+                    className="h-6 text-[10px] px-2 bg-amber-500/20 text-amber-200 border border-amber-500/30 hover:bg-amber-500/30"
+                    onClick={handleGeocodeHiddenStops}
+                    disabled={geocodingStops}
+                  >
+                    {geocodingStops ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                    Fix coordinates
+                  </Button>
                 </div>
                 <ul className="mt-1 space-y-0.5 text-amber-200/80">
                   {hiddenScheduledStops.slice(0, 8).map(({ job, techName, date, reason }) => (

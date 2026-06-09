@@ -11,6 +11,7 @@ import {
   normalizeServiceType,
 } from "@/lib/job-id";
 import { normalizeRouteDateValue } from "@/lib/route-bundles";
+import { geocodeAddresses, hasGoogleRoutesApiKey } from "@/lib/google-routing";
 
 interface CsvRow {
   [key: string]: string;
@@ -516,6 +517,40 @@ export async function POST(request: NextRequest) {
     fieldRoutesScheduledCount = preparedJobs.filter(
       (job) => Boolean(job.baseJobData.fieldRoutesScheduled),
     ).length;
+
+    // Geocode jobs that have an address but no coordinates so they can be
+    // placed on routes/maps. Without this, FieldRoutes-scheduled stops with
+    // no lat/lng from the CSV are silently dropped from the route view.
+    let geocodedCount = 0;
+    let geocodeFailedCount = 0;
+    if (hasGoogleRoutesApiKey()) {
+      const jobsNeedingGeocode = preparedJobs.filter((job) => {
+        const lat = job.baseJobData.lat;
+        const lng = job.baseJobData.lng;
+        return (
+          (lat === null || lat === undefined || lng === null || lng === undefined) &&
+          Boolean(String(job.baseJobData.address || "").trim())
+        );
+      });
+      if (jobsNeedingGeocode.length > 0) {
+        const geocoded = await geocodeAddresses(
+          jobsNeedingGeocode.map((job) => String(job.baseJobData.address || "")),
+          { concurrency: 8, maxRequests: 1500 },
+        );
+        for (const job of jobsNeedingGeocode) {
+          const match = geocoded.get(String(job.baseJobData.address || "").trim());
+          if (match) {
+            job.baseJobData.lat = match.lat;
+            job.baseJobData.lng = match.lng;
+            job.baseJobData.geocodeSource = "google_geocode";
+            geocodedCount++;
+          } else {
+            geocodeFailedCount++;
+          }
+        }
+      }
+    }
+
     const jobRefs = preparedJobs.map((job) => db.doc(`companies/${companyId}/jobs/${job.jobId}`));
     const existingJobs = await getExistingJobDocs(db, jobRefs);
     let batch = db.batch();
@@ -540,10 +575,24 @@ export async function POST(request: NextRequest) {
           ? existingData?.assignedTechId || prepared.assignedTechId
           : prepared.assignedTechId;
 
+      // Don't wipe known coordinates if this upload (and geocoding) produced none.
+      const preparedLat = prepared.baseJobData.lat;
+      const preparedLng = prepared.baseJobData.lng;
+      const lat =
+        preparedLat === null || preparedLat === undefined
+          ? (existingData?.lat ?? null)
+          : preparedLat;
+      const lng =
+        preparedLng === null || preparedLng === undefined
+          ? (existingData?.lng ?? null)
+          : preparedLng;
+
       batch.set(
         jobRef,
         {
           ...prepared.baseJobData,
+          lat,
+          lng,
           status: resolvedStatus,
           assignedTechId,
           lastUploadBatchId: batchId,
@@ -580,6 +629,8 @@ export async function POST(request: NextRequest) {
       alreadyCompleted: alreadyCompletedCount,
       fieldRoutesScheduled: fieldRoutesScheduledCount,
       duplicatesSkipped,
+      geocoded: geocodedCount,
+      geocodeFailed: geocodeFailedCount,
       invalidRows: invalidRows.length,
       invalidRowsSample: invalidRows.slice(0, 20),
     });
@@ -595,9 +646,11 @@ export async function POST(request: NextRequest) {
       fieldRoutesScheduled: fieldRoutesScheduledCount,
       skipped: 0,
       duplicatesSkipped,
+      geocoded: geocodedCount,
+      geocodeFailed: geocodeFailedCount,
       invalid: invalidRows.length,
       invalidSample: invalidRows.slice(0, 10),
-      message: `${total} rows: ${newCount} new, ${updatedCount} updated${fieldRoutesScheduledCount ? `, ${fieldRoutesScheduledCount} scheduled from FieldRoutes` : ""}${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${duplicatesSkipped ? `, ${duplicatesSkipped} duplicate rows merged` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
+      message: `${total} rows: ${newCount} new, ${updatedCount} updated${fieldRoutesScheduledCount ? `, ${fieldRoutesScheduledCount} scheduled from FieldRoutes` : ""}${geocodedCount ? `, ${geocodedCount} geocoded` : ""}${geocodeFailedCount ? `, ${geocodeFailedCount} could not be geocoded` : ""}${alreadyCompletedCount ? `, ${alreadyCompletedCount} already completed` : ""}${duplicatesSkipped ? `, ${duplicatesSkipped} duplicate rows merged` : ""}${invalidRows.length ? `, ${invalidRows.length} invalid` : ""}`,
     });
   } catch (error) {
     console.error("Upload jobs error:", error);
