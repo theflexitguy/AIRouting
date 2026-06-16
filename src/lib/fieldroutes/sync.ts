@@ -179,16 +179,24 @@ async function syncTechnicians(
   const existingSnap = await db.collection(`companies/${companyId}/technicians`).get();
   const byEmpId = new Map<string, string>();
   const byName = new Map<string, string>();
+  // Track docs THIS sync auto-created (id prefix `fr_`) so we can prune the ones
+  // that no longer correspond to a real serving tech. An earlier bug attributed
+  // appointments to the office/API account that created them, spawning phantom
+  // "technicians" (office staff, the API service account). They have no real
+  // meaning and must not clutter the tech list.
+  const autoCreatedFrDocs = new Set<string>();
   existingSnap.docs.forEach((d) => {
     const data = d.data();
     const empId = str(data.fieldRoutesEmployeeId || data.fieldRoutesTechId || data.employeeId);
     if (empId) byEmpId.set(empId, d.id);
     const nm = normName(data.name);
     if (nm) byName.set(nm, d.id);
+    if (d.id.startsWith("fr_")) autoCreatedFrDocs.add(d.id);
   });
 
   const empToTech = new Map<string, string>();
   const nameToTech = new Map<string, string>(byName);
+  const keptFrDocs = new Set<string>();
 
   let batch = db.batch();
   let ops = 0;
@@ -222,6 +230,22 @@ async function syncTechnicians(
     }
     empToTech.set(empId, techId);
     nameToTech.set(normName(name), techId);
+    if (techId.startsWith("fr_")) keptFrDocs.add(techId);
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+
+  // Prune phantom auto-created techs: any `fr_` doc we made before that isn't
+  // backed by a real serving tech this run. We only touch `fr_`-prefixed docs
+  // (which only this sync creates), so user-created or linked-existing techs are
+  // never deleted.
+  for (const frId of autoCreatedFrDocs) {
+    if (keptFrDocs.has(frId)) continue;
+    batch.delete(db.doc(`companies/${companyId}/technicians/${frId}`));
     ops++;
     if (ops >= 450) {
       await batch.commit();
@@ -532,9 +556,15 @@ async function buildRunSetup(
     ? await client.getEntities("appointment", pendingApptIds)
     : [];
 
-  // The appointment's employeeID is the office person who CREATED it, not the
-  // field technician. The actual tech lives on the route entity the appointment
-  // belongs to — resolve via routeID.
+  // The field technician is NOT on the appointment. Confirmed against live data:
+  //   - appointment.employeeID  -> the office/API account that CREATED it (e.g. 10004)
+  //   - appointment.assignedTech -> always "0" on pending appointments
+  //   - route.addedBy            -> the creator again
+  //   - route.assignedTech       -> the actual field tech for that route ✅
+  // So resolve the tech from the route the appointment belongs to (via routeID),
+  // reading route.assignedTech. Routes with assignedTech "0" are genuinely
+  // unassigned in FieldRoutes — we leave their appointments tech-less rather than
+  // inventing a phantom technician.
   const routeIdSet = new Set<string>();
   for (const a of pendingAppts) {
     const routeId = str(rec(a).routeID);
@@ -546,7 +576,7 @@ async function buildRunSetup(
   for (const r of routes) {
     const rr = rec(r);
     const rid = str(rr.routeID);
-    const techEmpId = str(rr.employeeID);
+    const techEmpId = str(rr.assignedTech);
     if (rid && techEmpId && techEmpId !== "0") routeTechMap.set(rid, techEmpId);
   }
 
