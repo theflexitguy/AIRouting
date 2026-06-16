@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { collection, query, where, getDocs, orderBy, doc, writeBatch } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { db, auth as firebaseAuth } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent } from "@/components/ui/card";
@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { SkeletonRow } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
-import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw } from "lucide-react";
+import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
@@ -85,6 +85,8 @@ export default function JobsPage() {
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncRemaining, setSyncRemaining] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterTech, setFilterTech] = useState("all");
@@ -98,6 +100,7 @@ export default function JobsPage() {
   const [bulkLoading, setBulkLoading] = useState(false);
   const [pageSize, setPageSize] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
+  const syncAbortRef = useRef<AbortController | null>(null);
 
   const today = format(new Date(), "yyyy-MM-dd");
 
@@ -360,6 +363,92 @@ export default function JobsPage() {
     if (currentPage > totalPages) setCurrentPage(totalPages);
   }, [currentPage, totalPages]);
 
+  const fetchSyncLimit = useCallback(async () => {
+    if (!firebaseAuth?.currentUser) return;
+    try {
+      const token = await firebaseAuth.currentUser.getIdToken();
+      const res = await fetch("/api/fieldroutes/manual-sync", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSyncRemaining(data.remaining ?? null);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { fetchSyncLimit(); }, [fetchSyncLimit]);
+
+  const handleManualSync = async () => {
+    if (!firebaseAuth?.currentUser) {
+      toast.error("Not authenticated");
+      return;
+    }
+    if (syncRemaining !== null && syncRemaining <= 0) {
+      toast.error("Daily sync limit reached (3 per day)");
+      return;
+    }
+
+    setSyncing(true);
+    const abort = new AbortController();
+    syncAbortRef.current = abort;
+
+    try {
+      const token = await firebaseAuth.currentUser.getIdToken();
+      let done = false;
+      let totalWritten = 0;
+      let totalSubs = 0;
+      let iterations = 0;
+      const MAX_ITERATIONS = 20;
+
+      while (!done && !abort.signal.aborted && iterations < MAX_ITERATIONS) {
+        iterations++;
+        const res = await fetch("/api/fieldroutes/manual-sync", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          signal: abort.signal,
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          if (res.status === 429) {
+            toast.error("Daily sync limit reached (3 per day)");
+            setSyncRemaining(0);
+          } else {
+            toast.error(data.error || "Sync failed");
+          }
+          return;
+        }
+
+        totalSubs = data.total || data.subscriptionsProcessed || totalSubs;
+        totalWritten = data.written || totalWritten;
+        done = data.done !== false;
+
+        if (data.syncLimit) {
+          setSyncRemaining(data.syncLimit.remaining);
+        }
+
+        if (!done) {
+          toast.info(`Syncing... ${data.offset || 0} of ${totalSubs} processed`);
+        }
+      }
+
+      toast.success(`Sync complete: ${totalWritten} jobs updated`);
+      await loadJobs();
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        toast.error("Sync failed. Check your connection.");
+      }
+    } finally {
+      setSyncing(false);
+      syncAbortRef.current = null;
+    }
+  };
+
+
   const getTechLabel = (assignedTechId?: string) => {
     const assigned = normalizeText(assignedTechId);
     if (!assigned) return "Unassigned";
@@ -443,6 +532,19 @@ export default function JobsPage() {
               <SelectItem value="250">250 rows</SelectItem>
             </SelectContent>
           </Select>
+          <Button
+            onClick={handleManualSync}
+            disabled={syncing || (syncRemaining !== null && syncRemaining <= 0)}
+            className="bg-blue-500 hover:bg-blue-600 text-white shrink-0 h-9"
+          >
+            {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+            {syncing ? "Syncing..." : "Sync Jobs"}
+          </Button>
+          {syncRemaining !== null && (
+            <span className="text-xs text-muted-foreground self-center">
+              {syncRemaining} sync{syncRemaining !== 1 ? "s" : ""} left today
+            </span>
+          )}
         </div>
 
         <div className="flex flex-col lg:flex-row gap-2.5">
@@ -508,6 +610,8 @@ export default function JobsPage() {
           <span className="text-muted-foreground">to</span>
           <DatePicker value={dateTo} onChange={setDateTo} className="h-8 text-xs" />
         </div>
+
+
 
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground/60 animate-fade-in">
           <span>
@@ -737,7 +841,7 @@ export default function JobsPage() {
                       {jobs.length === 0 ? "No jobs yet" : "No jobs match your filters"}
                     </p>
                     <p className="text-xs text-muted-foreground/50 mt-1">
-                      {jobs.length === 0 ? "Jobs sync automatically from FieldRoutes." : "Try adjusting filters or the date range."}
+                      {jobs.length === 0 ? "Use Sync Jobs to pull data from FieldRoutes." : "Try adjusting filters or the date range."}
                     </p>
                   </div>
                 )}
@@ -796,7 +900,7 @@ export default function JobsPage() {
                   <div className="flex flex-col items-center text-center py-16">
                     <Briefcase className="w-8 h-8 text-muted-foreground/20 mb-3" />
                     <p className="text-sm text-muted-foreground">
-                      {jobs.length === 0 ? "No jobs yet. Jobs sync automatically from FieldRoutes." : "No jobs match your filters."}
+                      {jobs.length === 0 ? "No jobs yet. Use Sync Jobs to pull data from FieldRoutes." : "No jobs match your filters."}
                     </p>
                   </div>
                 )}
