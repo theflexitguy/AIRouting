@@ -91,6 +91,66 @@ function routeSlotKey(date: string, techId: string) {
   return `${date}::${techId}`;
 }
 
+function jobHasExplicitAssignment(job: JobDoc) {
+  return [job.assignedTechId, job.fieldRoutesServicedBy, job.fieldRoutesServicedById]
+    .some((value) => String(value || "").trim().length > 0);
+}
+
+// Every job must belong to exactly ONE technician. Without this, unassigned
+// jobs (which match every tech) get routed once per tech — duplicate stops.
+// Order of precedence: pinned route slot > explicit assignment > nearest tech
+// with a load penalty so unassigned work spreads evenly across the team.
+function partitionJobsAmongTechs(
+  jobs: JobDoc[],
+  techs: Array<Record<string, unknown> & { id: string }>,
+  pinnedSlotByJobId: Map<string, string>,
+) {
+  const byTech = new Map<string, JobDoc[]>();
+  techs.forEach((tech) => byTech.set(tech.id, []));
+  const unassigned: JobDoc[] = [];
+  const seen = new Set<string>();
+
+  for (const job of jobs) {
+    if (seen.has(job.docId)) continue;
+    seen.add(job.docId);
+
+    const pinnedSlot = pinnedSlotByJobId.get(job.docId);
+    if (pinnedSlot) {
+      const pinnedTechId = pinnedSlot.split("::")[1] || "";
+      const bucket = byTech.get(pinnedTechId);
+      if (bucket) {
+        bucket.push(job);
+        continue;
+      }
+    }
+    if (jobHasExplicitAssignment(job)) {
+      const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
+      if (tech) byTech.get(tech.id)!.push(job);
+      continue;
+    }
+    unassigned.push(job);
+  }
+
+  for (const job of unassigned) {
+    let bestTechId = techs[0]?.id || "";
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const tech of techs) {
+      const current = byTech.get(tech.id) || [];
+      const nearestMinutes = current.length
+        ? Math.min(...current.map((existing) => estimateDriveMinutes(job, existing)))
+        : 0;
+      const score = nearestMinutes + current.length * 4;
+      if (score < bestScore) {
+        bestScore = score;
+        bestTechId = tech.id;
+      }
+    }
+    byTech.get(bestTechId)?.push(job);
+  }
+
+  return byTech;
+}
+
 function isFieldRoutesScheduledJob(job: JobDoc) {
   return Boolean(job.fieldRoutesScheduled || job.fieldRoutesServicedBy);
 }
@@ -1180,9 +1240,10 @@ async function buildFastFallbackRoutes({
   const polylineSources = new Set<string>();
   const driveCapDeferrals: Array<{ job: JobDoc; routeName: string; driveMinutes: number }> = [];
   let slotIndex = 0;
+  const partitionedByTech = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId);
 
   for (const tech of selectedTechs) {
-    const techJobs = jobsToRoute.filter((job) => jobAssignedToTech(job, tech));
+    const techJobs = partitionedByTech.get(tech.id) || [];
     if (techJobs.length === 0) {
       slotIndex += dates.length;
       continue;
@@ -1654,10 +1715,9 @@ export async function POST(request: NextRequest) {
 
     const selectedByTech = new Map<string, JobDoc[]>();
     const deferredByTech = new Map<string, JobDoc[]>();
+    const partitionedByTech = partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId);
     for (const tech of selectedTechs) {
-      const techJobs = allJobDocs
-        .filter((job) => jobAssignedToTech(job, tech))
-        .sort(prioritySort);
+      const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
       // Pinned (already-routed / FieldRoutes-scheduled) jobs always make the cut;
       // remaining capacity is filled with the highest-priority unpinned jobs.
       const pinned = techJobs.filter((job) => pinnedSlotByJobId.has(job.docId));

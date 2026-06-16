@@ -5,5 +5,9 @@
   "installCommand": "npm install",
   "env": {
     "FIELDROUTES_NWA_BASE_URL": "https://flexpc.fieldroutes.com/api"
-  }
+  },
+  "crons": [
+    { "path": "/api/fieldroutes/sync?mode=incremental", "schedule": "*/15 * * * *" },
+    { "path": "/api/fieldroutes/recompute-past-due", "schedule": "0 10 * * *" }
+  ]
 }
