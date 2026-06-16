@@ -17,6 +17,14 @@
       ]
     },
     {
+      "collectionGroup": "jobs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "inScope", "order": "ASCENDING" },
+        { "fieldPath": "pastDue", "order": "ASCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "routes",
       "queryScope": "COLLECTION",
       "fields": [
