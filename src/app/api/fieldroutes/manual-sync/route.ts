@@ -47,32 +47,38 @@ export async function POST(request: NextRequest) {
     usedToday = limitData.count || 0;
   }
 
-  if (usedToday >= MAX_MANUAL_SYNCS_PER_DAY) {
-    return NextResponse.json(
-      {
-        error: "Daily sync limit reached",
-        limit: MAX_MANUAL_SYNCS_PER_DAY,
-        used: usedToday,
-        remaining: 0,
-      },
-      { status: 429 },
-    );
-  }
+  // The sync is resumable: one user-initiated sync may take several POSTs to
+  // finish. Only the first call of a session (when no run is in progress) counts
+  // against the daily limit and is rate-limited — continuations always proceed.
+  const syncStateSnap = await db.doc(`companies/${companyId}/fieldRoutesState/sync`).get();
+  const runActive = Boolean((syncStateSnap.data()?.run as { active?: boolean } | undefined)?.active);
+  const isNewSession = !runActive;
 
-  await limitRef.set({ date: today, count: usedToday + 1 }, { merge: true });
+  if (isNewSession) {
+    if (usedToday >= MAX_MANUAL_SYNCS_PER_DAY) {
+      return NextResponse.json(
+        {
+          error: "Daily sync limit reached",
+          limit: MAX_MANUAL_SYNCS_PER_DAY,
+          used: usedToday,
+          remaining: 0,
+        },
+        { status: 429 },
+      );
+    }
+    usedToday += 1;
+    await limitRef.set({ date: today, count: usedToday }, { merge: true });
+  }
 
   try {
     const result = await runSync("incremental");
     return NextResponse.json({
       success: true,
-      // This branch's sync runs to completion in a single call, so the client
-      // never needs to repeat the request. Be explicit so the UI loop stops.
-      done: true,
       ...result,
       syncLimit: {
         limit: MAX_MANUAL_SYNCS_PER_DAY,
-        used: usedToday + 1,
-        remaining: MAX_MANUAL_SYNCS_PER_DAY - usedToday - 1,
+        used: usedToday,
+        remaining: Math.max(0, MAX_MANUAL_SYNCS_PER_DAY - usedToday),
       },
     });
   } catch (err) {

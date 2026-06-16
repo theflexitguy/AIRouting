@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { collection, query, where, getDocs, orderBy, limit } from "firebase/firestore";
+import { collection, query, where, getDocs, orderBy, limit, getCountFromServer } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -16,6 +16,7 @@ import {
   Brain,
   CheckCircle2,
   RefreshCw,
+  AlertTriangle,
 } from "lucide-react";
 import {
   BarChart,
@@ -33,6 +34,7 @@ import { format, addDays } from "date-fns";
 interface DashboardStats {
   todayRoutes: number;
   totalStops: number;
+  overdueStops: number;
   estimatedDriveTime: number;
   avgConfidence: number;
   jobsDueThisWeek: Array<{ date: string; count: number }>;
@@ -81,11 +83,32 @@ export default function DashboardPage() {
       const routesSnap = await getDocs(routesQuery);
       const todayRoutes = routesSnap.docs.map(d => d.data());
 
+      // FieldRoutes-scheduled appointments are materialized into real route docs
+      // by the sync (see reconcileScheduledRoutes), so counting route docs here
+      // already includes them alongside AI-generated routes — no separate
+      // scheduled-jobs tally needed (that would double-count).
+      const routesToday = todayRoutes.length;
       const totalStops = todayRoutes.reduce((sum, r) => sum + (r.totalStops || 0), 0);
       const estimatedDriveTime = todayRoutes.reduce((sum, r) => sum + (r.totalDriveTimeMinutes || 0), 0);
       const avgConfidence = todayRoutes.length > 0
         ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
         : 0;
+
+      // Overdue = in-scope subscriptions whose service due date has passed.
+      // Counted server-side so we never read the whole jobs collection.
+      const jobsCol = collection(db, `companies/${companyId}/jobs`);
+      let overdueStops = 0;
+      try {
+        const overdueSnap = await getCountFromServer(
+          query(jobsCol, where("inScope", "==", true), where("pastDue", "==", true))
+        );
+        overdueStops = overdueSnap.data().count;
+      } catch {
+        // Composite (inScope + pastDue) index not deployed yet — fall back to
+        // the single-field past-due count so the card still renders.
+        const overdueSnap = await getCountFromServer(query(jobsCol, where("pastDue", "==", true)));
+        overdueStops = overdueSnap.data().count;
+      }
 
       const jobsDueThisWeek = [];
       for (let i = 0; i < 7; i++) {
@@ -121,8 +144,9 @@ export default function DashboardPage() {
       }));
 
       setStats({
-        todayRoutes: todayRoutes.length,
+        todayRoutes: routesToday,
         totalStops,
+        overdueStops,
         estimatedDriveTime,
         avgConfidence,
         jobsDueThisWeek,
@@ -135,6 +159,7 @@ export default function DashboardPage() {
       setStats({
         todayRoutes: 0,
         totalStops: 0,
+        overdueStops: 0,
         estimatedDriveTime: 0,
         avgConfidence: 0,
         jobsDueThisWeek: [],
@@ -148,6 +173,7 @@ export default function DashboardPage() {
 
   const statCards = stats ? [
     { title: "Today's Routes", value: stats.todayRoutes, subtitle: "Active routes", icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
+    { title: "Overdue Stops", value: stats.overdueStops, subtitle: "Past service due date", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
     { title: "Total Stops", value: stats.totalStops, subtitle: "Across all techs", icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: "Total estimated", icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },
@@ -160,8 +186,8 @@ export default function DashboardPage() {
         {loading ? (
           /* Skeleton loading state — matches real layout exactly */
           <div className="space-y-6">
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              {Array.from({ length: 4 }).map((_, i) => (
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+              {Array.from({ length: 5 }).map((_, i) => (
                 <SkeletonCard key={i} className={`animate-fade-in stagger-${i + 1}`} />
               ))}
             </div>
@@ -173,7 +199,7 @@ export default function DashboardPage() {
         ) : stats ? (
           <>
             {/* Stat cards */}
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
               {statCards.map((stat, i) => {
                 const Icon = stat.icon;
                 return (

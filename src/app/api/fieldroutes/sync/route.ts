@@ -1,6 +1,6 @@
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { runSync, type SyncMode } from "@/lib/fieldroutes/sync";

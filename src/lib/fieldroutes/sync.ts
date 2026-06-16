@@ -10,6 +10,14 @@
 //   already_scheduled  -> status "scheduled" (pinned FieldRoutes stop)
 //   needs_review       -> status "review"    (constraint/over-balance; excluded)
 //   everything else    -> status "inactive"  (future/out-of-scope; excluded)
+//
+// Resumable + time-boxed: a single serverless invocation processes subscriptions
+// in batches until it approaches the function's time budget, then persists its
+// progress (subscription ID list, offset, running tallies, and the lookup maps)
+// under fieldRoutesState/sync.run. Re-invoking the same mode resumes where it
+// left off — this keeps a full sync of thousands of subscriptions within the
+// 60-second function cap of Vercel's Hobby plan. Callers repeat the request
+// until the response reports `done: true`.
 
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
@@ -27,9 +35,19 @@ import {
 
 export type SyncMode = "full" | "incremental";
 
+// Stop starting new batches once we cross this; leaves headroom under the
+// 60s function cap for the final Firestore flush and the HTTP response.
+const SOFT_DEADLINE_MS = 45_000;
+// Subscriptions per batch. One subscription `get` + one customer `get` per
+// batch (both <= 1000-entity cap), so a batch costs ~2 throttled requests.
+const BATCH_SUBS = 250;
+
 export interface SyncResult {
   mode: SyncMode;
   companyId: string;
+  done: boolean;
+  total: number;
+  offset: number;
   subscriptionsProcessed: number;
   inScopeCount: number;
   autoRoutableCount: number;
@@ -40,6 +58,31 @@ export interface SyncResult {
   cursor: string;
   startedAt: string;
   finishedAt: string;
+  message: string;
+}
+
+interface ApptInfo {
+  date: string;
+  techId: string;
+  techName: string;
+}
+
+interface RunProgress {
+  active: boolean;
+  mode: SyncMode;
+  ids: string[];
+  offset: number;
+  cursor: string;
+  apptMap: Record<string, ApptInfo>;
+  empNames: Record<string, string>;
+  counts: {
+    inScope: number;
+    autoRoutable: number;
+    alreadyScheduled: number;
+    needsReview: number;
+    written: number;
+    subsProcessed: number;
+  };
 }
 
 function rec(value: unknown): Record<string, unknown> {
@@ -120,76 +163,16 @@ function haversineRouteMetrics(
 }
 
 /**
- * Resolve which subscription IDs to (re)sync.
- *  - full: every active subscription.
- *  - incremental: subscriptions changed since the cursor, plus subscriptions of
- *    changed customers and changed appointments.
- */
-async function resolveSubscriptionIds(
-  client: FieldRoutesClient,
-  mode: SyncMode,
-  cursor: string,
-): Promise<string[]> {
-  if (mode === "full") {
-    return client.searchIds("subscription", { active: 1 });
-  }
-
-  if (!cursor) {
-    // No cursor yet — fall back to a full pull so we don't miss anything.
-    return client.searchIds("subscription", { active: 1 });
-  }
-
-  const changedSubs = await client.searchIds("subscription", {
-    dateUpdated: { operator: ">", value: cursor },
-  });
-  const changedCustomers = await client.searchIds("customer", {
-    dateUpdated: { operator: ">", value: cursor },
-  });
-  const changedAppointments = await client.searchIds("appointment", {
-    dateUpdated: { operator: ">", value: cursor },
-  });
-
-  // Resolving changed customers/appointments back to subscriptions is best-effort:
-  // if a filter key is rejected we still process the directly-changed subscriptions
-  // rather than failing the whole incremental run.
-  let subsOfChangedCustomers: string[] = [];
-  if (changedCustomers.length) {
-    try {
-      subsOfChangedCustomers = await client.searchIds("subscription", {
-        customerID: { operator: "in", value: changedCustomers },
-      });
-    } catch (err) {
-      console.warn("[fieldroutes/sync] customer→subscription resolve skipped:", String(err));
-    }
-  }
-
-  let subsOfChangedAppointments: string[] = [];
-  if (changedAppointments.length) {
-    try {
-      const appts = await client.getEntities("appointment", changedAppointments);
-      subsOfChangedAppointments = appts.map((a) => str(rec(a).subscriptionID)).filter(Boolean);
-    } catch (err) {
-      console.warn("[fieldroutes/sync] appointment→subscription resolve skipped:", String(err));
-    }
-  }
-
-  return Array.from(
-    new Set([...changedSubs, ...subsOfChangedCustomers, ...subsOfChangedAppointments]),
-  );
-}
-
-/**
  * Ensure a technician record exists for every FieldRoutes employee that has
  * scheduled work, linked by FieldRoutes employee ID. This is the foundation
  * that lets the router and UI match a scheduled job to a tech — without it,
  * FieldRoutes routes are silently dropped (and could be double-booked).
- *
  * Returns lookup maps so callers can resolve a job's tech to a technician doc id.
  */
 async function syncTechnicians(
   db: FirebaseFirestore.Firestore,
   companyId: string,
-  employeeById: Map<string, Record<string, unknown>>,
+  empNames: Record<string, string>,
   servingEmployeeIds: Set<string>,
   now: string,
 ): Promise<{ empToTech: Map<string, string>; nameToTech: Map<string, string> }> {
@@ -211,8 +194,7 @@ async function syncTechnicians(
   let ops = 0;
   for (const empId of servingEmployeeIds) {
     if (!empId || empId === "0") continue;
-    const emp = employeeById.get(empId) || {};
-    const name = employeeName(emp) || empId;
+    const name = empNames[empId] || empId;
     const existingId = byEmpId.get(empId) || byName.get(normName(name));
 
     const linkFields = {
@@ -264,7 +246,7 @@ async function syncTechnicians(
 async function reconcileScheduledRoutes(
   db: FirebaseFirestore.Firestore,
   companyId: string,
-  employeeById: Map<string, Record<string, unknown>>,
+  empNames: Record<string, string>,
   today: string,
   now: string,
 ): Promise<{ routesWritten: number; routesDeleted: number; techsLinked: number }> {
@@ -304,7 +286,7 @@ async function reconcileScheduledRoutes(
     });
   });
 
-  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, employeeById, servingEmployeeIds, now);
+  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, servingEmployeeIds, now);
   const resolveTechId = (j: SJob) =>
     empToTech.get(j.techEmpId) || nameToTech.get(normName(j.techName)) || "";
 
@@ -315,8 +297,7 @@ async function reconcileScheduledRoutes(
     if (!techId) continue;
     const key = `${j.date}::${techId}`;
     if (!groups.has(key)) {
-      const emp = employeeById.get(j.techEmpId);
-      const techName = (emp && employeeName(emp)) || j.techName || techId;
+      const techName = empNames[j.techEmpId] || j.techName || techId;
       groups.set(key, { date: j.date, techId, techName, jobs: [] });
     }
     groups.get(key)!.jobs.push(j);
@@ -450,7 +431,129 @@ async function reconcileScheduledRoutes(
   return { routesWritten, routesDeleted, techsLinked: empToTech.size };
 }
 
+/** Stable ascending order so the resume offset points at the same IDs across invocations. */
+function sortIds(ids: string[]): string[] {
+  return ids
+    .map((s) => str(s))
+    .filter(Boolean)
+    .sort((a, b) => Number(a) - Number(b) || a.localeCompare(b));
+}
+
+/**
+ * Resolve which subscription IDs to (re)sync.
+ *  - full: every active subscription.
+ *  - incremental: subscriptions changed since the cursor, plus subscriptions of
+ *    changed customers and changed appointments.
+ */
+async function resolveSubscriptionIds(
+  client: FieldRoutesClient,
+  mode: SyncMode,
+  cursor: string,
+): Promise<string[]> {
+  if (mode === "full" || !cursor) {
+    // No cursor yet on an incremental run falls back to a full pull so we don't miss anything.
+    return client.searchIds("subscription", { active: 1 });
+  }
+
+  const changedSubs = await client.searchIds("subscription", {
+    dateUpdated: { operator: ">", value: cursor },
+  });
+  const changedCustomers = await client.searchIds("customer", {
+    dateUpdated: { operator: ">", value: cursor },
+  });
+  const changedAppointments = await client.searchIds("appointment", {
+    dateUpdated: { operator: ">", value: cursor },
+  });
+
+  // Resolving changed customers/appointments back to subscriptions is best-effort:
+  // if a filter key is rejected we still process the directly-changed subscriptions
+  // rather than failing the whole incremental run.
+  let subsOfChangedCustomers: string[] = [];
+  if (changedCustomers.length) {
+    try {
+      subsOfChangedCustomers = await client.searchIds("subscription", {
+        customerID: { operator: "in", value: changedCustomers },
+      });
+    } catch (err) {
+      console.warn("[fieldroutes/sync] customer→subscription resolve skipped:", String(err));
+    }
+  }
+
+  let subsOfChangedAppointments: string[] = [];
+  if (changedAppointments.length) {
+    try {
+      const appts = await client.getEntities("appointment", changedAppointments);
+      subsOfChangedAppointments = appts.map((a) => str(rec(a).subscriptionID)).filter(Boolean);
+    } catch (err) {
+      console.warn("[fieldroutes/sync] appointment→subscription resolve skipped:", String(err));
+    }
+  }
+
+  return Array.from(
+    new Set([...changedSubs, ...subsOfChangedCustomers, ...subsOfChangedAppointments]),
+  );
+}
+
+/**
+ * Build the account-wide lookups a fresh run needs: the ordered subscription ID
+ * list, the pending-appointment map (double-book join on subscription_id ONLY),
+ * and the employee-name map. These are persisted with the run so resume
+ * invocations skip the setup cost entirely.
+ */
+async function buildRunSetup(
+  client: FieldRoutesClient,
+  mode: SyncMode,
+  cursor: string,
+  today: string,
+): Promise<{ ids: string[]; apptMap: Record<string, ApptInfo>; empNames: Record<string, string> }> {
+  const ids = sortIds(await resolveSubscriptionIds(client, mode, cursor));
+
+  // Employees are few — fetch all once for name resolution.
+  const employeeIds = await client.searchIds("employee", {});
+  const employees = employeeIds.length ? await client.getEntities("employee", employeeIds) : [];
+  const empNames: Record<string, string> = {};
+  for (const e of employees) {
+    const er = rec(e);
+    const id = str(er.employeeID || er.employeeId);
+    if (id) empNames[id] = employeeName(er);
+  }
+  const resolveEmpName = (id: unknown): string => {
+    const key = str(id);
+    if (!key || key === "0") return "";
+    return empNames[key] || key;
+  };
+
+  // Pending future appointments across the account, indexed by subscription_id.
+  const pendingApptIds = await client.searchIds("appointment", {
+    status: 0, // 0 = Pending
+    date: { operator: ">=", value: today },
+  });
+  const pendingAppts = pendingApptIds.length
+    ? await client.getEntities("appointment", pendingApptIds)
+    : [];
+  const apptMap: Record<string, ApptInfo> = {};
+  for (const a of pendingAppts) {
+    const ar = rec(a);
+    const subId = str(ar.subscriptionID);
+    if (!subId) continue;
+    const date = toDateOnly(ar.date);
+    if (!date || date < today) continue;
+    const existing = apptMap[subId];
+    // Keep the earliest upcoming appointment.
+    if (!existing || date < existing.date) {
+      apptMap[subId] = {
+        date,
+        techId: str(ar.employeeID), // VERIFIED: employeeID, not assignedTech
+        techName: resolveEmpName(ar.employeeID),
+      };
+    }
+  }
+
+  return { ids, apptMap, empNames };
+}
+
 export async function runSync(mode: SyncMode): Promise<SyncResult> {
+  const startMs = Date.now();
   const startedAt = new Date().toISOString();
   const companyId = targetCompanyId();
   const today = centralTodayISO();
@@ -459,73 +562,57 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
 
   const stateRef = db.doc(`companies/${companyId}/fieldRoutesState/sync`);
   const stateSnap = await stateRef.get();
-  const priorCursor = str(stateSnap.exists ? stateSnap.data()?.cursor : "");
+  const state = stateSnap.exists ? (stateSnap.data() as Record<string, unknown>) : {};
+  const priorCursor = str(state.cursor);
 
-  const subscriptionIds = await resolveSubscriptionIds(client, mode, priorCursor);
+  // Resume an in-progress run of the SAME mode; otherwise start a fresh run.
+  const prior = state.run as RunProgress | undefined;
+  const resuming = Boolean(prior?.active) && prior?.mode === mode && Array.isArray(prior?.ids);
 
-  if (subscriptionIds.length === 0) {
-    const finishedAt = new Date().toISOString();
-    await stateRef.set(
-      { cursor: priorCursor, lastRunMode: mode, lastRunAt: finishedAt, lastRunWritten: 0 },
-      { merge: true },
-    );
-    return {
-      mode, companyId, subscriptionsProcessed: 0, inScopeCount: 0, autoRoutableCount: 0,
-      alreadyScheduledCount: 0, needsReviewCount: 0, written: 0,
-      apiReads: client.readCount, cursor: priorCursor, startedAt, finishedAt,
-    };
+  let ids: string[];
+  let apptMap: Record<string, ApptInfo>;
+  let empNames: Record<string, string>;
+  let offset: number;
+  let cursor: string;
+  let inScopeCount: number;
+  let autoRoutableCount: number;
+  let alreadyScheduledCount: number;
+  let needsReviewCount: number;
+  let written: number;
+  let subsProcessed: number;
+
+  if (resuming && prior) {
+    ids = prior.ids;
+    apptMap = rec(prior.apptMap) as Record<string, ApptInfo>;
+    empNames = rec(prior.empNames) as Record<string, string>;
+    offset = num(prior.offset);
+    cursor = str(prior.cursor) || priorCursor;
+    inScopeCount = num(prior.counts?.inScope);
+    autoRoutableCount = num(prior.counts?.autoRoutable);
+    alreadyScheduledCount = num(prior.counts?.alreadyScheduled);
+    needsReviewCount = num(prior.counts?.needsReview);
+    written = num(prior.counts?.written);
+    subsProcessed = num(prior.counts?.subsProcessed);
+  } else {
+    const setup = await buildRunSetup(client, mode, priorCursor, today);
+    ids = setup.ids;
+    apptMap = setup.apptMap;
+    empNames = setup.empNames;
+    offset = 0;
+    cursor = priorCursor;
+    inScopeCount = autoRoutableCount = alreadyScheduledCount = needsReviewCount = 0;
+    written = subsProcessed = 0;
   }
 
-  // --- Fetch entities and build lookup maps. ---
-  const subscriptions = await client.getEntities("subscription", subscriptionIds);
-
-  const customerIds = Array.from(
-    new Set(subscriptions.map((s) => str(rec(s).customerID)).filter(Boolean)),
-  );
-  const customers = await client.getEntities("customer", customerIds);
-  const customerById = new Map(customers.map((c) => [str(rec(c).customerID), rec(c)]));
-
-  // Employees are few — fetch all once for name resolution.
-  const employeeIds = await client.searchIds("employee", {});
-  const employees = employeeIds.length ? await client.getEntities("employee", employeeIds) : [];
-  const employeeById = new Map(employees.map((e) => [str(rec(e).employeeID || rec(e).employeeId), rec(e)]));
-  const resolveEmpName = (id: unknown) => {
+  const total = ids.length;
+  const resolveEmpName = (id: unknown): string => {
     const key = str(id);
     if (!key || key === "0") return "";
-    const emp = employeeById.get(key);
-    return emp ? employeeName(emp) : key;
+    return empNames[key] || key;
   };
 
-  // Pending future appointments across the account, indexed by subscription_id.
-  // Double-book join is on subscription_id ONLY — never customer_id.
-  const pendingApptIds = await client.searchIds("appointment", {
-    status: 0, // 0 = Pending
-    date: { operator: ">=", value: today },
-  });
-  const pendingAppts = pendingApptIds.length
-    ? await client.getEntities("appointment", pendingApptIds)
-    : [];
-  const pendingApptBySub = new Map<string, Record<string, unknown>>();
-  for (const a of pendingAppts) {
-    const ar = rec(a);
-    const subId = str(ar.subscriptionID);
-    if (!subId) continue;
-    const date = toDateOnly(ar.date);
-    if (!date || date < today) continue;
-    const existing = pendingApptBySub.get(subId);
-    // Keep the earliest upcoming appointment.
-    if (!existing || date < toDateOnly(existing.date)) pendingApptBySub.set(subId, ar);
-  }
-
-  // --- Build + upsert job documents. ---
+  // --- Process subscriptions in batches until exhausted or near the time budget. ---
   const now = new Date().toISOString();
-  let cursor = priorCursor;
-  let inScopeCount = 0;
-  let autoRoutableCount = 0;
-  let alreadyScheduledCount = 0;
-  let needsReviewCount = 0;
-  let written = 0;
-
   let batch = db.batch();
   let ops = 0;
   const flush = async () => {
@@ -536,157 +623,206 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     }
   };
 
-  for (const subRaw of subscriptions) {
-    const sub = rec(subRaw);
-    const subscriptionId = str(sub.subscriptionID);
-    if (!subscriptionId) continue;
-    const customerId = str(sub.customerID);
-    const customer = customerById.get(customerId) || {};
+  while (offset < total) {
+    if (Date.now() - startMs > SOFT_DEADLINE_MS) break;
 
-    cursor = maxDateString(cursor, str(sub.dateUpdated));
+    const sliceIds = ids.slice(offset, offset + BATCH_SUBS);
+    const subscriptions = await client.getEntities("subscription", sliceIds);
+    const customerIds = Array.from(
+      new Set(subscriptions.map((s) => str(rec(s).customerID)).filter(Boolean)),
+    );
+    const customers = customerIds.length ? await client.getEntities("customer", customerIds) : [];
+    const customerById = new Map(customers.map((c) => [str(rec(c).customerID), rec(c)]));
 
-    const serviceType = str(sub.serviceType);
-    const serviceDue = toDateOnly(sub.nextService);
-    const lastCompleted = toDateOnly(sub.lastCompleted);
-    const customerBalance = num(customer.balance);
-    const specialScheduling = str(customer.specialScheduling);
-    const onHold = num(sub.onHold);
+    for (const subRaw of subscriptions) {
+      const sub = rec(subRaw);
+      const subscriptionId = str(sub.subscriptionID);
+      if (!subscriptionId) continue;
+      const customerId = str(sub.customerID);
+      const customer = customerById.get(customerId) || {};
 
-    const appt = pendingApptBySub.get(subscriptionId);
-    const alreadyScheduled = Boolean(appt);
-    const scheduledFor = appt ? toDateOnly(appt.date) : "";
-    const scheduledTech = appt ? resolveEmpName(appt.employeeID) : ""; // VERIFIED: employeeID, not assignedTech
-    const scheduledTechId = appt ? str(appt.employeeID) : "";
+      cursor = maxDateString(cursor, str(sub.dateUpdated));
 
-    const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge });
-    const flags = computeFlags({
-      inScope,
-      serviceDue,
-      customerBalance,
-      specialScheduling,
-      alreadyScheduled,
-      today,
-    });
+      const serviceType = str(sub.serviceType);
+      const serviceDue = toDateOnly(sub.nextService);
+      const lastCompleted = toDateOnly(sub.lastCompleted);
+      const customerBalance = num(customer.balance);
+      const specialScheduling = str(customer.specialScheduling);
+      const onHold = num(sub.onHold);
 
-    const serviceDueAlreadyCompleted = Boolean(lastCompleted) && Boolean(serviceDue) && lastCompleted >= serviceDue;
+      const appt = apptMap[subscriptionId];
+      const alreadyScheduled = Boolean(appt);
+      const scheduledFor = appt ? appt.date : "";
+      const scheduledTech = appt ? appt.techName : "";
+      const scheduledTechId = appt ? appt.techId : "";
 
-    let status: string;
-    if (serviceDueAlreadyCompleted) status = "completed";
-    else if (alreadyScheduled) status = "scheduled";
-    else if (flags.autoRoutable) status = "pending";
-    else if (flags.needsReview) status = "review";
-    else status = "inactive";
+      const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge });
+      const flags = computeFlags({
+        inScope,
+        serviceDue,
+        customerBalance,
+        specialScheduling,
+        alreadyScheduled,
+        today,
+      });
 
-    if (inScope) inScopeCount++;
-    if (flags.autoRoutable) autoRoutableCount++;
-    if (alreadyScheduled) alreadyScheduledCount++;
-    if (flags.needsReview) needsReviewCount++;
+      const serviceDueAlreadyCompleted =
+        Boolean(lastCompleted) && Boolean(serviceDue) && lastCompleted >= serviceDue;
 
-    const preferredTech = resolveEmpName(sub.preferredTech);
-    const fname = str(customer.fname);
-    const lname = str(customer.lname);
-    const address = str(customer.address);
-    const city = str(customer.city);
-    const zip = str(customer.zip);
-    const fullAddress = [address, city, zip].filter(Boolean).join(", ");
+      let status: string;
+      if (serviceDueAlreadyCompleted) status = "completed";
+      else if (alreadyScheduled) status = "scheduled";
+      else if (flags.autoRoutable) status = "pending";
+      else if (flags.needsReview) status = "review";
+      else status = "inactive";
 
-    const docRef = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
-    const jobData: Record<string, unknown> = {
-      companyId,
-      subscriptionId,
-      customerId,
-      customerName: `${fname} ${lname}`.trim() || customerId,
-      firstName: fname,
-      lastName: lname,
-      address: fullAddress,
-      addressRaw: address,
-      city,
-      zip,
-      lat: typeof customer.lat === "number" ? customer.lat : num(customer.lat) || null,
-      lng: typeof customer.lng === "number" ? customer.lng : num(customer.lng) || null,
-      scheduledDate: serviceDue,
-      serviceType,
-      serviceTypeNormalized: normalizeServiceType(serviceType),
-      subscriptionCategory: deriveCategory(serviceType),
-      category: deriveCategory(serviceType),
-      duration: 25,
-      status,
-      // Routing-relevant assignment fields:
-      assignedTechId: alreadyScheduled ? scheduledTech : "",
-      fieldRoutesScheduled: alreadyScheduled,
-      fieldRoutesScheduledDate: scheduledFor || serviceDue,
-      fieldRoutesServicedBy: alreadyScheduled ? scheduledTech : "",
-      fieldRoutesServicedById: alreadyScheduled ? scheduledTechId : "",
-      fieldRoutesScheduleSource: alreadyScheduled ? "api_appointment" : "",
-      schedulingRequest: specialScheduling,
-      // Subscription / billing detail (labels match the FieldRoutes report):
-      recurringFrequency: recurringFrequencyLabel(sub.frequency),
-      billingFrequency: billingFrequencyLabel(sub.billingFrequency),
-      recurringPrice: str(sub.recurringCharge),
-      subscriptionStatus: str(sub.active),
-      subscriptionBalance: String(customerBalance),
-      subscriptionOnHold: String(onHold),
-      subscriptionLastServiced: lastCompleted,
-      subscriptionLastCompletedDate: lastCompleted,
-      serviceDueAlreadyCompleted,
-      preferredTech,
-      // Computed flags (also stored as columns for review feeds / debugging):
-      inScope,
-      pastDue: flags.pastDue,
-      balanceOk: flags.balanceOk,
-      hasConstraint: flags.hasConstraint,
-      alreadyScheduled,
-      autoRoutable: flags.autoRoutable,
-      needsReview: flags.needsReview,
-      customerBalance,
-      onHold: onHold === 1,
-      scheduledFor,
-      scheduledTech,
-      subDateUpdated: str(sub.dateUpdated),
-      source: "api",
-      syncedAt: now,
-      updatedAt: now,
-    };
+      if (inScope) inScopeCount++;
+      if (flags.autoRoutable) autoRoutableCount++;
+      if (alreadyScheduled) alreadyScheduledCount++;
+      if (flags.needsReview) needsReviewCount++;
 
-    batch.set(docRef, { ...jobData, createdAt: now }, { merge: true });
-    written++;
-    ops++;
-    if (ops >= 450) await flush();
+      const preferredTech = resolveEmpName(sub.preferredTech);
+      const fname = str(customer.fname);
+      const lname = str(customer.lname);
+      const address = str(customer.address);
+      const city = str(customer.city);
+      const zip = str(customer.zip);
+      const fullAddress = [address, city, zip].filter(Boolean).join(", ");
+
+      const docRef = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
+      const jobData: Record<string, unknown> = {
+        companyId,
+        subscriptionId,
+        customerId,
+        customerName: `${fname} ${lname}`.trim() || customerId,
+        firstName: fname,
+        lastName: lname,
+        address: fullAddress,
+        addressRaw: address,
+        city,
+        zip,
+        lat: typeof customer.lat === "number" ? customer.lat : num(customer.lat) || null,
+        lng: typeof customer.lng === "number" ? customer.lng : num(customer.lng) || null,
+        scheduledDate: serviceDue,
+        serviceType,
+        serviceTypeNormalized: normalizeServiceType(serviceType),
+        subscriptionCategory: deriveCategory(serviceType),
+        category: deriveCategory(serviceType),
+        duration: 25,
+        status,
+        // Routing-relevant assignment fields:
+        assignedTechId: alreadyScheduled ? scheduledTech : "",
+        fieldRoutesScheduled: alreadyScheduled,
+        fieldRoutesScheduledDate: scheduledFor || serviceDue,
+        fieldRoutesServicedBy: alreadyScheduled ? scheduledTech : "",
+        fieldRoutesServicedById: alreadyScheduled ? scheduledTechId : "",
+        fieldRoutesScheduleSource: alreadyScheduled ? "api_appointment" : "",
+        schedulingRequest: specialScheduling,
+        // Subscription / billing detail (labels match the FieldRoutes report):
+        recurringFrequency: recurringFrequencyLabel(sub.frequency),
+        billingFrequency: billingFrequencyLabel(sub.billingFrequency),
+        recurringPrice: str(sub.recurringCharge),
+        subscriptionStatus: str(sub.active),
+        subscriptionBalance: String(customerBalance),
+        subscriptionOnHold: String(onHold),
+        subscriptionLastServiced: lastCompleted,
+        subscriptionLastCompletedDate: lastCompleted,
+        serviceDueAlreadyCompleted,
+        preferredTech,
+        // Computed flags (also stored as columns for review feeds / debugging):
+        inScope,
+        pastDue: flags.pastDue,
+        balanceOk: flags.balanceOk,
+        hasConstraint: flags.hasConstraint,
+        alreadyScheduled,
+        autoRoutable: flags.autoRoutable,
+        needsReview: flags.needsReview,
+        customerBalance,
+        onHold: onHold === 1,
+        scheduledFor,
+        scheduledTech,
+        subDateUpdated: str(sub.dateUpdated),
+        source: "api",
+        syncedAt: now,
+        updatedAt: now,
+      };
+
+      batch.set(docRef, { ...jobData, createdAt: now }, { merge: true });
+      written++;
+      subsProcessed++;
+      ops++;
+      if (ops >= 450) await flush();
+    }
+    await flush();
+    offset += sliceIds.length;
   }
   await flush();
 
-  // Link technicians and materialize FieldRoutes-scheduled routes so they show
-  // up everywhere and the generator schedules around them. Derived from current
-  // Firestore state (no API cost); never fail the whole sync if this step errors.
-  try {
-    const reconciled = await reconcileScheduledRoutes(db, companyId, employeeById, today, now);
-    console.log(
-      `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
-        `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
+  const done = offset >= total;
+  const finishedAt = new Date().toISOString();
+
+  if (done) {
+    // Link technicians and materialize FieldRoutes-scheduled routes so they show
+    // up everywhere and the generator schedules around them. Runs only when the
+    // whole sync completes; derived from current Firestore state (no API cost).
+    try {
+      const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, today, now);
+      console.log(
+        `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
+          `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
+      );
+    } catch (err) {
+      console.error("[fieldroutes/sync] route reconciliation failed:", String(err));
+    }
+
+    // Advance the top-level cursor only when the whole run completes, so an
+    // interrupted incremental run re-resolves the same change set next time.
+    if (!cursor) cursor = now;
+    await stateRef.set(
+      {
+        cursor,
+        lastRunMode: mode,
+        lastRunAt: finishedAt,
+        lastRunWritten: written,
+        lastInScopeCount: inScopeCount,
+        run: { active: false },
+        ...(mode === "full" ? { lastFullSyncAt: finishedAt } : { lastIncrementalAt: finishedAt }),
+      },
+      { merge: true },
     );
-  } catch (err) {
-    console.error("[fieldroutes/sync] route reconciliation failed:", String(err));
+  } else {
+    const progress: RunProgress = {
+      active: true,
+      mode,
+      ids,
+      offset,
+      cursor,
+      apptMap,
+      empNames,
+      counts: {
+        inScope: inScopeCount,
+        autoRoutable: autoRoutableCount,
+        alreadyScheduled: alreadyScheduledCount,
+        needsReview: needsReviewCount,
+        written,
+        subsProcessed,
+      },
+    };
+    // Replace the whole run object (set without merge on the field) so stale keys don't linger.
+    await stateRef.set({ run: progress, lastRunMode: mode, lastRunAt: finishedAt }, { merge: true });
   }
 
-  // Advance the cursor for the next incremental run.
-  if (!cursor) cursor = now;
-  const finishedAt = new Date().toISOString();
-  await stateRef.set(
-    {
-      cursor,
-      lastRunMode: mode,
-      lastRunAt: finishedAt,
-      lastRunWritten: written,
-      lastInScopeCount: inScopeCount,
-      ...(mode === "full" ? { lastFullSyncAt: finishedAt } : { lastIncrementalAt: finishedAt }),
-    },
-    { merge: true },
-  );
+  const message = done
+    ? `Sync complete: processed ${subsProcessed} of ${total} subscriptions.`
+    : `Partial sync: ${offset} of ${total} subscriptions processed. Call the same URL again to continue.`;
 
   return {
     mode,
     companyId,
-    subscriptionsProcessed: subscriptions.length,
+    done,
+    total,
+    offset,
+    subscriptionsProcessed: subsProcessed,
     inScopeCount,
     autoRoutableCount,
     alreadyScheduledCount,
@@ -696,6 +832,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     cursor,
     startedAt,
     finishedAt,
+    message,
   };
 }
 
