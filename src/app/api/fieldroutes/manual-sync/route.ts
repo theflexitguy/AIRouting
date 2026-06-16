@@ -65,6 +65,9 @@ export async function POST(request: NextRequest) {
     const result = await runSync("incremental");
     return NextResponse.json({
       success: true,
+      // This branch's sync runs to completion in a single call, so the client
+      // never needs to repeat the request. Be explicit so the UI loop stops.
+      done: true,
       ...result,
       syncLimit: {
         limit: MAX_MANUAL_SYNCS_PER_DAY,

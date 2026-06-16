@@ -419,8 +419,13 @@ export default function JobsPage() {
       let done = false;
       let totalWritten = 0;
       let totalSubs = 0;
+      // Safety cap so a backend that never reports done can't loop forever and
+      // exhaust the daily limit.
+      let iterations = 0;
+      const MAX_ITERATIONS = 20;
 
-      while (!done && !abort.signal.aborted) {
+      while (!done && !abort.signal.aborted && iterations < MAX_ITERATIONS) {
+        iterations++;
         const res = await fetch("/api/fieldroutes/manual-sync", {
           method: "POST",
           headers: {
@@ -441,9 +446,11 @@ export default function JobsPage() {
           return;
         }
 
-        totalSubs = data.total || totalSubs;
+        totalSubs = data.total || data.subscriptionsProcessed || totalSubs;
         totalWritten = data.written || totalWritten;
-        done = data.done === true;
+        // Treat a missing `done` flag as complete — the single-pass sync
+        // finishes in one call. Only an explicit `done: false` continues.
+        done = data.done !== false;
 
         if (data.syncLimit) {
           setSyncRemaining(data.syncLimit.remaining);
@@ -454,10 +461,8 @@ export default function JobsPage() {
         }
       }
 
-      if (done) {
-        toast.success(`Sync complete: ${totalWritten} jobs updated`);
-        await loadJobs();
-      }
+      toast.success(`Sync complete: ${totalWritten} jobs updated`);
+      await loadJobs();
     } catch (err) {
       if ((err as Error).name !== "AbortError") {
         toast.error("Sync failed. Check your connection.");
