@@ -110,6 +110,327 @@ function employeeName(emp: Record<string, unknown>): string {
   return full || str(emp.name) || str(emp.employeeID || emp.employeeId);
 }
 
+function normName(value: unknown): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function haversineMiles(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
+  const radiusMiles = 3958.7613;
+  const toRad = (v: number) => (v * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return radiusMiles * 2 * Math.asin(Math.sqrt(h));
+}
+
+// Mirrors the routes page's estimateRouteMetrics so materialized FieldRoutes
+// route docs carry the same drive/work estimates the UI shows for AI routes.
+function haversineRouteMetrics(
+  stops: Array<{ lat?: number; lng?: number; duration: number }>,
+): Record<string, unknown> {
+  let drive = 0;
+  let service = 0;
+  let prev: { lat?: number; lng?: number } | null = null;
+  for (const s of stops) {
+    service += Number(s.duration) || 25;
+    if (
+      prev &&
+      typeof prev.lat === "number" &&
+      typeof prev.lng === "number" &&
+      typeof s.lat === "number" &&
+      typeof s.lng === "number"
+    ) {
+      drive += (haversineMiles({ lat: prev.lat, lng: prev.lng }, { lat: s.lat, lng: s.lng }) / 30) * 60;
+    }
+    prev = s;
+  }
+  const roundedDrive = Math.round(drive);
+  const roundedService = Math.round(service);
+  return {
+    totalDriveTimeMinutes: roundedDrive,
+    totalServiceMinutes: roundedService,
+    totalWorkMinutes: roundedDrive + roundedService,
+    driveTimeSource: "haversine_fallback",
+    polylineSource: "haversine_fallback",
+    polylineStatus: "ESTIMATE_ONLY",
+  };
+}
+
+/**
+ * Ensure a technician record exists for every FieldRoutes employee that has
+ * scheduled work, linked by FieldRoutes employee ID. This is the foundation
+ * that lets the router and UI match a scheduled job to a tech — without it,
+ * FieldRoutes routes are silently dropped (and could be double-booked).
+ * Returns lookup maps so callers can resolve a job's tech to a technician doc id.
+ */
+async function syncTechnicians(
+  db: FirebaseFirestore.Firestore,
+  companyId: string,
+  empNames: Record<string, string>,
+  servingEmployeeIds: Set<string>,
+  now: string,
+): Promise<{ empToTech: Map<string, string>; nameToTech: Map<string, string> }> {
+  const existingSnap = await db.collection(`companies/${companyId}/technicians`).get();
+  const byEmpId = new Map<string, string>();
+  const byName = new Map<string, string>();
+  existingSnap.docs.forEach((d) => {
+    const data = d.data();
+    const empId = str(data.fieldRoutesEmployeeId || data.fieldRoutesTechId || data.employeeId);
+    if (empId) byEmpId.set(empId, d.id);
+    const nm = normName(data.name);
+    if (nm) byName.set(nm, d.id);
+  });
+
+  const empToTech = new Map<string, string>();
+  const nameToTech = new Map<string, string>(byName);
+
+  let batch = db.batch();
+  let ops = 0;
+  for (const empId of servingEmployeeIds) {
+    if (!empId || empId === "0") continue;
+    const name = empNames[empId] || empId;
+    const existingId = byEmpId.get(empId) || byName.get(normName(name));
+
+    const linkFields = {
+      companyId,
+      name,
+      employeeId: empId,
+      fieldRoutesEmployeeId: empId,
+      fieldRoutesTechId: empId,
+      source: "fieldroutes",
+      updatedAt: now,
+    };
+
+    let techId: string;
+    if (existingId) {
+      // Link an existing tech (don't touch active/maxStops the user may have set).
+      techId = existingId;
+      batch.set(db.doc(`companies/${companyId}/technicians/${techId}`), linkFields, { merge: true });
+    } else {
+      techId = `fr_${empId}`;
+      batch.set(
+        db.doc(`companies/${companyId}/technicians/${techId}`),
+        { ...linkFields, active: true, maxStopsPerDay: 25, createdAt: now },
+        { merge: true },
+      );
+    }
+    empToTech.set(empId, techId);
+    nameToTech.set(normName(name), techId);
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+
+  return { empToTech, nameToTech };
+}
+
+/**
+ * Materialize FieldRoutes-scheduled appointments as real, locked route docs so
+ * they appear everywhere (dashboard counts, every map, routes page) and the
+ * generator treats them as immovable. Derived entirely from current Firestore
+ * job state (zero API cost), so it is always accurate regardless of sync mode.
+ *
+ * Existing non-FieldRoutes stops on a slot (e.g. AI-generated additions) are
+ * preserved; stale FieldRoutes stops (appointment moved/cancelled) are removed.
+ */
+async function reconcileScheduledRoutes(
+  db: FirebaseFirestore.Firestore,
+  companyId: string,
+  empNames: Record<string, string>,
+  today: string,
+  now: string,
+): Promise<{ routesWritten: number; routesDeleted: number; techsLinked: number }> {
+  interface SJob {
+    id: string;
+    date: string;
+    techEmpId: string;
+    techName: string;
+    lat?: number;
+    lng?: number;
+    duration: number;
+    scheduledDate: string;
+    customerName: string;
+  }
+
+  const jobsSnap = await db.collection(`companies/${companyId}/jobs`).where("status", "==", "scheduled").get();
+  const scheduled: SJob[] = [];
+  const servingEmployeeIds = new Set<string>();
+  jobsSnap.docs.forEach((doc) => {
+    const d = doc.data();
+    if (!d.fieldRoutesScheduled) return;
+    const date = toDateOnly(d.fieldRoutesScheduledDate || d.scheduledDate);
+    if (!date || date < today) return;
+    const techEmpId = str(d.fieldRoutesServicedById);
+    const techName = str(d.fieldRoutesServicedBy || d.assignedTechId);
+    if (techEmpId) servingEmployeeIds.add(techEmpId);
+    scheduled.push({
+      id: doc.id,
+      date,
+      techEmpId,
+      techName,
+      lat: typeof d.lat === "number" ? d.lat : undefined,
+      lng: typeof d.lng === "number" ? d.lng : undefined,
+      duration: Number(d.duration) || 25,
+      scheduledDate: str(d.scheduledDate),
+      customerName: str(d.customerName),
+    });
+  });
+
+  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, servingEmployeeIds, now);
+  const resolveTechId = (j: SJob) =>
+    empToTech.get(j.techEmpId) || nameToTech.get(normName(j.techName)) || "";
+
+  // Group scheduled jobs by (date :: techId).
+  const groups = new Map<string, { date: string; techId: string; techName: string; jobs: SJob[] }>();
+  for (const j of scheduled) {
+    const techId = resolveTechId(j);
+    if (!techId) continue;
+    const key = `${j.date}::${techId}`;
+    if (!groups.has(key)) {
+      const techName = empNames[j.techEmpId] || j.techName || techId;
+      groups.set(key, { date: j.date, techId, techName, jobs: [] });
+    }
+    groups.get(key)!.jobs.push(j);
+  }
+
+  // Load existing future routes to preserve generated stops and clean up stale ones.
+  const routesSnap = await db.collection(`companies/${companyId}/routes`).where("date", ">=", today).get();
+  const existingBySlot = new Map<string, { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData }>();
+  routesSnap.docs.forEach((rd) => {
+    const r = rd.data();
+    existingBySlot.set(`${str(r.date)}::${str(r.techId)}`, { ref: rd.ref, data: r });
+  });
+
+  let batch = db.batch();
+  let ops = 0;
+  let routesWritten = 0;
+  let routesDeleted = 0;
+  const commit = async () => {
+    if (ops > 0) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  };
+
+  const handledSlots = new Set<string>();
+  for (const [key, group] of groups) {
+    handledSlots.add(key);
+    const orderedJobs = group.jobs
+      .slice()
+      .sort(
+        (a, b) =>
+          a.scheduledDate.localeCompare(b.scheduledDate) ||
+          a.customerName.localeCompare(b.customerName),
+      );
+    const frStopIds = orderedJobs.map((j) => j.id);
+    const metrics = haversineRouteMetrics(orderedJobs);
+    const existing = existingBySlot.get(key);
+
+    if (existing) {
+      const prevFr: string[] = Array.isArray(existing.data.fieldRoutesStopIds)
+        ? existing.data.fieldRoutesStopIds.map(String)
+        : [];
+      const prevSeq: string[] = Array.isArray(existing.data.stopSequence)
+        ? existing.data.stopSequence.map(String)
+        : [];
+      // Keep generated (non-FieldRoutes) stops; swap in the current FR stops.
+      const preserved = prevSeq.filter((id) => !prevFr.includes(id) && !frStopIds.includes(id));
+      const newSeq = [...frStopIds, ...preserved];
+      const isPureFieldRoutes = preserved.length === 0;
+      batch.set(
+        existing.ref,
+        {
+          companyId,
+          date: group.date,
+          techId: group.techId,
+          techName: group.techName,
+          stopSequence: newSeq,
+          totalStops: newSeq.length,
+          fieldRoutesStopIds: frStopIds,
+          hasFieldRoutesStops: true,
+          ...metrics,
+          // A pure-FieldRoutes slot is locked. A slot that also holds generated
+          // stops keeps its existing approval so we don't surprise-lock an AI
+          // route — its FieldRoutes stops are still protected by pinning.
+          approved: isPureFieldRoutes ? true : existing.data.approved === true,
+          ...(isPureFieldRoutes ? { locked: true } : {}),
+          source: isPureFieldRoutes ? "fieldroutes" : "mixed",
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+    } else {
+      batch.set(db.doc(`companies/${companyId}/routes/${group.date}-${group.techId}`), {
+        companyId,
+        date: group.date,
+        techId: group.techId,
+        techName: group.techName,
+        stopSequence: frStopIds,
+        totalStops: frStopIds.length,
+        fieldRoutesStopIds: frStopIds,
+        hasFieldRoutesStops: true,
+        ...metrics,
+        confidence: 1,
+        approved: true,
+        locked: true,
+        source: "fieldroutes",
+        generatedBy: "fieldroutes",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    routesWritten++;
+    ops++;
+    if (ops >= 450) await commit();
+  }
+
+  // Clean up slots that previously held FieldRoutes stops but no longer do.
+  for (const [key, existing] of existingBySlot) {
+    if (handledSlots.has(key)) continue;
+    const prevFr: string[] = Array.isArray(existing.data.fieldRoutesStopIds)
+      ? existing.data.fieldRoutesStopIds.map(String)
+      : [];
+    if (prevFr.length === 0) continue; // not FieldRoutes-managed — leave it alone
+    const prevSeq: string[] = Array.isArray(existing.data.stopSequence)
+      ? existing.data.stopSequence.map(String)
+      : [];
+    const preserved = prevSeq.filter((id) => !prevFr.includes(id));
+    if (preserved.length === 0) {
+      batch.delete(existing.ref);
+      routesDeleted++;
+    } else {
+      batch.set(
+        existing.ref,
+        {
+          stopSequence: preserved,
+          totalStops: preserved.length,
+          fieldRoutesStopIds: [],
+          hasFieldRoutesStops: false,
+          source: existing.data.source === "mixed" ? "ai" : existing.data.source,
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+    }
+    ops++;
+    if (ops >= 450) await commit();
+  }
+  await commit();
+
+  return { routesWritten, routesDeleted, techsLinked: empToTech.size };
+}
+
 /** Stable ascending order so the resume offset points at the same IDs across invocations. */
 function sortIds(ids: string[]): string[] {
   return ids
@@ -441,6 +762,19 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   const finishedAt = new Date().toISOString();
 
   if (done) {
+    // Link technicians and materialize FieldRoutes-scheduled routes so they show
+    // up everywhere and the generator schedules around them. Runs only when the
+    // whole sync completes; derived from current Firestore state (no API cost).
+    try {
+      const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, today, now);
+      console.log(
+        `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
+          `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
+      );
+    } catch (err) {
+      console.error("[fieldroutes/sync] route reconciliation failed:", String(err));
+    }
+
     // Advance the top-level cursor only when the whole run completes, so an
     // interrupted incremental run re-resolves the same change set next time.
     if (!cursor) cursor = now;

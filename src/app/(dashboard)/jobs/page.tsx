@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { collection, query, where, getDocs, orderBy, doc, writeBatch } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { db, auth as firebaseAuth } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,7 +14,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { SkeletonRow } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
-import { Upload, Search, MapPin, Calendar, User, Loader2, FileSpreadsheet, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw } from "lucide-react";
+import { Search, MapPin, Calendar, User, Loader2, FileSpreadsheet, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
@@ -103,8 +103,8 @@ export default function JobsPage() {
   const [jobs, setJobs] = useState<JobRow[]>([]);
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [loading, setLoading] = useState(true);
-  const [uploading, setUploading] = useState(false);
-  const [scheduledUploading, setScheduledUploading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncRemaining, setSyncRemaining] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterTech, setFilterTech] = useState("all");
@@ -114,14 +114,12 @@ export default function JobsPage() {
   const [filterServiceFrequency, setFilterServiceFrequency] = useState("all");
   const [dateFrom, setDateFrom] = useState(format(startOfYear(new Date()), "yyyy-MM-dd"));
   const [dateTo, setDateTo] = useState(format(addDays(new Date(), 90), "yyyy-MM-dd"));
-  const [uploadResult, setUploadResult] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [selectedCsvJob, setSelectedCsvJob] = useState<JobRow | null>(null);
   const [bulkLoading, setBulkLoading] = useState(false);
   const [pageSize, setPageSize] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const scheduledFileInputRef = useRef<HTMLInputElement>(null);
+  const syncAbortRef = useRef<AbortController | null>(null);
 
   const today = format(new Date(), "yyyy-MM-dd");
 
@@ -386,53 +384,93 @@ export default function JobsPage() {
     if (currentPage > totalPages) setCurrentPage(totalPages);
   }, [currentPage, totalPages]);
 
-  const uploadCsvFile = async (
-    file: File,
-    uploadKind: "job_pool" | "scheduled_jobs",
-  ) => {
-    if (!file || !userProfile?.companyId) return;
-
-    if (uploadKind === "scheduled_jobs") setScheduledUploading(true);
-    else setUploading(true);
-    setUploadResult(null);
+  const fetchSyncLimit = useCallback(async () => {
+    if (!firebaseAuth?.currentUser) return;
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("companyId", userProfile.companyId);
-      formData.append("uploadKind", uploadKind);
-
-      const res = await fetch("/api/upload-jobs", {
-        method: "POST",
-        body: formData,
+      const token = await firebaseAuth.currentUser.getIdToken();
+      const res = await fetch("/api/fieldroutes/manual-sync", {
+        headers: { Authorization: `Bearer ${token}` },
       });
-      const data = await res.json();
-      if (data.success) {
-        setUploadResult(data.message || `${data.new} new, ${data.updated} updated`);
-        if (uploadKind === "scheduled_jobs") setFilterStatus("scheduled");
-        await loadJobs();
-      } else {
-        setUploadResult(`Upload failed: ${data.error}`);
+      if (res.ok) {
+        const data = await res.json();
+        setSyncRemaining(data.remaining ?? null);
       }
-    } catch {
-      setUploadResult("Upload failed. Check your connection.");
-    } finally {
-      if (uploadKind === "scheduled_jobs") setScheduledUploading(false);
-      else setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-      if (scheduledFileInputRef.current) scheduledFileInputRef.current.value = "";
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { fetchSyncLimit(); }, [fetchSyncLimit]);
+
+  const handleManualSync = async () => {
+    if (!firebaseAuth?.currentUser) {
+      toast.error("Not authenticated");
+      return;
     }
-  };
+    if (syncRemaining !== null && syncRemaining <= 0) {
+      toast.error("Daily sync limit reached (3 per day)");
+      return;
+    }
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await uploadCsvFile(file, "job_pool");
-  };
+    setSyncing(true);
+    const abort = new AbortController();
+    syncAbortRef.current = abort;
 
-  const handleScheduledUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await uploadCsvFile(file, "scheduled_jobs");
+    try {
+      const token = await firebaseAuth.currentUser.getIdToken();
+      let done = false;
+      let totalWritten = 0;
+      let totalSubs = 0;
+      // Safety cap so a backend that never reports done can't loop forever and
+      // exhaust the daily limit.
+      let iterations = 0;
+      const MAX_ITERATIONS = 20;
+
+      while (!done && !abort.signal.aborted && iterations < MAX_ITERATIONS) {
+        iterations++;
+        const res = await fetch("/api/fieldroutes/manual-sync", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          signal: abort.signal,
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          if (res.status === 429) {
+            toast.error("Daily sync limit reached (3 per day)");
+            setSyncRemaining(0);
+          } else {
+            toast.error(data.error || "Sync failed");
+          }
+          return;
+        }
+
+        totalSubs = data.total || data.subscriptionsProcessed || totalSubs;
+        totalWritten = data.written || totalWritten;
+        // Treat a missing `done` flag as complete — the single-pass sync
+        // finishes in one call. Only an explicit `done: false` continues.
+        done = data.done !== false;
+
+        if (data.syncLimit) {
+          setSyncRemaining(data.syncLimit.remaining);
+        }
+
+        if (!done) {
+          toast.info(`Syncing... ${data.offset || 0} of ${totalSubs} processed`);
+        }
+      }
+
+      toast.success(`Sync complete: ${totalWritten} jobs updated`);
+      await loadJobs();
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        toast.error("Sync failed. Check your connection.");
+      }
+    } finally {
+      setSyncing(false);
+      syncAbortRef.current = null;
+    }
   };
 
   const getTechLabel = (assignedTechId?: string) => {
@@ -518,37 +556,19 @@ export default function JobsPage() {
               <SelectItem value="250">250 rows</SelectItem>
             </SelectContent>
           </Select>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".csv"
-            onChange={handleUpload}
-            className="hidden"
-          />
-          <input
-            ref={scheduledFileInputRef}
-            type="file"
-            accept=".csv"
-            onChange={handleScheduledUpload}
-            className="hidden"
-          />
           <Button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading || scheduledUploading}
+            onClick={handleManualSync}
+            disabled={syncing || (syncRemaining !== null && syncRemaining <= 0)}
             className="bg-blue-500 hover:bg-blue-600 text-white shrink-0 h-9"
           >
-            {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-            Upload CSV
+            {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+            {syncing ? "Syncing..." : "Sync Jobs"}
           </Button>
-          <Button
-            onClick={() => scheduledFileInputRef.current?.click()}
-            disabled={uploading || scheduledUploading}
-            variant="outline"
-            className="shrink-0 h-9"
-          >
-            {scheduledUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Calendar className="w-4 h-4" />}
-            Upload Scheduled Jobs CSV
-          </Button>
+          {syncRemaining !== null && (
+            <span className="text-xs text-muted-foreground self-center">
+              {syncRemaining} sync{syncRemaining !== 1 ? "s" : ""} left today
+            </span>
+          )}
         </div>
 
         <div className="flex flex-col lg:flex-row gap-2.5">
@@ -615,19 +635,6 @@ export default function JobsPage() {
           <DatePicker value={dateTo} onChange={setDateTo} className="h-8 text-xs" />
         </div>
 
-        {/* CSV format hint */}
-        <div className="flex items-start gap-2 text-xs text-muted-foreground bg-accent/30 rounded-lg px-3 py-2 border border-border/40">
-          <FileSpreadsheet className="w-4 h-4 mt-0.5 shrink-0" />
-          <span>
-            Accepts FieldRoutes CSV exports and preserves every uploaded column. Key columns: <code className="bg-accent px-1 rounded">Customer ID</code>, <code className="bg-accent px-1 rounded">Address</code>, <code className="bg-accent px-1 rounded">Service Due</code>, <code className="bg-accent px-1 rounded">Scheduled For</code>, <code className="bg-accent px-1 rounded">Serviced By</code>, <code className="bg-accent px-1 rounded">Preferred Tech</code>, <code className="bg-accent px-1 rounded">Billing Frequency</code>, <code className="bg-accent px-1 rounded">Recurring Frequency</code>, <code className="bg-accent px-1 rounded">Recurring Price</code>
-          </span>
-        </div>
-
-        {uploadResult && (
-          <div className={`text-sm px-3 py-2.5 rounded-lg border animate-scale-in ${uploadResult.includes("failed") ? "bg-red-500/8 border-red-500/15 text-red-400" : "bg-emerald-500/8 border-emerald-500/15 text-emerald-400"}`}>
-            {uploadResult}
-          </div>
-        )}
 
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground/60 animate-fade-in">
           <span>
@@ -877,7 +884,7 @@ export default function JobsPage() {
                       {jobs.length === 0 ? "No jobs yet" : "No jobs match your filters"}
                     </p>
                     <p className="text-xs text-muted-foreground/50 mt-1">
-                      {jobs.length === 0 ? "Upload a CSV to get started." : "Try adjusting filters."}
+                      {jobs.length === 0 ? "Use Sync Jobs to pull data from FieldRoutes." : "Try adjusting filters."}
                     </p>
                   </div>
                 )}
@@ -950,7 +957,7 @@ export default function JobsPage() {
                   <div className="flex flex-col items-center text-center py-16">
                     <Briefcase className="w-8 h-8 text-muted-foreground/20 mb-3" />
                     <p className="text-sm text-muted-foreground">
-                      {jobs.length === 0 ? "No jobs yet. Upload a CSV to get started." : "No jobs match your filters."}
+                      {jobs.length === 0 ? "No jobs yet. Use Sync Jobs to pull data from FieldRoutes." : "No jobs match your filters."}
                     </p>
                   </div>
                 )}
