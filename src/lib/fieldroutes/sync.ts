@@ -531,6 +531,25 @@ async function buildRunSetup(
   const pendingAppts = pendingApptIds.length
     ? await client.getEntities("appointment", pendingApptIds)
     : [];
+
+  // The appointment's employeeID is the office person who CREATED it, not the
+  // field technician. The actual tech lives on the route entity the appointment
+  // belongs to — resolve via routeID.
+  const routeIdSet = new Set<string>();
+  for (const a of pendingAppts) {
+    const routeId = str(rec(a).routeID);
+    if (routeId && routeId !== "0") routeIdSet.add(routeId);
+  }
+  const routeIds = Array.from(routeIdSet);
+  const routes = routeIds.length ? await client.getEntities("route", routeIds) : [];
+  const routeTechMap = new Map<string, string>();
+  for (const r of routes) {
+    const rr = rec(r);
+    const rid = str(rr.routeID);
+    const techEmpId = str(rr.employeeID);
+    if (rid && techEmpId && techEmpId !== "0") routeTechMap.set(rid, techEmpId);
+  }
+
   const apptMap: Record<string, ApptInfo> = {};
   for (const a of pendingAppts) {
     const ar = rec(a);
@@ -539,12 +558,15 @@ async function buildRunSetup(
     const date = toDateOnly(ar.date);
     if (!date || date < today) continue;
     const existing = apptMap[subId];
+    // Resolve the tech from the route, not the appointment's employeeID.
+    const routeId = str(ar.routeID);
+    const techEmpId = routeTechMap.get(routeId) || "";
     // Keep the earliest upcoming appointment.
     if (!existing || date < existing.date) {
       apptMap[subId] = {
         date,
-        techId: str(ar.employeeID), // VERIFIED: employeeID, not assignedTech
-        techName: resolveEmpName(ar.employeeID),
+        techId: techEmpId,
+        techName: resolveEmpName(techEmpId),
       };
     }
   }
