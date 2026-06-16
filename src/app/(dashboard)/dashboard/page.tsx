@@ -83,7 +83,27 @@ export default function DashboardPage() {
       const routesSnap = await getDocs(routesQuery);
       const todayRoutes = routesSnap.docs.map(d => d.data());
 
-      const totalStops = todayRoutes.reduce((sum, r) => sum + (r.totalStops || 0), 0);
+      // FieldRoutes appointments scheduled for today are real per-tech routes
+      // too, but they live as scheduled jobs (scheduledFor === today), not saved
+      // route docs. Count them — grouped by tech — so the dashboard matches the
+      // Route Builder instead of only showing saved AI routes.
+      const scheduledTodaySnap = await getDocs(
+        query(collection(db, `companies/${companyId}/jobs`), where("scheduledFor", "==", today))
+      );
+      const scheduledTechs = new Set<string>();
+      let scheduledStops = 0;
+      scheduledTodaySnap.forEach((d) => {
+        const j = d.data();
+        if (j.status !== "scheduled") return;
+        scheduledStops++;
+        scheduledTechs.add(
+          String(j.fieldRoutesServicedBy || j.fieldRoutesServicedById || j.assignedTechId || d.id)
+        );
+      });
+
+      const routesToday = todayRoutes.length + scheduledTechs.size;
+      const totalStops =
+        todayRoutes.reduce((sum, r) => sum + (r.totalStops || 0), 0) + scheduledStops;
       const estimatedDriveTime = todayRoutes.reduce((sum, r) => sum + (r.totalDriveTimeMinutes || 0), 0);
       const avgConfidence = todayRoutes.length > 0
         ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
@@ -139,7 +159,7 @@ export default function DashboardPage() {
       }));
 
       setStats({
-        todayRoutes: todayRoutes.length,
+        todayRoutes: routesToday,
         totalStops,
         overdueStops,
         estimatedDriveTime,
