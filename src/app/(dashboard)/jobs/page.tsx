@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { collection, query, where, getDocs, orderBy, doc, writeBatch } from "firebase/firestore";
 import { db, auth as firebaseAuth } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -10,11 +10,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { SkeletonRow } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
-import { Search, MapPin, Calendar, User, Loader2, FileSpreadsheet, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw } from "lucide-react";
+import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
@@ -48,7 +47,6 @@ function uniqueOptions(values: Array<unknown>) {
     .sort((a, b) => a.localeCompare(b));
 }
 
-// Extended job type for all CSV fields
 interface JobRow {
   id: string;
   companyId: string;
@@ -80,22 +78,6 @@ interface JobRow {
   productionValue?: string;
   subscriptionCategory?: string;
   source?: string;
-  rawCsv?: Record<string, unknown>;
-  csvFields?: Array<{ name?: string; value?: unknown }>;
-}
-
-function getCsvFields(job: JobRow) {
-  if (Array.isArray(job.csvFields) && job.csvFields.length > 0) {
-    return job.csvFields.map((field) => ({
-      name: String(field.name || ""),
-      value: String(field.value ?? ""),
-    }));
-  }
-
-  return Object.entries(job.rawCsv || {}).map(([name, value]) => ({
-    name,
-    value: String(value ?? ""),
-  }));
 }
 
 export default function JobsPage() {
@@ -115,7 +97,6 @@ export default function JobsPage() {
   const [dateFrom, setDateFrom] = useState(format(startOfYear(new Date()), "yyyy-MM-dd"));
   const [dateTo, setDateTo] = useState(format(addDays(new Date(), 90), "yyyy-MM-dd"));
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [selectedCsvJob, setSelectedCsvJob] = useState<JobRow | null>(null);
   const [bulkLoading, setBulkLoading] = useState(false);
   const [pageSize, setPageSize] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
@@ -296,8 +277,6 @@ export default function JobsPage() {
           j.scheduledDate,
           j.fieldRoutesScheduledDate,
           j.status,
-          ...Object.values(j.rawCsv || {}),
-          ...(j.csvFields || []).flatMap((field) => [field.name, field.value]),
         ];
         return searchableValues.some((value) => normalizeText(value).includes(s));
       });
@@ -419,8 +398,6 @@ export default function JobsPage() {
       let done = false;
       let totalWritten = 0;
       let totalSubs = 0;
-      // Safety cap so a backend that never reports done can't loop forever and
-      // exhaust the daily limit.
       let iterations = 0;
       const MAX_ITERATIONS = 20;
 
@@ -448,8 +425,6 @@ export default function JobsPage() {
 
         totalSubs = data.total || data.subscriptionsProcessed || totalSubs;
         totalWritten = data.written || totalWritten;
-        // Treat a missing `done` flag as complete — the single-pass sync
-        // finishes in one call. Only an explicit `done: false` continues.
         done = data.done !== false;
 
         if (data.syncLimit) {
@@ -472,6 +447,7 @@ export default function JobsPage() {
       syncAbortRef.current = null;
     }
   };
+
 
   const getTechLabel = (assignedTechId?: string) => {
     const assigned = normalizeText(assignedTechId);
@@ -636,6 +612,7 @@ export default function JobsPage() {
         </div>
 
 
+
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground/60 animate-fade-in">
           <span>
             {filteredJobs.length > 0
@@ -753,9 +730,7 @@ export default function JobsPage() {
                       <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Service Freq</th>
                       <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Recurring Price</th>
                       <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Stop Value</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">CSV Production</th>
                       <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Sub Status</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">CSV Fields</th>
                       <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Status</th>
                     </tr>
                   </thead>
@@ -765,7 +740,6 @@ export default function JobsPage() {
                       const sc = statusConfig[status] || statusConfig.pending;
                       const pastDue = isPastDue(job);
                       const stopProduction = calculateStopProductionValue(job);
-                      const csvFieldCount = getCsvFields(job).length;
                       const scheduledRouteDate =
                         job.fieldRoutesScheduledDate && job.fieldRoutesScheduledDate !== job.scheduledDate
                           ? job.fieldRoutesScheduledDate
@@ -845,29 +819,12 @@ export default function JobsPage() {
                               </div>
                             ) : "-"}
                           </td>
-                          <td className="p-4 text-muted-foreground/70 whitespace-nowrap">
-                            {stopProduction.csvValue !== null ? formatCurrency(stopProduction.csvValue) : "-"}
-                          </td>
                           <td className="p-4">
                             {job.subscriptionStatus ? (
                               <Badge variant={job.subscriptionStatus === "Active" ? "success" : "secondary"} className="text-[10px]">
                                 {job.subscriptionStatus}
                               </Badge>
                             ) : "—"}
-                          </td>
-                          <td className="p-4">
-                            {csvFieldCount > 0 ? (
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                className="h-7 px-2 text-xs"
-                                onClick={() => setSelectedCsvJob(job)}
-                              >
-                                <FileSpreadsheet className="w-3 h-3" />
-                                {csvFieldCount}
-                              </Button>
-                            ) : "-"}
                           </td>
                           <td className="p-4">
                             <Badge variant={sc.variant} className="text-[11px]">{sc.label}</Badge>
@@ -884,7 +841,7 @@ export default function JobsPage() {
                       {jobs.length === 0 ? "No jobs yet" : "No jobs match your filters"}
                     </p>
                     <p className="text-xs text-muted-foreground/50 mt-1">
-                      {jobs.length === 0 ? "Use Sync Jobs to pull data from FieldRoutes." : "Try adjusting filters."}
+                      {jobs.length === 0 ? "Use Sync Jobs to pull data from FieldRoutes." : "Try adjusting filters or the date range."}
                     </p>
                   </div>
                 )}
@@ -897,7 +854,6 @@ export default function JobsPage() {
                   const sc = statusConfig[status] || statusConfig.pending;
                   const pastDue = isPastDue(job);
                   const stopProduction = calculateStopProductionValue(job);
-                  const csvFieldCount = getCsvFields(job).length;
                   const scheduledRouteDate =
                     job.fieldRoutesScheduledDate && job.fieldRoutesScheduledDate !== job.scheduledDate
                       ? job.fieldRoutesScheduledDate
@@ -934,21 +890,8 @@ export default function JobsPage() {
                           <span><Repeat className="w-3 h-3 inline mr-1" />Service: {job.recurringFrequency || "-"}</span>
                           <span><DollarSign className="w-3 h-3 inline mr-1" />Price: {formatCurrency(stopProduction.price)}</span>
                           <span className="text-emerald-400"><DollarSign className="w-3 h-3 inline mr-1" />Stop: {formatCurrency(stopProduction.value)}</span>
-                          <span>CSV Production: {formatCurrency(stopProduction.csvValue)}</span>
                           {job.subscriptionStatus && <Badge variant={job.subscriptionStatus === "Active" ? "success" : "secondary"} className="text-[10px]">{job.subscriptionStatus}</Badge>}
                         </div>
-                        {csvFieldCount > 0 && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="mt-2 h-7 px-2 text-xs"
-                            onClick={() => setSelectedCsvJob(job)}
-                          >
-                            <FileSpreadsheet className="w-3 h-3" />
-                            View {csvFieldCount} CSV fields
-                          </Button>
-                        )}
                       </div>
                     </div>
                   );
@@ -966,38 +909,6 @@ export default function JobsPage() {
           </Card>
         )}
       </div>
-      <Dialog open={Boolean(selectedCsvJob)} onOpenChange={(open) => { if (!open) setSelectedCsvJob(null); }}>
-        <DialogContent className="max-w-3xl max-h-[85vh] overflow-hidden">
-          {selectedCsvJob && (
-            <>
-              <DialogHeader>
-                <DialogTitle>CSV Fields</DialogTitle>
-                <DialogDescription>
-                  {selectedCsvJob.customerName} · Customer {selectedCsvJob.customerId || "-"} · Subscription {selectedCsvJob.subscriptionId || "-"}
-                </DialogDescription>
-              </DialogHeader>
-              <div className="overflow-auto rounded-lg border border-border/50 max-h-[65vh]">
-                <table className="w-full text-sm">
-                  <thead className="sticky top-0 bg-background border-b border-border/60">
-                    <tr className="text-muted-foreground/70">
-                      <th className="text-left p-3 font-medium text-xs uppercase tracking-wider w-1/3">Column</th>
-                      <th className="text-left p-3 font-medium text-xs uppercase tracking-wider">Value</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {getCsvFields(selectedCsvJob).map((field, index) => (
-                      <tr key={`${field.name}-${index}`} className="border-b border-border/30 last:border-0">
-                        <td className="p-3 text-muted-foreground/70 align-top">{field.name || `Column ${index + 1}`}</td>
-                        <td className="p-3 text-foreground break-words">{field.value || "-"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
