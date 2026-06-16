@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
+import { adminDb } from "@/lib/firebase-admin";
 import { runSync, type SyncMode } from "@/lib/fieldroutes/sync";
 
 // Guards the route with CRON_SECRET. Vercel Cron automatically sends
@@ -24,6 +25,16 @@ async function handle(request: NextRequest) {
   }
 
   const url = new URL(request.url);
+
+  // ?action=reset-sync-counter resets the manual sync daily limit.
+  if (url.searchParams.get("action") === "reset-sync-counter") {
+    const companyId = (process.env.FIELDROUTES_COMPANY_ID || "").trim();
+    if (!companyId) return NextResponse.json({ error: "no company id" }, { status: 500 });
+    const db = adminDb();
+    await db.doc(`companies/${companyId}/fieldRoutesState/manualSync`).set({ date: "", count: 0 }, { merge: true });
+    return NextResponse.json({ success: true, message: "Sync counter reset. You have 3 fresh syncs." });
+  }
+
   let mode = (url.searchParams.get("mode") || "").toLowerCase();
   if (mode !== "full" && mode !== "incremental") {
     // Cron default is incremental; full is opt-in.
