@@ -26,17 +26,59 @@ async function handle(request: NextRequest) {
 
   const url = new URL(request.url);
 
-  // ?action=inspect-employees dumps a few employee records so we can see fields.
-  if (url.searchParams.get("action") === "inspect-employees") {
-    const { FieldRoutesClient } = await import("@/lib/fieldroutes/client");
-    const client = new FieldRoutesClient();
-    const empIds = await client.searchIds("employee", {});
-    const emps = empIds.length ? await client.getEntities("employee", empIds.slice(0, 10)) : [];
+  // ?action=cleanup wipes all stale FieldRoutes-derived data so the next sync
+  // rebuilds it cleanly: phantom fr_* technician docs, FieldRoutes route docs,
+  // the cached resumable-run state, and the daily manual-sync counter.
+  if (url.searchParams.get("action") === "cleanup") {
+    const companyId = (process.env.FIELDROUTES_COMPANY_ID || "").trim();
+    if (!companyId) return NextResponse.json({ error: "no company id" }, { status: 500 });
+    const db = adminDb();
+    let phantomTechsDeleted = 0;
+    let staleRoutesDeleted = 0;
+    let batch = db.batch();
+    let ops = 0;
+    const flush = async (force = false) => {
+      if (ops >= 450 || (force && ops > 0)) {
+        await batch.commit();
+        batch = db.batch();
+        ops = 0;
+      }
+    };
+
+    const techSnap = await db.collection(`companies/${companyId}/technicians`).get();
+    for (const doc of techSnap.docs) {
+      if (doc.id.startsWith("fr_")) {
+        batch.delete(doc.ref);
+        phantomTechsDeleted++;
+        ops++;
+        await flush();
+      }
+    }
+
+    const routeSnap = await db.collection(`companies/${companyId}/routes`).get();
+    for (const doc of routeSnap.docs) {
+      const data = doc.data();
+      if (data.source === "fieldroutes" || data.generatedBy === "fieldroutes") {
+        batch.delete(doc.ref);
+        staleRoutesDeleted++;
+        ops++;
+        await flush();
+      }
+    }
+
+    batch.set(db.doc(`companies/${companyId}/fieldRoutesState/sync`), { run: { active: false } }, { merge: true });
+    ops++;
+    batch.set(db.doc(`companies/${companyId}/fieldRoutesState/manualSync`), { date: "", count: 0 }, { merge: true });
+    ops++;
+    await flush(true);
+
     return NextResponse.json({
-      totalEmployees: empIds.length,
-      sampleFieldKeys: emps[0] ? Object.keys(emps[0] as Record<string, unknown>).sort() : [],
-      employees: emps,
-      apiReads: client.readCount,
+      success: true,
+      phantomTechsDeleted,
+      staleRoutesDeleted,
+      syncRunCleared: true,
+      syncCounterReset: true,
+      message: "Cleanup complete. Run a sync (Jobs page or the sync URL) to rebuild cleanly.",
     });
   }
 
