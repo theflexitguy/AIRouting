@@ -26,6 +26,20 @@ async function handle(request: NextRequest) {
 
   const url = new URL(request.url);
 
+  // ?action=inspect-employees dumps a few employee records so we can see fields.
+  if (url.searchParams.get("action") === "inspect-employees") {
+    const { FieldRoutesClient } = await import("@/lib/fieldroutes/client");
+    const client = new FieldRoutesClient();
+    const empIds = await client.searchIds("employee", {});
+    const emps = empIds.length ? await client.getEntities("employee", empIds.slice(0, 10)) : [];
+    return NextResponse.json({
+      totalEmployees: empIds.length,
+      sampleFieldKeys: emps[0] ? Object.keys(emps[0] as Record<string, unknown>).sort() : [],
+      employees: emps,
+      apiReads: client.readCount,
+    });
+  }
+
   // ?action=reset-sync-counter resets the manual sync daily limit.
   if (url.searchParams.get("action") === "reset-sync-counter") {
     const companyId = (process.env.FIELDROUTES_COMPANY_ID || "").trim();
