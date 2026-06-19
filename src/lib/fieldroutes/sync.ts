@@ -536,6 +536,21 @@ async function buildRunSetup(
   const employeeIds = await client.searchIds("employee", {});
   const employees = employeeIds.length ? await client.getEntities("employee", employeeIds) : [];
   const empNames: Record<string, string> = {};
+  // route.assignedTech can reference an employee by any of several ID fields
+  // (employeeID, roamingRep, linkedEmployeeIDs) — confirmed against live data
+  // where a tech's employeeID (e.g. 10005) differs from the ID routes use
+  // (e.g. roamingRep 10122). Map every alias so the tech name always resolves;
+  // employeeID wins on collision.
+  for (const e of employees) {
+    const er = rec(e);
+    const name = employeeName(er);
+    for (const raw of [er.roamingRep, er.linkedEmployeeIDs]) {
+      for (const part of str(raw).split(",")) {
+        const id = part.trim();
+        if (id && id !== "0" && !empNames[id]) empNames[id] = name;
+      }
+    }
+  }
   for (const e of employees) {
     const er = rec(e);
     const id = str(er.employeeID || er.employeeId);
