@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { CRITICAL_CLASSES, parseSchedulingRequest } from "@/lib/scheduling-constraints";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
+import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const APPOINTMENT_ID_FIELDS = ["appointmentID", "appointmentId", "appointment_id", "id"];
@@ -141,6 +142,12 @@ class FieldRoutesClient {
   private baseUrl: string;
   private authKey: string;
   private authToken: string;
+  // Per-approval API tallies, metered against the company's daily cap.
+  reads = 0;
+  writes = 0;
+  // Hard cap on combined reads+writes this approval may perform (the remaining
+  // daily budget). Defaults to no limit; set via setMaxTotal() before uploading.
+  private maxTotal = Infinity;
 
   constructor({ baseUrl, authKey, authToken }: { baseUrl: string; authKey: string; authToken: string }) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
@@ -148,7 +155,21 @@ class FieldRoutesClient {
     this.authToken = authToken;
   }
 
+  /** Cap combined reads+writes for this approval (the remaining daily budget). */
+  setMaxTotal(limit: number) {
+    this.maxTotal = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0;
+  }
+
   async request(endpoint: string, payload: FieldRoutesPayload, write = false) {
+    // Refuse before consuming quota when the daily cap is exhausted.
+    if (this.reads + this.writes >= this.maxTotal) {
+      throw new ApproveRouteError(
+        `FieldRoutes daily API cap reached (${this.reads + this.writes} calls this approval). Raise the cap in Settings or wait until it resets at midnight Central.`,
+        429,
+      );
+    }
+    if (write) this.writes++;
+    else this.reads++;
     const ep = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
     const requestBody = Object.fromEntries(
       Object.entries({
@@ -1660,11 +1681,16 @@ async function uploadRouteToFieldRoutes({
 }
 
 export async function POST(request: NextRequest) {
+  // Hoisted so the finally block can meter whatever API quota this approval spent.
+  let usageClient: FieldRoutesClient | null = null;
+  let usageCompanyId = "";
+  const usageDb = adminDb();
   try {
     const { companyId, routeId, approvedBy } = await request.json();
     if (!companyId || !routeId) {
       return NextResponse.json({ error: "companyId and routeId are required" }, { status: 400 });
     }
+    usageCompanyId = companyId;
 
     const db = adminDb();
     const [companyDoc, routeDoc] = await Promise.all([
@@ -1750,6 +1776,18 @@ export async function POST(request: NextRequest) {
       authKey,
       authToken,
     });
+    usageClient = client;
+
+    // Enforce the daily API cap (combined reads+writes, shared with the sync).
+    const budget = await loadBudget(db, companyId);
+    if (budget.remaining <= 0) {
+      throw new ApproveRouteError(
+        `FieldRoutes daily API cap reached (${budget.used}/${budget.cap} reads+writes). Raise the cap in Settings or wait until it resets at midnight Central.`,
+        429,
+      );
+    }
+    client.setMaxTotal(budget.remaining);
+
     const syncSummary = await uploadRouteToFieldRoutes({
       client,
       route: routeWithConfig,
@@ -1806,5 +1844,17 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: error.message, details: error.details }, { status: error.status });
     }
     return NextResponse.json({ error: "Failed to approve route", details: String(error) }, { status: 500 });
+  } finally {
+    // Meter whatever FieldRoutes quota this approval consumed, even on failure.
+    if (usageClient && usageCompanyId && (usageClient.reads > 0 || usageClient.writes > 0)) {
+      try {
+        await recordApiUsage(usageDb, usageCompanyId, {
+          reads: usageClient.reads,
+          writes: usageClient.writes,
+        });
+      } catch (err) {
+        console.error("[approve-route] failed to record API usage:", String(err));
+      }
+    }
   }
 }

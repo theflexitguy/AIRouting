@@ -21,7 +21,8 @@
 
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
-import { FieldRoutesClient } from "./client";
+import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
+import { loadBudget, recordApiUsage } from "./usage";
 import {
   billingFrequencyLabel,
   centralTodayISO,
@@ -59,6 +60,12 @@ export interface SyncResult {
   startedAt: string;
   finishedAt: string;
   message: string;
+  // True when the run stopped (or never started) because the daily API cap was
+  // reached. The run is paused, not failed — re-invoke after the cap resets or
+  // after raising it in Settings.
+  capped: boolean;
+  apiCap: number;
+  apiUsedToday: number;
 }
 
 interface ApptInfo {
@@ -636,6 +643,40 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   const prior = state.run as RunProgress | undefined;
   const resuming = Boolean(prior?.active) && prior?.mode === mode && Array.isArray(prior?.ids);
 
+  // Enforce the daily API cap. Reads are metered against the company's combined
+  // reads+writes budget so RouteIQ never consumes the whole FieldRoutes account
+  // quota (3,000/day, shared with every other tool).
+  const budget = await loadBudget(db, companyId);
+  client.setMaxReads(budget.remaining);
+
+  // Already at/over the cap: don't start (or pause a resume) without spending a
+  // single read. Any in-progress run state is left untouched so it resumes once
+  // the cap resets at midnight Central (or the user raises it).
+  if (budget.remaining <= 0) {
+    const finishedAt = new Date().toISOString();
+    return {
+      mode,
+      companyId,
+      done: false,
+      total: 0,
+      offset: num(prior?.offset),
+      subscriptionsProcessed: 0,
+      inScopeCount: 0,
+      autoRoutableCount: 0,
+      alreadyScheduledCount: 0,
+      needsReviewCount: 0,
+      written: 0,
+      apiReads: 0,
+      cursor: priorCursor,
+      startedAt,
+      finishedAt,
+      message: `FieldRoutes API daily cap reached (${budget.used}/${budget.cap} reads+writes). Sync paused — it resumes after the cap resets at midnight Central, or raise the cap in Settings.`,
+      capped: true,
+      apiCap: budget.cap,
+      apiUsedToday: budget.used,
+    };
+  }
+
   let ids: string[];
   let apptMap: Record<string, ApptInfo>;
   let empNames: Record<string, string>;
@@ -647,6 +688,9 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   let needsReviewCount: number;
   let written: number;
   let subsProcessed: number;
+
+  // Set true if the cap is hit mid-run; flips the response to a paused state.
+  let capped = false;
 
   if (resuming && prior) {
     ids = prior.ids;
@@ -661,10 +705,43 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     written = num(prior.counts?.written);
     subsProcessed = num(prior.counts?.subsProcessed);
   } else {
-    const setup = await buildRunSetup(client, mode, priorCursor, today);
-    ids = setup.ids;
-    apptMap = setup.apptMap;
-    empNames = setup.empNames;
+    try {
+      const setup = await buildRunSetup(client, mode, priorCursor, today);
+      ids = setup.ids;
+      apptMap = setup.apptMap;
+      empNames = setup.empNames;
+    } catch (err) {
+      if (err instanceof FieldRoutesBudgetError) {
+        // Ran out of budget while building the account-wide lookups. No per-sub
+        // progress to persist, so record the reads spent and report a pause; the
+        // next invocation rebuilds setup once budget is available again.
+        await recordApiUsage(db, companyId, { reads: client.readCount });
+        const finishedAt = new Date().toISOString();
+        const used = budget.used + client.readCount;
+        return {
+          mode,
+          companyId,
+          done: false,
+          total: 0,
+          offset: 0,
+          subscriptionsProcessed: 0,
+          inScopeCount: 0,
+          autoRoutableCount: 0,
+          alreadyScheduledCount: 0,
+          needsReviewCount: 0,
+          written: 0,
+          apiReads: client.readCount,
+          cursor: priorCursor,
+          startedAt,
+          finishedAt,
+          message: `FieldRoutes API daily cap reached (${used}/${budget.cap} reads+writes) while preparing the sync. It resumes after the cap resets at midnight Central, or raise the cap in Settings.`,
+          capped: true,
+          apiCap: budget.cap,
+          apiUsedToday: used,
+        };
+      }
+      throw err;
+    }
     offset = 0;
     cursor = priorCursor;
     inScopeCount = autoRoutableCount = alreadyScheduledCount = needsReviewCount = 0;
@@ -694,11 +771,23 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     if (Date.now() - startMs > SOFT_DEADLINE_MS) break;
 
     const sliceIds = ids.slice(offset, offset + BATCH_SUBS);
-    const subscriptions = await client.getEntities("subscription", sliceIds);
-    const customerIds = Array.from(
-      new Set(subscriptions.map((s) => str(rec(s).customerID)).filter(Boolean)),
-    );
-    const customers = customerIds.length ? await client.getEntities("customer", customerIds) : [];
+    let subscriptions: Record<string, unknown>[];
+    let customers: Record<string, unknown>[];
+    try {
+      subscriptions = await client.getEntities("subscription", sliceIds);
+      const customerIds = Array.from(
+        new Set(subscriptions.map((s) => str(rec(s).customerID)).filter(Boolean)),
+      );
+      customers = customerIds.length ? await client.getEntities("customer", customerIds) : [];
+    } catch (err) {
+      if (err instanceof FieldRoutesBudgetError) {
+        // Hit the cap fetching this slice. offset hasn't advanced and prior
+        // slices are already committed, so breaking here is cleanly resumable.
+        capped = true;
+        break;
+      }
+      throw err;
+    }
     const customerById = new Map(customers.map((c) => [str(rec(c).customerID), rec(c)]));
 
     for (const subRaw of subscriptions) {
@@ -879,9 +968,15 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     await stateRef.set({ run: progress, lastRunMode: mode, lastRunAt: finishedAt }, { merge: true });
   }
 
+  // Meter the reads this invocation spent against the daily cap.
+  await recordApiUsage(db, companyId, { reads: client.readCount });
+  const apiUsedToday = budget.used + client.readCount;
+
   const message = done
     ? `Sync complete: processed ${subsProcessed} of ${total} subscriptions.`
-    : `Partial sync: ${offset} of ${total} subscriptions processed. Call the same URL again to continue.`;
+    : capped
+      ? `FieldRoutes API daily cap reached (${apiUsedToday}/${budget.cap} reads+writes). Synced ${offset} of ${total} subscriptions; the rest resumes after the cap resets at midnight Central, or raise the cap in Settings.`
+      : `Partial sync: ${offset} of ${total} subscriptions processed. Call the same URL again to continue.`;
 
   return {
     mode,
@@ -900,6 +995,9 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     startedAt,
     finishedAt,
     message,
+    capped,
+    apiCap: budget.cap,
+    apiUsedToday,
   };
 }
 
