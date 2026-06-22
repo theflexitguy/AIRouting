@@ -48,6 +48,12 @@ import { Undo2, Redo2 } from "lucide-react";
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
 // Neutral gray for FieldRoutes appointments with no tech assigned.
 const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
+// Synthetic tech id prefix for unassigned FieldRoutes appointments (no real tech).
+const UNASSIGNED_TECH_PREFIX = "__unassigned__";
+
+function isUnassignedRoute(tr: { tech: { id?: string } }) {
+  return String(tr.tech?.id || "").startsWith(UNASSIGNED_TECH_PREFIX);
+}
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
 const FIELDROUTES_SCHEDULED_ROUTE_PREFIX = "fieldroutes-scheduled:";
@@ -870,6 +876,7 @@ export default function RoutesPage() {
   const [editMode, setEditMode] = useState(false);
   const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
   const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
+  const [showUnassigned, setShowUnassigned] = useState(true);
   const [jobPoolDueStart, setJobPoolDueStart] = useState(startDate);
   const [jobPoolDueEnd, setJobPoolDueEnd] = useState(endDate);
   const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
@@ -945,12 +952,12 @@ export default function RoutesPage() {
       if (!assignedTech) {
         const frRouteId = String(job.fieldRoutesRouteId || "").trim();
         const routeKey = frRouteId || job.id;
-        const key = `${routeDate}::__unassigned__::${routeKey}`;
+        const key = `${routeDate}::${UNASSIGNED_TECH_PREFIX}::${routeKey}`;
         if (!groups.has(key)) {
           groups.set(key, {
             date: routeDate,
             tech: {
-              id: `__unassigned__:${routeKey}`,
+              id: `${UNASSIGNED_TECH_PREFIX}:${routeKey}`,
               name: "Unassigned",
               employeeId: "",
               active: true,
@@ -1060,10 +1067,18 @@ export default function RoutesPage() {
   const techFilterActive = selectedTechIds.length > 0 && selectedTechIds.length < techs.length;
   const selectedTechIdSet = new Set(selectedTechIds);
   const visibleRoutes = displayRoutes.filter((tr) => {
+    const unassigned = isUnassignedRoute(tr);
+    if (unassigned && !showUnassigned) return false;
     if (selectedDates.length > 0 && !selectedDates.includes(tr.route.date)) return false;
-    if (techFilterActive && !selectedTechIdSet.has(tr.tech.id)) return false;
+    // The technician filter never applies to unassigned routes — they belong to
+    // no tech, so the dedicated toggle controls their visibility instead.
+    if (techFilterActive && !unassigned && !selectedTechIdSet.has(tr.tech.id)) return false;
     return true;
   });
+  // Unassigned FieldRoutes routes within the selected dates, for the toggle badge.
+  const unassignedRouteCount = displayRoutes.filter(
+    (tr) => isUnassignedRoute(tr) && (selectedDates.length === 0 || selectedDates.includes(tr.route.date)),
+  ).length;
   const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved && !isFieldRoutesScheduledRoute(tr.route));
   const routedJobIds = useMemo(() => {
     const ids = new Set<string>();
@@ -2831,6 +2846,21 @@ export default function RoutesPage() {
             onChange={setSelectedTechIds}
             allLabel={`All (${techs.length})`}
           />
+          <Button
+            variant={showUnassigned ? "default" : "outline"}
+            onClick={() => setShowUnassigned(prev => !prev)}
+            className={cn(
+              "h-9 text-sm",
+              showUnassigned ? "bg-slate-400 hover:bg-slate-500 text-slate-950" : "text-muted-foreground",
+            )}
+            title="Show FieldRoutes appointments that aren't assigned to a tech yet"
+          >
+            <span
+              className="w-2.5 h-2.5 rounded-full shrink-0"
+              style={{ backgroundColor: showUnassigned ? "#0f172a" : UNASSIGNED_ROUTE_COLOR }}
+            />
+            Unassigned ({unassignedRouteCount})
+          </Button>
           <div className="flex items-center gap-2 ml-auto">
             <Button
               variant={showJobPoolLayer ? "default" : "outline"}
