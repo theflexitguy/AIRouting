@@ -1021,10 +1021,17 @@ export default function RoutesPage() {
   // Get unique dates that have routes
   const routeDates = [...new Set(displayRoutes.map((tr) => tr.route.date))].sort();
   const routeDateKey = routeDates.join("|");
-  // Routes for selected dates (show all if none specifically selected)
-  const visibleRoutes = selectedDates.length > 0
-    ? displayRoutes.filter((tr) => selectedDates.includes(tr.route.date))
-    : displayRoutes;
+  // Routes for the selected dates AND technicians. Like the date filter, an
+  // empty selection or "all techs selected" shows everything (so routes for a
+  // tech who isn't in the active list aren't accidentally hidden). Narrowing the
+  // Technicians dropdown filters the map and the route list down to those techs.
+  const techFilterActive = selectedTechIds.length > 0 && selectedTechIds.length < techs.length;
+  const selectedTechIdSet = new Set(selectedTechIds);
+  const visibleRoutes = displayRoutes.filter((tr) => {
+    if (selectedDates.length > 0 && !selectedDates.includes(tr.route.date)) return false;
+    if (techFilterActive && !selectedTechIdSet.has(tr.tech.id)) return false;
+    return true;
+  });
   const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved && !isFieldRoutesScheduledRoute(tr.route));
   const routedJobIds = useMemo(() => {
     const ids = new Set<string>();
