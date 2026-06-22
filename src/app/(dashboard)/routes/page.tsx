@@ -46,6 +46,8 @@ import { useEditHistory } from "@/hooks/useEditHistory";
 import { Undo2, Redo2 } from "lucide-react";
 
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
+// Neutral gray for FieldRoutes appointments with no tech assigned.
+const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
 const FIELDROUTES_SCHEDULED_ROUTE_PREFIX = "fieldroutes-scheduled:";
@@ -932,6 +934,36 @@ export default function RoutesPage() {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(routeDate)) return;
       if (routeDate < startDate || routeDate > endDate) return;
       if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
+
+      // Unassigned FieldRoutes appointments (no tech assigned in FieldRoutes)
+      // must NOT be attributed to a selected tech or merged together. Keep each
+      // on its own route, grouped by the FieldRoutes route it belongs to, and
+      // label it "Unassigned" so it reads the same as "No Tech Assigned" there.
+      const assignedTech = String(
+        job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById || "",
+      ).trim();
+      if (!assignedTech) {
+        const frRouteId = String(job.fieldRoutesRouteId || "").trim();
+        const routeKey = frRouteId || job.id;
+        const key = `${routeDate}::__unassigned__::${routeKey}`;
+        if (!groups.has(key)) {
+          groups.set(key, {
+            date: routeDate,
+            tech: {
+              id: `__unassigned__:${routeKey}`,
+              name: "Unassigned",
+              employeeId: "",
+              active: true,
+              maxStopsPerDay: 99,
+              companyId,
+            } as Technician,
+            jobs: [],
+            color: UNASSIGNED_ROUTE_COLOR,
+          });
+        }
+        groups.get(key)?.jobs.push(job);
+        return;
+      }
 
       const techIndex = selectedJobPoolTechs.findIndex((tech) => jobAssignedToTech(job, tech));
       if (techIndex < 0) return;

@@ -72,6 +72,7 @@ interface ApptInfo {
   date: string;
   techId: string;
   techName: string;
+  routeId: string;
 }
 
 interface RunProgress {
@@ -685,6 +686,10 @@ async function buildRunSetup(
         date,
         techId: techEmpId,
         techName: resolveEmpName(techEmpId),
+        // Keep the FieldRoutes route this appointment sits on so unassigned
+        // appointments (no tech) stay on their own separate route in the UI
+        // instead of being merged together.
+        routeId: routeId && routeId !== "0" ? routeId : "",
       };
     }
   }
@@ -889,6 +894,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const appt = apptMap[subscriptionId];
       const alreadyScheduled = Boolean(appt);
       const scheduledFor = appt ? appt.date : "";
+      const scheduledRouteId = appt ? appt.routeId : "";
       const scheduledTech = appt ? appt.techName : "";
       const scheduledTechId = appt ? appt.techId : "";
 
@@ -952,6 +958,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         fieldRoutesScheduledDate: scheduledFor || serviceDue,
         fieldRoutesServicedBy: alreadyScheduled ? scheduledTech : "",
         fieldRoutesServicedById: alreadyScheduled ? scheduledTechId : "",
+        fieldRoutesRouteId: alreadyScheduled ? scheduledRouteId : "",
         fieldRoutesScheduleSource: alreadyScheduled ? "api_appointment" : "",
         schedulingRequest: specialScheduling,
         // Subscription / billing detail (labels match the FieldRoutes report):

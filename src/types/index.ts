@@ -65,6 +65,7 @@ export interface Job {
   fieldRoutesScheduledDate?: string;
   fieldRoutesServicedBy?: string;
   fieldRoutesServicedById?: string;
+  fieldRoutesRouteId?: string;
   revenue?: string;
   productionValue?: string;
   subscriptionCategory?: string;
