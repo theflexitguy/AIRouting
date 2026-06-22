@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { doc, getDoc, setDoc, collection, getDocs, addDoc, deleteDoc, updateDoc } from "firebase/firestore";
+import { doc, getDoc, setDoc, collection, getDocs, addDoc, deleteDoc, updateDoc, onSnapshot } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -13,8 +13,16 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Technician } from "@/types";
-import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal } from "lucide-react";
+import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal, Gauge, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
+
+// Headroom under FieldRoutes' account-wide 3,000 reads/day limit. Mirrors
+// DEFAULT_API_DAILY_CAP in src/lib/fieldroutes/usage.ts.
+const DEFAULT_API_DAILY_CAP = 2500;
+
+function centralTodayISO(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/Chicago" });
+}
 
 export default function SettingsPage() {
   const { userProfile } = useAuth();
@@ -33,12 +41,34 @@ export default function SettingsPage() {
   const [savingRouting, setSavingRouting] = useState(false);
   const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
   const [emailNotifications, setEmailNotifications] = useState(true);
+  const [apiDailyCap, setApiDailyCap] = useState("");
+  const [apiCapSaving, setApiCapSaving] = useState(false);
+  const [apiUsage, setApiUsage] = useState<{ date: string; reads: number; writes: number } | null>(null);
 
   useEffect(() => {
     if (!userProfile?.companyId || settingsLoaded) return;
     loadSettings(userProfile.companyId);
     loadTechs(userProfile.companyId);
   }, [userProfile, settingsLoaded]);
+
+  // Live FieldRoutes API usage counter for today, written by the sync/approve flows.
+  useEffect(() => {
+    if (!userProfile?.companyId) return;
+    const ref = doc(db, `companies/${userProfile.companyId}/fieldRoutesState/apiUsage`);
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        const d = snap.exists() ? snap.data() : null;
+        setApiUsage({
+          date: String(d?.date || ""),
+          reads: Number(d?.reads) || 0,
+          writes: Number(d?.writes) || 0,
+        });
+      },
+      () => setApiUsage({ date: "", reads: 0, writes: 0 }),
+    );
+    return () => unsub();
+  }, [userProfile?.companyId]);
 
   async function loadSettings(companyId: string) {
     try {
@@ -53,9 +83,33 @@ export default function SettingsPage() {
         setMosquitoServiceId(String(data.fieldRoutesMosquitoServiceId || ""));
         setOutdoorPackageServiceId(String(data.fieldRoutesOutdoorPackageServiceId || ""));
         setAllowCrossTechRouteEdits(data.allowCrossTechRouteEdits !== false);
+        setApiDailyCap(data.fieldRoutesApiDailyCap ? String(data.fieldRoutesApiDailyCap) : "");
       }
       setSettingsLoaded(true);
     } catch { }
+  }
+
+  async function saveApiCap() {
+    if (!userProfile?.companyId) return;
+    const n = parseInt(apiDailyCap, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      toast.error("Enter a positive number of API calls for the daily cap.");
+      return;
+    }
+    if (n > 3000) {
+      toast.error("FieldRoutes allows at most 3,000 reads/day for the whole account. Set the cap at or below 3,000.");
+      return;
+    }
+    setApiCapSaving(true);
+    try {
+      await setDoc(doc(db, "companies", userProfile.companyId), { fieldRoutesApiDailyCap: n }, { merge: true });
+      toast.success(`Daily API cap set to ${n.toLocaleString()} calls`);
+    } catch (err) {
+      console.error("Save API cap error:", err);
+      toast.error("Failed to save the API cap. Check your connection.");
+    } finally {
+      setApiCapSaving(false);
+    }
   }
 
   async function loadTechs(companyId: string) {
@@ -213,6 +267,14 @@ export default function SettingsPage() {
                 </Button>
               </CardContent>
             </Card>
+
+            <ApiUsageCard
+              apiUsage={apiUsage}
+              apiDailyCap={apiDailyCap}
+              setApiDailyCap={setApiDailyCap}
+              apiCapSaving={apiCapSaving}
+              saveApiCap={saveApiCap}
+            />
           </TabsContent>
 
           <TabsContent value="techs" className="space-y-4">
@@ -357,5 +419,93 @@ export default function SettingsPage() {
         </Tabs>
       </div>
     </div>
+  );
+}
+
+function ApiUsageCard({
+  apiUsage,
+  apiDailyCap,
+  setApiDailyCap,
+  apiCapSaving,
+  saveApiCap,
+}: {
+  apiUsage: { date: string; reads: number; writes: number } | null;
+  apiDailyCap: string;
+  setApiDailyCap: (value: string) => void;
+  apiCapSaving: boolean;
+  saveApiCap: () => void;
+}) {
+  // Counters reset at midnight Central; ignore a stored doc from a previous day.
+  const isToday = apiUsage?.date === centralTodayISO();
+  const reads = isToday ? apiUsage!.reads : 0;
+  const writes = isToday ? apiUsage!.writes : 0;
+  const used = reads + writes;
+
+  const parsedCap = parseInt(apiDailyCap, 10);
+  const cap = Number.isFinite(parsedCap) && parsedCap > 0 ? parsedCap : DEFAULT_API_DAILY_CAP;
+  const usingDefaultCap = !(Number.isFinite(parsedCap) && parsedCap > 0);
+  const remaining = Math.max(0, cap - used);
+  const pct = Math.min(100, cap > 0 ? Math.round((used / cap) * 100) : 0);
+  const barColor = pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
+
+  return (
+    <Card className="border-border/40">
+      <CardHeader>
+        <CardTitle className="text-sm font-semibold flex items-center gap-2">
+          <Gauge className="w-4 h-4 text-blue-400" />
+          API Usage &amp; Daily Limit
+        </CardTitle>
+        <CardDescription className="text-xs">
+          FieldRoutes allows 3,000 API reads per day across <span className="font-medium">all</span> software on your account.
+          Set a hard cap for RouteIQ so it leaves room for everything else — once it&apos;s hit, RouteIQ stops calling the API
+          until midnight Central.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        {/* Today's usage */}
+        <div className="space-y-2">
+          <div className="flex items-end justify-between">
+            <div>
+              <p className="text-xs text-muted-foreground/60">Used today (resets midnight Central)</p>
+              <p className="text-2xl font-bold tabular-nums">
+                {used.toLocaleString()}
+                <span className="text-sm font-normal text-muted-foreground/50"> / {cap.toLocaleString()}</span>
+              </p>
+            </div>
+            <p className="text-xs text-muted-foreground/60 text-right">{remaining.toLocaleString()} left</p>
+          </div>
+          <div className="h-2.5 w-full rounded-full bg-accent/30 overflow-hidden">
+            <div className={`h-full rounded-full transition-all ${barColor}`} style={{ width: `${pct}%` }} />
+          </div>
+          <div className="flex items-center gap-4 text-xs text-muted-foreground/60">
+            <span><span className="font-medium text-foreground/80 tabular-nums">{reads.toLocaleString()}</span> reads</span>
+            <span><span className="font-medium text-foreground/80 tabular-nums">{writes.toLocaleString()}</span> writes</span>
+            <span className="ml-auto inline-flex items-center gap-1"><RefreshCw className="w-3 h-3" /> live</span>
+          </div>
+        </div>
+
+        {/* Hard cap */}
+        <div className="space-y-2 pt-1 border-t border-border/30">
+          <Label className="text-sm pt-3 block">Daily API cap (reads + writes)</Label>
+          <p className="text-xs text-muted-foreground/50">
+            Maximum FieldRoutes calls RouteIQ may make per day. Must be 3,000 or less.
+            {usingDefaultCap && ` Defaults to ${DEFAULT_API_DAILY_CAP.toLocaleString()} when unset.`}
+          </p>
+          <div className="flex gap-2">
+            <Input
+              value={apiDailyCap}
+              onChange={(e) => setApiDailyCap(e.target.value.replace(/[^0-9]/g, ""))}
+              placeholder={String(DEFAULT_API_DAILY_CAP)}
+              inputMode="numeric"
+              className="h-10 max-w-[180px]"
+            />
+            <Button onClick={saveApiCap} disabled={apiCapSaving} className="bg-blue-500 hover:bg-blue-600 text-white">
+              {apiCapSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              Save Cap
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }

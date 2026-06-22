@@ -5,6 +5,7 @@ export const maxDuration = 300;
 import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
+import { recordApiUsage } from "@/lib/fieldroutes/usage";
 
 const FIELDROUTES_NWA_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -213,6 +214,8 @@ export async function POST(request: NextRequest) {
     const skipped: Array<{ appointmentId: string; customerName: string; reason: string }> = [];
     const baseUrl = fieldRoutesNwaBaseUrl(company);
     const cancelConfig = cancellationConfig(company, route);
+    // Count each FieldRoutes write attempt (cancel/update) to meter the daily cap.
+    let apiWrites = 0;
 
     for (const item of uploadedAppointments) {
       const appointmentId = clean(item.appointmentId);
@@ -249,6 +252,7 @@ export async function POST(request: NextRequest) {
       }
 
       try {
+        apiWrites++;
         await fieldRoutesRequest({
           baseUrl,
           authKey,
@@ -265,6 +269,11 @@ export async function POST(request: NextRequest) {
         });
       }
     }
+
+    // Meter the writes this undo spent, whether or not some failed.
+    await recordApiUsage(db, companyId, { writes: apiWrites }).catch((err) =>
+      console.error("[undo-fieldroutes-stops] failed to record API usage:", String(err)),
+    );
 
     if (errors.length) {
       return NextResponse.json(

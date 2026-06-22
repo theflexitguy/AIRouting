@@ -5,6 +5,7 @@ export const maxDuration = 120;
 import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
+import { recordApiUsage } from "@/lib/fieldroutes/usage";
 
 const FIELDROUTES_NWA_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -195,6 +196,10 @@ export async function POST(request: NextRequest) {
       endpoint: "/route/delete",
       payload: { routeID: Number(fieldRoutesRouteId) },
     });
+    // Meter the single /route/delete write against the daily API cap.
+    await recordApiUsage(db, companyId, { writes: 1 }).catch((err) =>
+      console.error("[delete-fieldroutes-route] failed to record API usage:", String(err)),
+    );
 
     const now = new Date().toISOString();
     const batch = db.batch();

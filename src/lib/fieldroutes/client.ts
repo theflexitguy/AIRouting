@@ -86,8 +86,28 @@ export class FieldRoutesApiError extends Error {
   }
 }
 
+// Thrown when a request would exceed the per-run read budget (the company's
+// daily API cap minus what's already been spent today). Callers catch this to
+// stop gracefully and persist progress rather than blow past the FieldRoutes
+// account-wide quota.
+export class FieldRoutesBudgetError extends Error {
+  readsSoFar: number;
+  maxReads: number;
+  constructor(readsSoFar: number, maxReads: number) {
+    super(
+      `FieldRoutes read budget exhausted: ${readsSoFar} reads this run reached the cap of ${maxReads}.`,
+    );
+    this.name = "FieldRoutesBudgetError";
+    this.readsSoFar = readsSoFar;
+    this.maxReads = maxReads;
+  }
+}
+
 export class FieldRoutesClient {
   private reads = 0;
+  // Hard cap on reads this client instance may perform (the remaining daily
+  // budget). Defaults to no limit; set via setMaxReads() before a run.
+  private maxReads = Infinity;
 
   constructor(private config: FieldRoutesConfig = fieldRoutesConfigFromEnv()) {}
 
@@ -95,11 +115,20 @@ export class FieldRoutesClient {
     return this.reads;
   }
 
+  /** Cap the reads this client may perform; the next read past it throws FieldRoutesBudgetError. */
+  setMaxReads(limit: number) {
+    this.maxReads = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0;
+  }
+
   private async request(
     module: string,
     action: string,
     payload: Record<string, FilterValue>,
   ): Promise<Record<string, unknown>> {
+    // Refuse before consuming quota when the daily budget is exhausted.
+    if (this.reads >= this.maxReads) {
+      throw new FieldRoutesBudgetError(this.reads, this.maxReads);
+    }
     const endpoint = `/${module}/${action}`;
     const url = `${this.config.baseUrl}${endpoint}`;
     // Auth fields appended LAST, per the verified contract.
