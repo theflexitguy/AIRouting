@@ -82,6 +82,7 @@ interface RunProgress {
   cursor: string;
   apptMap: Record<string, ApptInfo>;
   empNames: Record<string, string>;
+  technicianEmpIds: string[];
   counts: {
     inScope: number;
     autoRoutable: number;
@@ -115,6 +116,25 @@ function employeeName(emp: Record<string, unknown>): string {
   const last = str(emp.lname || emp.lastName);
   const full = `${first} ${last}`.trim();
   return full || str(emp.name) || str(emp.employeeID || emp.employeeId);
+}
+
+// FieldRoutes classifies employees by `type`: 1 = Technician, 3 = Tech & Sales
+// both run service routes; 0 = Office and 2 = Sales never do. Office/sales/CSR
+// staff were polluting the technician list because FieldRoutes still records
+// them as a route's `assignedTech` in some cases. We INCLUDE technician types
+// (rather than exclude known office types) so any unexpected/custom type value
+// defaults to "kept" — a real field tech is never silently dropped.
+const FIELDROUTES_TECHNICIAN_TYPES = new Set([1, 3]);
+
+function employeeType(emp: Record<string, unknown>): number | null {
+  const raw = emp.type ?? emp.fkEmployeeType ?? emp.employeeType ?? emp.fkType;
+  const t = Number(raw);
+  return Number.isFinite(t) ? t : null;
+}
+
+function isTechnicianEmployee(emp: Record<string, unknown>): boolean {
+  const t = employeeType(emp);
+  return t !== null && FIELDROUTES_TECHNICIAN_TYPES.has(t);
 }
 
 function normName(value: unknown): string {
@@ -278,6 +298,7 @@ async function reconcileScheduledRoutes(
   db: FirebaseFirestore.Firestore,
   companyId: string,
   empNames: Record<string, string>,
+  technicianEmpIds: Set<string>,
   today: string,
   now: string,
 ): Promise<{ routesWritten: number; routesDeleted: number; techsLinked: number }> {
@@ -317,7 +338,24 @@ async function reconcileScheduledRoutes(
     });
   });
 
-  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, servingEmployeeIds, now);
+  // Restrict the technician list to employees FieldRoutes classifies as field
+  // technicians (by role/type). If the roster is empty (no employee data) or
+  // the filter would drop EVERY serving tech (unexpected type values), fall back
+  // to the unfiltered set so a real tech's locked routes are never lost.
+  let techServing = servingEmployeeIds;
+  if (technicianEmpIds.size > 0) {
+    const filtered = new Set([...servingEmployeeIds].filter((id) => technicianEmpIds.has(id)));
+    if (filtered.size > 0) {
+      techServing = filtered;
+    } else {
+      console.warn(
+        "[fieldroutes/sync] technician role filter matched 0 of " +
+          `${servingEmployeeIds.size} serving employees — keeping all to avoid dropping real techs.`,
+      );
+    }
+  }
+
+  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, techServing, now);
   const resolveTechId = (j: SJob) =>
     empToTech.get(j.techEmpId) || nameToTech.get(normName(j.techName)) || "";
 
@@ -536,13 +574,41 @@ async function buildRunSetup(
   mode: SyncMode,
   cursor: string,
   today: string,
-): Promise<{ ids: string[]; apptMap: Record<string, ApptInfo>; empNames: Record<string, string> }> {
+): Promise<{
+  ids: string[];
+  apptMap: Record<string, ApptInfo>;
+  empNames: Record<string, string>;
+  technicianEmpIds: string[];
+  employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean }>;
+}> {
   const ids = sortIds(await resolveSubscriptionIds(client, mode, cursor));
 
   // Employees are few — fetch all once for name resolution.
   const employeeIds = await client.searchIds("employee", {});
   const employees = employeeIds.length ? await client.getEntities("employee", employeeIds) : [];
   const empNames: Record<string, string> = {};
+  // Every alias ID of employees FieldRoutes marks as field technicians (by role/
+  // type). Used to keep office/sales staff out of the technician list. A roster
+  // is persisted alongside so the actual type of every employee is inspectable.
+  const technicianEmpIds = new Set<string>();
+  const employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean }> = [];
+  for (const e of employees) {
+    const er = rec(e);
+    const isTech = isTechnicianEmployee(er);
+    employeeRoster.push({
+      employeeId: str(er.employeeID || er.employeeId),
+      name: employeeName(er),
+      type: employeeType(er),
+      isTechnician: isTech,
+    });
+    if (!isTech) continue;
+    for (const raw of [er.employeeID, er.employeeId, er.roamingRep, er.linkedEmployeeIDs]) {
+      for (const part of str(raw).split(",")) {
+        const id = part.trim();
+        if (id && id !== "0") technicianEmpIds.add(id);
+      }
+    }
+  }
   // route.assignedTech can reference an employee by any of several ID fields
   // (employeeID, roamingRep, linkedEmployeeIDs) — confirmed against live data
   // where a tech's employeeID (e.g. 10005) differs from the ID routes use
@@ -623,7 +689,7 @@ async function buildRunSetup(
     }
   }
 
-  return { ids, apptMap, empNames };
+  return { ids, apptMap, empNames, technicianEmpIds: [...technicianEmpIds], employeeRoster };
 }
 
 export async function runSync(mode: SyncMode): Promise<SyncResult> {
@@ -680,6 +746,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   let ids: string[];
   let apptMap: Record<string, ApptInfo>;
   let empNames: Record<string, string>;
+  let technicianEmpIds: string[];
   let offset: number;
   let cursor: string;
   let inScopeCount: number;
@@ -696,6 +763,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     ids = prior.ids;
     apptMap = rec(prior.apptMap) as Record<string, ApptInfo>;
     empNames = rec(prior.empNames) as Record<string, string>;
+    technicianEmpIds = Array.isArray(prior.technicianEmpIds) ? prior.technicianEmpIds.map(String) : [];
     offset = num(prior.offset);
     cursor = str(prior.cursor) || priorCursor;
     inScopeCount = num(prior.counts?.inScope);
@@ -710,6 +778,18 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       ids = setup.ids;
       apptMap = setup.apptMap;
       empNames = setup.empNames;
+      technicianEmpIds = setup.technicianEmpIds;
+      // Persist the full employee roster (id, name, type, isTechnician) so the
+      // role-based technician filter is auditable — if a real tech is missing,
+      // their actual `type` is visible here.
+      await db.doc(`companies/${companyId}/fieldRoutesState/employeeRoster`).set(
+        {
+          employees: setup.employeeRoster,
+          technicianCount: setup.technicianEmpIds.length,
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true },
+      );
     } catch (err) {
       if (err instanceof FieldRoutesBudgetError) {
         // Ran out of budget while building the account-wide lookups. No per-sub
@@ -922,7 +1002,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     // up everywhere and the generator schedules around them. Runs only when the
     // whole sync completes; derived from current Firestore state (no API cost).
     try {
-      const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, today, now);
+      const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now);
       console.log(
         `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
           `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
@@ -955,6 +1035,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       cursor,
       apptMap,
       empNames,
+      technicianEmpIds,
       counts: {
         inScope: inScopeCount,
         autoRoutable: autoRoutableCount,
