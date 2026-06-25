@@ -24,6 +24,7 @@ import { normalizeServiceType } from "@/lib/job-id";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
 import {
+  BALANCE_GATE,
   billingFrequencyLabel,
   centralTodayISO,
   computeFlags,
@@ -1111,7 +1112,9 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
     if (d.serviceDueAlreadyCompleted) continue;
     const serviceDue = str(d.scheduledDate);
     const inScope = Boolean(d.inScope);
-    const balanceOk = Boolean(d.balanceOk);
+    // Recompute balanceOk from the stored balance so the current BALANCE_GATE
+    // is honored even on docs synced before the gate changed (no API read).
+    const balanceOk = num(d.customerBalance) <= BALANCE_GATE;
     const hasConstraint = Boolean(d.hasConstraint);
     const alreadyScheduled = Boolean(d.alreadyScheduled);
 
@@ -1128,12 +1131,13 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
 
     if (
       pastDue !== Boolean(d.pastDue) ||
+      balanceOk !== Boolean(d.balanceOk) ||
       autoRoutable !== Boolean(d.autoRoutable) ||
       needsReview !== Boolean(d.needsReview) ||
       overdueActionable !== Boolean(d.overdueActionable) ||
       status !== str(d.status)
     ) {
-      batch.update(doc.ref, { pastDue, autoRoutable, needsReview, overdueActionable, status, updatedAt: now });
+      batch.update(doc.ref, { pastDue, balanceOk, autoRoutable, needsReview, overdueActionable, status, updatedAt: now });
       updated++;
       ops++;
       if (ops >= 450) {

@@ -4,7 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb, adminAuth } from "@/lib/firebase-admin";
-import { runSync } from "@/lib/fieldroutes/sync";
+import { runSync, recomputePastDue } from "@/lib/fieldroutes/sync";
 
 const MAX_MANUAL_SYNCS_PER_DAY = 3;
 
@@ -72,6 +72,17 @@ export async function POST(request: NextRequest) {
 
   try {
     const result = await runSync("incremental");
+    // Incremental syncs only rewrite changed subscriptions, so derived flags
+    // (pastDue, overdueActionable) drift on untouched docs. When a run finishes,
+    // recompute them across ALL jobs — pure Firestore, zero FieldRoutes reads —
+    // so dashboard counts stay accurate without spending API quota.
+    if (result.done) {
+      try {
+        await recomputePastDue();
+      } catch (recomputeErr) {
+        console.error("[fieldroutes/manual-sync] recompute after sync failed:", recomputeErr);
+      }
+    }
     return NextResponse.json({
       success: true,
       ...result,
