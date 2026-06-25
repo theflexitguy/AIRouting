@@ -980,6 +980,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         alreadyScheduled,
         autoRoutable: flags.autoRoutable,
         needsReview: flags.needsReview,
+        overdueActionable: flags.overdueActionable && !serviceDueAlreadyCompleted,
         customerBalance,
         onHold: onHold === 1,
         scheduledFor,
@@ -1117,6 +1118,7 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
     const pastDue = Boolean(serviceDue) && serviceDue < today;
     const autoRoutable = inScope && pastDue && balanceOk && !hasConstraint && !alreadyScheduled;
     const needsReview = inScope && pastDue && !alreadyScheduled && (hasConstraint || !balanceOk);
+    const overdueActionable = inScope && pastDue && balanceOk && !alreadyScheduled;
 
     let status: string;
     if (alreadyScheduled) status = "scheduled";
@@ -1128,9 +1130,10 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
       pastDue !== Boolean(d.pastDue) ||
       autoRoutable !== Boolean(d.autoRoutable) ||
       needsReview !== Boolean(d.needsReview) ||
+      overdueActionable !== Boolean(d.overdueActionable) ||
       status !== str(d.status)
     ) {
-      batch.update(doc.ref, { pastDue, autoRoutable, needsReview, status, updatedAt: now });
+      batch.update(doc.ref, { pastDue, autoRoutable, needsReview, overdueActionable, status, updatedAt: now });
       updated++;
       ops++;
       if (ops >= 450) {

@@ -94,21 +94,13 @@ export default function DashboardPage() {
         ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
         : 0;
 
-      // Overdue = in-scope subscriptions whose service due date has passed.
-      // Counted server-side so we never read the whole jobs collection.
+      // Overdue = in-scope, past-due, not scheduled, not completed,
+      // balance <= $149. Pre-computed as a single boolean on each job doc.
       const jobsCol = collection(db, `companies/${companyId}/jobs`);
-      let overdueStops = 0;
-      try {
-        const overdueSnap = await getCountFromServer(
-          query(jobsCol, where("inScope", "==", true), where("pastDue", "==", true))
-        );
-        overdueStops = overdueSnap.data().count;
-      } catch {
-        // Composite (inScope + pastDue) index not deployed yet — fall back to
-        // the single-field past-due count so the card still renders.
-        const overdueSnap = await getCountFromServer(query(jobsCol, where("pastDue", "==", true)));
-        overdueStops = overdueSnap.data().count;
-      }
+      const overdueSnap = await getCountFromServer(
+        query(jobsCol, where("overdueActionable", "==", true))
+      );
+      const overdueStops = overdueSnap.data().count;
 
       const jobsDueThisWeek = [];
       for (let i = 0; i < 7; i++) {

@@ -4,12 +4,12 @@
 //  - "Today" is America/Chicago, DST-safe. Never use a UTC server date.
 //  - in_scope        = onHold == 0 && recurringCharge > 0
 //  - past_due        = service_due < today(Central)
-//  - balance_ok      = customer_balance <= 150
+//  - balance_ok      = customer_balance <= 149
 //  - has_constraint  = special_scheduling is non-empty
 //  - already_scheduled = a pending future appointment exists for THIS subscription_id
 //  - auto_routable   = in_scope && past_due && balance_ok && !has_constraint && !already_scheduled
 
-export const BALANCE_GATE = 150;
+export const BALANCE_GATE = 149;
 
 /** Today's date as YYYY-MM-DD in America/Chicago, regardless of server TZ. */
 export function centralTodayISO(now: Date = new Date()): string {
@@ -98,6 +98,7 @@ export interface JobFlags {
   hasConstraint: boolean;
   autoRoutable: boolean;
   needsReview: boolean;
+  overdueActionable: boolean;
 }
 
 export function computeFlags(input: JobFlagsInput): JobFlags {
@@ -108,5 +109,7 @@ export function computeFlags(input: JobFlagsInput): JobFlags {
     input.inScope && pastDue && balanceOk && !hasConstraint && !input.alreadyScheduled;
   const needsReview =
     input.inScope && pastDue && !input.alreadyScheduled && (hasConstraint || !balanceOk);
-  return { pastDue, balanceOk, hasConstraint, autoRoutable, needsReview };
+  const overdueActionable =
+    input.inScope && pastDue && balanceOk && !input.alreadyScheduled;
+  return { pastDue, balanceOk, hasConstraint, autoRoutable, needsReview, overdueActionable };
 }
