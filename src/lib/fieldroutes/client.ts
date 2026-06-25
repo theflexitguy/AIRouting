@@ -255,10 +255,17 @@ export class FieldRoutesClient {
   /**
    * Fetch full entities for a list of IDs, chunked to the 1,000-entity cap.
    * Returns objects from the "{module}s" key (with dynamic fallback).
+   *
+   * Most modules take a `{module}IDs` param, but a few break the convention
+   * (e.g. serviceType/get wants `typeIDs`). Pass `opts.idParam` to override.
    */
-  async getEntities(module: string, ids: string[]): Promise<Record<string, unknown>[]> {
+  async getEntities(
+    module: string,
+    ids: string[],
+    opts: { idParam?: string } = {},
+  ): Promise<Record<string, unknown>[]> {
     const out: Record<string, unknown>[] = [];
-    const idParam = `${module}IDs`;
+    const idParam = opts.idParam ?? `${module}IDs`;
     const primaryKey = `${module}s`;
 
     for (let i = 0; i < ids.length; i += GET_CHUNK) {

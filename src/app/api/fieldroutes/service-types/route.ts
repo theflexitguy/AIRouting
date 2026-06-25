@@ -47,11 +47,15 @@ export async function POST(request: Request) {
       return NextResponse.json({ serviceTypes: [] });
     }
 
-    const entities = await client.getEntities("serviceType", ids);
-    const serviceTypes = entities.map((e) => ({
-      id: String(e.serviceTypeID ?? e.typeID ?? e.id ?? ""),
-      description: String(e.description ?? e.name ?? e.serviceType ?? ""),
-    })).filter((s) => s.id && s.description);
+    // serviceType/get breaks convention: the ID param is `typeIDs` (not
+    // `serviceTypeIDs`), and entities expose `typeID` + `description`.
+    const entities = await client.getEntities("serviceType", ids, { idParam: "typeIDs" });
+    const serviceTypes = entities
+      .map((e) => ({
+        id: String(e.typeID ?? e.serviceTypeID ?? e.id ?? ""),
+        description: String(e.description ?? e.name ?? ""),
+      }))
+      .filter((s) => s.id && s.description);
 
     serviceTypes.sort((a, b) => a.description.localeCompare(b.description));
 
