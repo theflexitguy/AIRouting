@@ -34,6 +34,8 @@ export default function SettingsPage() {
   const [generalPestServiceId, setGeneralPestServiceId] = useState("");
   const [mosquitoServiceId, setMosquitoServiceId] = useState("");
   const [outdoorPackageServiceId, setOutdoorPackageServiceId] = useState("");
+  const [serviceIdMap, setServiceIdMap] = useState<Array<{ name: string; id: string }>>([]);
+  const [newService, setNewService] = useState({ name: "", id: "" });
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [techs, setTechs] = useState<Technician[]>([]);
   const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
@@ -84,6 +86,11 @@ export default function SettingsPage() {
         setOutdoorPackageServiceId(String(data.fieldRoutesOutdoorPackageServiceId || ""));
         setAllowCrossTechRouteEdits(data.allowCrossTechRouteEdits !== false);
         setApiDailyCap(data.fieldRoutesApiDailyCap ? String(data.fieldRoutesApiDailyCap) : "");
+        if (data.fieldRoutesServiceIdMap && typeof data.fieldRoutesServiceIdMap === "object") {
+          setServiceIdMap(
+            Object.entries(data.fieldRoutesServiceIdMap).map(([name, id]) => ({ name, id: String(id) }))
+          );
+        }
       }
       setSettingsLoaded(true);
     } catch { }
@@ -138,6 +145,13 @@ export default function SettingsPage() {
       updateData.fieldRoutesGeneralPestServiceId = generalPestServiceId.trim();
       updateData.fieldRoutesMosquitoServiceId = mosquitoServiceId.trim();
       updateData.fieldRoutesOutdoorPackageServiceId = outdoorPackageServiceId.trim();
+      const mapObj: Record<string, number> = {};
+      for (const entry of serviceIdMap) {
+        const n = entry.name.trim();
+        const v = parseInt(entry.id, 10);
+        if (n && Number.isFinite(v) && v > 0) mapObj[n] = v;
+      }
+      updateData.fieldRoutesServiceIdMap = mapObj;
       if (Object.keys(updateData).length === 0) {
         toast.error("No changes to save. Clear the field and enter your key.");
         setSaving(false);
@@ -248,17 +262,64 @@ export default function SettingsPage() {
                     <Label className="text-sm">GPC Route Template ID</Label>
                     <Input value={gpcRouteTemplateId} onChange={e => setGpcRouteTemplateId(e.target.value)} placeholder="Optional template ID" inputMode="numeric" className="h-10" />
                   </div>
-                  <div className="space-y-2">
-                    <Label className="text-sm">General Pest Service ID</Label>
-                    <Input value={generalPestServiceId} onChange={e => setGeneralPestServiceId(e.target.value)} placeholder="Service ID" inputMode="numeric" className="h-10" />
+                </div>
+                <div className="space-y-3 pt-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-sm font-semibold">Service ID Mappings</Label>
+                    <span className="text-xs text-muted-foreground/50">{serviceIdMap.length} service{serviceIdMap.length !== 1 ? "s" : ""}</span>
                   </div>
-                  <div className="space-y-2">
-                    <Label className="text-sm">Mosquito Service ID</Label>
-                    <Input value={mosquitoServiceId} onChange={e => setMosquitoServiceId(e.target.value)} placeholder="Service ID" inputMode="numeric" className="h-10" />
-                  </div>
-                  <div className="space-y-2">
-                    <Label className="text-sm">Outdoor Package Service ID</Label>
-                    <Input value={outdoorPackageServiceId} onChange={e => setOutdoorPackageServiceId(e.target.value)} placeholder="Service ID" inputMode="numeric" className="h-10" />
+                  <p className="text-xs text-muted-foreground/50">Map your service names to FieldRoutes service type IDs. When a route is approved, the matching ID is sent to FieldRoutes.</p>
+                  {serviceIdMap.map((entry, i) => (
+                    <div key={i} className="flex gap-2 items-center">
+                      <Input
+                        value={entry.name}
+                        onChange={e => setServiceIdMap(prev => prev.map((s, j) => j === i ? { ...s, name: e.target.value } : s))}
+                        placeholder="Service name"
+                        className="h-9 flex-1"
+                      />
+                      <Input
+                        value={entry.id}
+                        onChange={e => setServiceIdMap(prev => prev.map((s, j) => j === i ? { ...s, id: e.target.value.replace(/[^0-9]/g, "") } : s))}
+                        placeholder="ID"
+                        inputMode="numeric"
+                        className="h-9 w-24"
+                      />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="text-muted-foreground/30 hover:text-red-400 h-8 w-8 shrink-0"
+                        onClick={() => setServiceIdMap(prev => prev.filter((_, j) => j !== i))}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  ))}
+                  <div className="flex gap-2 items-center">
+                    <Input
+                      value={newService.name}
+                      onChange={e => setNewService(prev => ({ ...prev, name: e.target.value }))}
+                      placeholder="New service name"
+                      className="h-9 flex-1"
+                    />
+                    <Input
+                      value={newService.id}
+                      onChange={e => setNewService(prev => ({ ...prev, id: e.target.value.replace(/[^0-9]/g, "") }))}
+                      placeholder="ID"
+                      inputMode="numeric"
+                      className="h-9 w-24"
+                    />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="text-blue-400 hover:text-blue-300 h-8 w-8 shrink-0"
+                      disabled={!newService.name.trim() || !newService.id.trim()}
+                      onClick={() => {
+                        setServiceIdMap(prev => [...prev, { name: newService.name.trim(), id: newService.id.trim() }]);
+                        setNewService({ name: "", id: "" });
+                      }}
+                    >
+                      <Plus className="w-4 h-4" />
+                    </Button>
                   </div>
                 </div>
                 <Button onClick={saveApiCredentials} disabled={saving} className="bg-blue-500 hover:bg-blue-600 text-white">
