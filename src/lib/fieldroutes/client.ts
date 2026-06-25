@@ -221,6 +221,28 @@ export class FieldRoutesClient {
    * Handles the 50,000-ID pagination cap dynamically using the response's
    * own propertyName / idName fields. Never sends includeData.
    */
+  /**
+   * Search with includeData=1 to get resolved entities in one call (up to
+   * 1,000). Avoids the separate get endpoint, which some modules (like
+   * serviceType) expose with non-standard param/response keys.
+   */
+  async searchWithData(
+    module: string,
+    filters: Record<string, FilterValue> = {},
+  ): Promise<Record<string, unknown>[]> {
+    const body = await this.request(module, "search", { ...filters, includeData: 1 });
+    // The resolved array lives under the plural key (e.g. "serviceTypes").
+    const pluralKey = `${module}s`;
+    let entities = body[pluralKey];
+    if (!Array.isArray(entities)) {
+      // Fallback: find the first array of objects in the response.
+      entities = Object.values(body).find(
+        (v) => Array.isArray(v) && v.length > 0 && typeof v[0] === "object" && v[0] !== null,
+      );
+    }
+    return Array.isArray(entities) ? (entities as Record<string, unknown>[]) : [];
+  }
+
   async searchIds(module: string, filters: Record<string, FilterValue> = {}): Promise<string[]> {
     const ids: string[] = [];
     let cursor: string | number | null = null;
@@ -255,10 +277,17 @@ export class FieldRoutesClient {
   /**
    * Fetch full entities for a list of IDs, chunked to the 1,000-entity cap.
    * Returns objects from the "{module}s" key (with dynamic fallback).
+   *
+   * Most modules take a `{module}IDs` param, but a few break the convention
+   * (e.g. serviceType/get wants `typeIDs`). Pass `opts.idParam` to override.
    */
-  async getEntities(module: string, ids: string[]): Promise<Record<string, unknown>[]> {
+  async getEntities(
+    module: string,
+    ids: string[],
+    opts: { idParam?: string } = {},
+  ): Promise<Record<string, unknown>[]> {
     const out: Record<string, unknown>[] = [];
-    const idParam = `${module}IDs`;
+    const idParam = opts.idParam ?? `${module}IDs`;
     const primaryKey = `${module}s`;
 
     for (let i = 0; i < ids.length; i += GET_CHUNK) {

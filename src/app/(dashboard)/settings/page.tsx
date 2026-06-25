@@ -13,7 +13,7 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Technician } from "@/types";
-import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal, Gauge, RefreshCw } from "lucide-react";
+import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal, Gauge, RefreshCw, Download, Check } from "lucide-react";
 import { toast } from "sonner";
 
 // Headroom under FieldRoutes' account-wide 3,000 reads/day limit. Mirrors
@@ -36,6 +36,8 @@ export default function SettingsPage() {
   const [outdoorPackageServiceId, setOutdoorPackageServiceId] = useState("");
   const [serviceIdMap, setServiceIdMap] = useState<Array<{ name: string; id: string }>>([]);
   const [newService, setNewService] = useState({ name: "", id: "" });
+  const [pullingServices, setPullingServices] = useState(false);
+  const [availableServices, setAvailableServices] = useState<Array<{ id: string; description: string; selected: boolean }> | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [techs, setTechs] = useState<Technician[]>([]);
   const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
@@ -168,6 +170,39 @@ export default function SettingsPage() {
     }
   }
 
+  async function pullServiceTypes() {
+    if (!userProfile?.companyId) return;
+    setPullingServices(true);
+    try {
+      const res = await fetch("/api/fieldroutes/service-types", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companyId: userProfile.companyId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to fetch service types");
+      const existing = new Set(serviceIdMap.map(s => s.id));
+      setAvailableServices(
+        (data.serviceTypes as Array<{ id: string; description: string }>).map(s => ({
+          ...s,
+          selected: existing.has(s.id),
+        }))
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to pull service types");
+    } finally {
+      setPullingServices(false);
+    }
+  }
+
+  function applySelectedServices() {
+    if (!availableServices) return;
+    const selected = availableServices.filter(s => s.selected);
+    setServiceIdMap(selected.map(s => ({ name: s.description, id: s.id })));
+    setAvailableServices(null);
+    toast.success(`${selected.length} service${selected.length !== 1 ? "s" : ""} selected — click Save to persist`);
+  }
+
   async function addTechnician() {
     if (!userProfile?.companyId || !newTech.name || !newTech.employeeId) return;
     setAddingTech(true);
@@ -266,61 +301,142 @@ export default function SettingsPage() {
                 <div className="space-y-3 pt-2">
                   <div className="flex items-center justify-between">
                     <Label className="text-sm font-semibold">Service ID Mappings</Label>
-                    <span className="text-xs text-muted-foreground/50">{serviceIdMap.length} service{serviceIdMap.length !== 1 ? "s" : ""}</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground/50">Map your service names to FieldRoutes service type IDs. When a route is approved, the matching ID is sent to FieldRoutes.</p>
-                  {serviceIdMap.map((entry, i) => (
-                    <div key={i} className="flex gap-2 items-center">
-                      <Input
-                        value={entry.name}
-                        onChange={e => setServiceIdMap(prev => prev.map((s, j) => j === i ? { ...s, name: e.target.value } : s))}
-                        placeholder="Service name"
-                        className="h-9 flex-1"
-                      />
-                      <Input
-                        value={entry.id}
-                        onChange={e => setServiceIdMap(prev => prev.map((s, j) => j === i ? { ...s, id: e.target.value.replace(/[^0-9]/g, "") } : s))}
-                        placeholder="ID"
-                        inputMode="numeric"
-                        className="h-9 w-24"
-                      />
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground/50">{serviceIdMap.length} service{serviceIdMap.length !== 1 ? "s" : ""}</span>
                       <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-muted-foreground/30 hover:text-red-400 h-8 w-8 shrink-0"
-                        onClick={() => setServiceIdMap(prev => prev.filter((_, j) => j !== i))}
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs gap-1.5"
+                        disabled={pullingServices}
+                        onClick={pullServiceTypes}
                       >
-                        <Trash2 className="w-4 h-4" />
+                        {pullingServices ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                        Pull from FieldRoutes
                       </Button>
                     </div>
-                  ))}
-                  <div className="flex gap-2 items-center">
-                    <Input
-                      value={newService.name}
-                      onChange={e => setNewService(prev => ({ ...prev, name: e.target.value }))}
-                      placeholder="New service name"
-                      className="h-9 flex-1"
-                    />
-                    <Input
-                      value={newService.id}
-                      onChange={e => setNewService(prev => ({ ...prev, id: e.target.value.replace(/[^0-9]/g, "") }))}
-                      placeholder="ID"
-                      inputMode="numeric"
-                      className="h-9 w-24"
-                    />
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="text-blue-400 hover:text-blue-300 h-8 w-8 shrink-0"
-                      disabled={!newService.name.trim() || !newService.id.trim()}
-                      onClick={() => {
-                        setServiceIdMap(prev => [...prev, { name: newService.name.trim(), id: newService.id.trim() }]);
-                        setNewService({ name: "", id: "" });
-                      }}
-                    >
-                      <Plus className="w-4 h-4" />
-                    </Button>
                   </div>
+                  <p className="text-xs text-muted-foreground/50">Select which FieldRoutes service types to map. When a route is approved, the matching ID is sent to FieldRoutes.</p>
+
+                  {availableServices !== null ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-xs font-medium text-blue-400">{availableServices.length} service types found</p>
+                        <div className="flex gap-2">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() => setAvailableServices(prev => prev?.map(s => ({ ...s, selected: true })) ?? null)}
+                          >
+                            Select all
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() => setAvailableServices(prev => prev?.map(s => ({ ...s, selected: false })) ?? null)}
+                          >
+                            Clear
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="max-h-64 overflow-y-auto rounded-lg border border-border/30 divide-y divide-border/20">
+                        {availableServices.map((svc, i) => (
+                          <label
+                            key={svc.id}
+                            className="flex items-center gap-3 px-3 py-2 hover:bg-accent/15 cursor-pointer transition-colors"
+                          >
+                            <div
+                              className={`w-4 h-4 rounded border shrink-0 flex items-center justify-center transition-colors ${
+                                svc.selected
+                                  ? "bg-blue-500 border-blue-500"
+                                  : "border-muted-foreground/30"
+                              }`}
+                              onClick={() => setAvailableServices(prev =>
+                                prev?.map((s, j) => j === i ? { ...s, selected: !s.selected } : s) ?? null
+                              )}
+                            >
+                              {svc.selected && <Check className="w-3 h-3 text-white" />}
+                            </div>
+                            <span className="text-sm flex-1 truncate">{svc.description}</span>
+                            <span className="text-xs text-muted-foreground/40 tabular-nums">{svc.id}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="flex gap-2 justify-end">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 text-xs"
+                          onClick={() => setAvailableServices(null)}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          size="sm"
+                          className="h-8 text-xs bg-blue-500 hover:bg-blue-600 text-white"
+                          onClick={applySelectedServices}
+                        >
+                          Apply {availableServices.filter(s => s.selected).length} selected
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {serviceIdMap.map((entry, i) => (
+                        <div key={i} className="flex gap-2 items-center">
+                          <Input
+                            value={entry.name}
+                            onChange={e => setServiceIdMap(prev => prev.map((s, j) => j === i ? { ...s, name: e.target.value } : s))}
+                            placeholder="Service name"
+                            className="h-9 flex-1"
+                          />
+                          <Input
+                            value={entry.id}
+                            onChange={e => setServiceIdMap(prev => prev.map((s, j) => j === i ? { ...s, id: e.target.value.replace(/[^0-9]/g, "") } : s))}
+                            placeholder="ID"
+                            inputMode="numeric"
+                            className="h-9 w-24"
+                          />
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="text-muted-foreground/30 hover:text-red-400 h-8 w-8 shrink-0"
+                            onClick={() => setServiceIdMap(prev => prev.filter((_, j) => j !== i))}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        </div>
+                      ))}
+                      <div className="flex gap-2 items-center">
+                        <Input
+                          value={newService.name}
+                          onChange={e => setNewService(prev => ({ ...prev, name: e.target.value }))}
+                          placeholder="New service name"
+                          className="h-9 flex-1"
+                        />
+                        <Input
+                          value={newService.id}
+                          onChange={e => setNewService(prev => ({ ...prev, id: e.target.value.replace(/[^0-9]/g, "") }))}
+                          placeholder="ID"
+                          inputMode="numeric"
+                          className="h-9 w-24"
+                        />
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="text-blue-400 hover:text-blue-300 h-8 w-8 shrink-0"
+                          disabled={!newService.name.trim() || !newService.id.trim()}
+                          onClick={() => {
+                            setServiceIdMap(prev => [...prev, { name: newService.name.trim(), id: newService.id.trim() }]);
+                            setNewService({ name: "", id: "" });
+                          }}
+                        >
+                          <Plus className="w-4 h-4" />
+                        </Button>
+                      </div>
+                    </>
+                  )}
                 </div>
                 <Button onClick={saveApiCredentials} disabled={saving} className="bg-blue-500 hover:bg-blue-600 text-white">
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
