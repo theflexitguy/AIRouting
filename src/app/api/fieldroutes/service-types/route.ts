@@ -42,18 +42,14 @@ export async function POST(request: Request) {
 
     const client = new FieldRoutesClient({ baseUrl, authKey, authToken, timeoutMs: 30_000 });
 
-    const ids = await client.searchIds("serviceType");
-    if (ids.length === 0) {
-      return NextResponse.json({ serviceTypes: [] });
-    }
-
-    // serviceType/get breaks convention: the ID param is `typeIDs` (not
-    // `serviceTypeIDs`), and entities expose `typeID` + `description`.
-    const entities = await client.getEntities("serviceType", ids, { idParam: "typeIDs" });
-    const serviceTypes = entities
+    // Use includeData=1 on search to get fully resolved entities in one call.
+    // This avoids the serviceType/get endpoint which uses non-standard param
+    // names and response keys.
+    const body = await client.searchWithData("serviceType");
+    const serviceTypes = body
       .map((e) => ({
-        id: String(e.typeID ?? e.serviceTypeID ?? e.id ?? ""),
-        description: String(e.description ?? e.name ?? ""),
+        id: String(e.typeID ?? ""),
+        description: String(e.description ?? ""),
       }))
       .filter((s) => s.id && s.description);
 
