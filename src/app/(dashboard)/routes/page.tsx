@@ -12,8 +12,10 @@ import { calculateStopProductionValue, formatCurrency } from "@/lib/production-v
 import {
   Loader2, Wand2, CheckCircle, XCircle, GripVertical,
   Clock, AlertTriangle, Calendar,
-  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick, DollarSign, Layers
+  Printer, Share2, Pencil, MoreVertical, ArrowRight, MousePointerClick, DollarSign, Layers,
+  Check, ChevronDown, Users
 } from "lucide-react";
+import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
 import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
@@ -44,6 +46,14 @@ import { useEditHistory } from "@/hooks/useEditHistory";
 import { Undo2, Redo2 } from "lucide-react";
 
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
+// Neutral gray for FieldRoutes appointments with no tech assigned.
+const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
+// Synthetic tech id prefix for unassigned FieldRoutes appointments (no real tech).
+const UNASSIGNED_TECH_PREFIX = "__unassigned__";
+
+function isUnassignedRoute(tr: { tech: { id?: string } }) {
+  return String(tr.tech?.id || "").startsWith(UNASSIGNED_TECH_PREFIX);
+}
 const NW_ARK = { lat: 36.07, lng: -94.17 };
 const ROUTE_DROP_PREFIX = "route:";
 const FIELDROUTES_SCHEDULED_ROUTE_PREFIX = "fieldroutes-scheduled:";
@@ -92,6 +102,118 @@ function normalizeMatchValue(value: unknown) {
     .replace(/['"]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+type MultiSelectOption = { id: string; label: string; hint?: string };
+
+/**
+ * Compact multi-select dropdown used for the technician and date filters.
+ * Replaces the long chip rows so the header stays small. Supports select-all,
+ * clear, and toggling individual options (clear + pick one = single select).
+ */
+function MultiSelectDropdown({
+  label,
+  icon,
+  options,
+  selectedIds,
+  onChange,
+  allLabel,
+  emptyLabel = "None selected",
+  triggerClassName,
+}: {
+  label: string;
+  icon?: ReactNode;
+  options: MultiSelectOption[];
+  selectedIds: string[];
+  onChange: (ids: string[]) => void;
+  allLabel?: string;
+  emptyLabel?: string;
+  triggerClassName?: string;
+}) {
+  const total = options.length;
+  const selectedSet = new Set(selectedIds);
+  const count = options.filter((o) => selectedSet.has(o.id)).length;
+  const allSelected = total > 0 && count === total;
+  const summary =
+    count === 0
+      ? emptyLabel
+      : allSelected
+        ? allLabel ?? `All (${total})`
+        : count === 1
+          ? options.find((o) => selectedSet.has(o.id))?.label ?? "1 selected"
+          : `${count} of ${total}`;
+
+  const toggle = (id: string) =>
+    onChange(selectedIds.includes(id) ? selectedIds.filter((x) => x !== id) : [...selectedIds, id]);
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            "h-9 inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-background px-3 text-sm hover:bg-accent/50 transition-colors max-w-[220px]",
+            triggerClassName,
+          )}
+          title={`${label}: ${summary}`}
+        >
+          {icon}
+          <span className="text-muted-foreground shrink-0">{label}:</span>
+          <span className="font-medium truncate">{summary}</span>
+          <ChevronDown className="w-4 h-4 ml-0.5 opacity-60 shrink-0" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-64 p-0">
+        <div className="flex items-center justify-between gap-2 border-b border-border/60 px-3 py-2">
+          <span className="text-xs font-medium text-muted-foreground">{label}</span>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => onChange(options.map((o) => o.id))}
+              className="text-[11px] px-1.5 py-0.5 rounded text-blue-400 hover:bg-blue-500/10"
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="text-[11px] px-1.5 py-0.5 rounded text-muted-foreground hover:bg-accent"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+        <div className="max-h-72 overflow-y-auto py-1">
+          {options.length === 0 ? (
+            <div className="px-3 py-6 text-center text-xs text-muted-foreground">Nothing to show</div>
+          ) : (
+            options.map((o) => {
+              const checked = selectedSet.has(o.id);
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  onClick={() => toggle(o.id)}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-left hover:bg-accent/60"
+                >
+                  <span
+                    className={cn(
+                      "w-4 h-4 rounded border flex items-center justify-center shrink-0",
+                      checked ? "bg-blue-500 border-blue-500 text-white" : "border-border",
+                    )}
+                  >
+                    {checked && <Check className="w-3 h-3" />}
+                  </span>
+                  <span className="flex-1 truncate">{o.label}</span>
+                  {o.hint && <span className="text-[11px] text-muted-foreground shrink-0">{o.hint}</span>}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 function technicianMatchTokens(tech: Technician) {
@@ -754,6 +876,7 @@ export default function RoutesPage() {
   const [editMode, setEditMode] = useState(false);
   const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
   const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
+  const [showUnassigned, setShowUnassigned] = useState(true);
   const [jobPoolDueStart, setJobPoolDueStart] = useState(startDate);
   const [jobPoolDueEnd, setJobPoolDueEnd] = useState(endDate);
   const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
@@ -818,6 +941,36 @@ export default function RoutesPage() {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(routeDate)) return;
       if (routeDate < startDate || routeDate > endDate) return;
       if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
+
+      // Unassigned FieldRoutes appointments (no tech assigned in FieldRoutes)
+      // must NOT be attributed to a selected tech or merged together. Keep each
+      // on its own route, grouped by the FieldRoutes route it belongs to, and
+      // label it "Unassigned" so it reads the same as "No Tech Assigned" there.
+      const assignedTech = String(
+        job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById || "",
+      ).trim();
+      if (!assignedTech) {
+        const frRouteId = String(job.fieldRoutesRouteId || "").trim();
+        const routeKey = frRouteId || job.id;
+        const key = `${routeDate}::${UNASSIGNED_TECH_PREFIX}::${routeKey}`;
+        if (!groups.has(key)) {
+          groups.set(key, {
+            date: routeDate,
+            tech: {
+              id: `${UNASSIGNED_TECH_PREFIX}:${routeKey}`,
+              name: "Unassigned",
+              employeeId: "",
+              active: true,
+              maxStopsPerDay: 99,
+              companyId,
+            } as Technician,
+            jobs: [],
+            color: UNASSIGNED_ROUTE_COLOR,
+          });
+        }
+        groups.get(key)?.jobs.push(job);
+        return;
+      }
 
       const techIndex = selectedJobPoolTechs.findIndex((tech) => jobAssignedToTech(job, tech));
       if (techIndex < 0) return;
@@ -907,10 +1060,25 @@ export default function RoutesPage() {
   // Get unique dates that have routes
   const routeDates = [...new Set(displayRoutes.map((tr) => tr.route.date))].sort();
   const routeDateKey = routeDates.join("|");
-  // Routes for selected dates (show all if none specifically selected)
-  const visibleRoutes = selectedDates.length > 0
-    ? displayRoutes.filter((tr) => selectedDates.includes(tr.route.date))
-    : displayRoutes;
+  // Routes for the selected dates AND technicians. Like the date filter, an
+  // empty selection or "all techs selected" shows everything (so routes for a
+  // tech who isn't in the active list aren't accidentally hidden). Narrowing the
+  // Technicians dropdown filters the map and the route list down to those techs.
+  const techFilterActive = selectedTechIds.length > 0 && selectedTechIds.length < techs.length;
+  const selectedTechIdSet = new Set(selectedTechIds);
+  const visibleRoutes = displayRoutes.filter((tr) => {
+    const unassigned = isUnassignedRoute(tr);
+    if (unassigned && !showUnassigned) return false;
+    if (selectedDates.length > 0 && !selectedDates.includes(tr.route.date)) return false;
+    // The technician filter never applies to unassigned routes — they belong to
+    // no tech, so the dedicated toggle controls their visibility instead.
+    if (techFilterActive && !unassigned && !selectedTechIdSet.has(tr.tech.id)) return false;
+    return true;
+  });
+  // Unassigned FieldRoutes routes within the selected dates, for the toggle badge.
+  const unassignedRouteCount = displayRoutes.filter(
+    (tr) => isUnassignedRoute(tr) && (selectedDates.length === 0 || selectedDates.includes(tr.route.date)),
+  ).length;
   const pendingVisibleRoutes = visibleRoutes.filter(tr => !tr.route.approved && !isFieldRoutesScheduledRoute(tr.route));
   const routedJobIds = useMemo(() => {
     const ids = new Set<string>();
@@ -2670,25 +2838,29 @@ export default function RoutesPage() {
               />
             </label>
           </div>
-          <div className="flex gap-1.5 flex-wrap">
-            {techs.map(tech => (
-              <button
-                key={tech.id}
-                onClick={() => setSelectedTechIds(prev =>
-                  prev.includes(tech.id) ? prev.filter(id => id !== tech.id) : [...prev, tech.id]
-                )}
-                className={cn(
-                  "px-3 py-1.5 rounded-full text-xs font-medium border min-h-[32px]",
-                  "transition-all duration-150",
-                  selectedTechIds.includes(tech.id)
-                    ? "bg-blue-500/15 border-blue-500/30 text-blue-400"
-                    : "border-border/60 text-muted-foreground/60 hover:bg-accent/50 hover:text-muted-foreground"
-                )}
-              >
-                {tech.name}
-              </button>
-            ))}
-          </div>
+          <MultiSelectDropdown
+            label="Technicians"
+            icon={<Users className="w-4 h-4 opacity-70 shrink-0" />}
+            options={techs.map(t => ({ id: t.id, label: t.name }))}
+            selectedIds={selectedTechIds}
+            onChange={setSelectedTechIds}
+            allLabel={`All (${techs.length})`}
+          />
+          <Button
+            variant={showUnassigned ? "default" : "outline"}
+            onClick={() => setShowUnassigned(prev => !prev)}
+            className={cn(
+              "h-9 text-sm",
+              showUnassigned ? "bg-slate-400 hover:bg-slate-500 text-slate-950" : "text-muted-foreground",
+            )}
+            title="Show FieldRoutes appointments that aren't assigned to a tech yet"
+          >
+            <span
+              className="w-2.5 h-2.5 rounded-full shrink-0"
+              style={{ backgroundColor: showUnassigned ? "#0f172a" : UNASSIGNED_ROUTE_COLOR }}
+            />
+            Unassigned ({unassignedRouteCount})
+          </Button>
           <div className="flex items-center gap-2 ml-auto">
             <Button
               variant={showJobPoolLayer ? "default" : "outline"}
@@ -2794,40 +2966,19 @@ export default function RoutesPage() {
         {/* Date filter pills + bulk actions */}
         {routeDates.length > 0 && (
           <div className="px-4 pt-3 pb-2 border-b border-border/50 space-y-2">
-            <div className="flex items-center gap-2 overflow-x-auto">
-              {/* Select All / None */}
-              <button
-                onClick={() => setSelectedDates(prev => prev.length === routeDates.length ? [] : [...routeDates])}
-                className={cn(
-                  "px-2.5 py-1 rounded-md text-[11px] font-medium border transition-colors whitespace-nowrap",
-                  selectedDates.length === routeDates.length
-                    ? "bg-blue-500/20 border-blue-500/40 text-blue-400"
-                    : "border-border text-muted-foreground hover:bg-accent"
-                )}
-              >
-                All Days
-              </button>
-              {routeDates.map((d) => {
-                const count = allRoutes.filter((r) => r.route.date === d).length;
-                const isSelected = selectedDates.includes(d);
-                return (
-                  <button
-                    key={d}
-                    onClick={() => setSelectedDates(prev =>
-                      prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]
-                    )}
-                    className={cn(
-                      "px-3 py-1 rounded-md text-[11px] font-medium border transition-colors whitespace-nowrap",
-                      isSelected
-                        ? "bg-blue-500/20 border-blue-500/40 text-blue-400"
-                        : "border-border text-muted-foreground hover:bg-accent"
-                    )}
-                  >
-                    <Calendar className="w-3 h-3 inline mr-1" />
-                    {d} ({count})
-                  </button>
-                );
-              })}
+            <div className="flex items-center gap-2">
+              <MultiSelectDropdown
+                label="Dates"
+                icon={<Calendar className="w-4 h-4 opacity-70 shrink-0" />}
+                options={routeDates.map((d) => ({
+                  id: d,
+                  label: d,
+                  hint: String(allRoutes.filter((r) => r.route.date === d).length),
+                }))}
+                selectedIds={selectedDates}
+                onChange={setSelectedDates}
+                allLabel={`All days (${routeDates.length})`}
+              />
               <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap pl-4">
                 {visibleRoutes.length} routes · {visibleRoutes.reduce((s, r) => s + r.route.totalStops, 0)} stops · {formatCurrency(visibleRoutes.reduce((total, r) => total + getRouteProductionValue(r.route.stopSequence, allJobs), 0))}
               </span>

@@ -11,6 +11,7 @@ export interface Company {
   fieldRoutesMosquitoServiceId?: string;
   fieldRoutesOutdoorPackageServiceId?: string;
   fieldRoutesDefaultServiceId?: string;
+  fieldRoutesServiceIdMap?: Record<string, number>;
   allowCrossTechRouteEdits?: boolean;
   createdAt: string;
   active: boolean;
@@ -65,6 +66,7 @@ export interface Job {
   fieldRoutesScheduledDate?: string;
   fieldRoutesServicedBy?: string;
   fieldRoutesServicedById?: string;
+  fieldRoutesRouteId?: string;
   revenue?: string;
   productionValue?: string;
   subscriptionCategory?: string;
