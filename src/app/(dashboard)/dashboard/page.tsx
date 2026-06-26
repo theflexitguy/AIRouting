@@ -94,8 +94,10 @@ export default function DashboardPage() {
         ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
         : 0;
 
-      // Overdue = in-scope, past-due, not scheduled, not completed,
-      // balance <= $149. Pre-computed as a single boolean on each job doc.
+      // Overdue Stops = "Past Due": service due more than 30 days ago, in-scope,
+      // not scheduled, not completed, no constraint, balance <= $149. This is the
+      // highest-priority routing backlog. Pre-computed as a single boolean
+      // (overdueActionable) on each job doc, so the count is a cheap aggregate.
       const jobsCol = collection(db, `companies/${companyId}/jobs`);
       const overdueSnap = await getCountFromServer(
         query(jobsCol, where("overdueActionable", "==", true))
@@ -165,7 +167,7 @@ export default function DashboardPage() {
 
   const statCards = stats ? [
     { title: "Today's Routes", value: stats.todayRoutes, subtitle: "Active routes", icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
-    { title: "Overdue Stops", value: stats.overdueStops, subtitle: "Past service due date", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
+    { title: "Overdue Stops", value: stats.overdueStops, subtitle: "Past due 30+ days", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
     { title: "Total Stops", value: stats.totalStops, subtitle: "Across all techs", icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: "Total estimated", icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },

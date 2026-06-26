@@ -18,12 +18,15 @@ import { toast } from "sonner";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
 
-const statusConfig: Record<string, { label: string; variant: "warning" | "default" | "secondary" | "success" | "destructive" }> = {
+// Badge per model bucket (see jobBucket). The badge reflects the bucket, not the
+// raw status string, so Past Due / Needs Review / Inactive read correctly.
+const bucketConfig: Record<string, { label: string; variant: "warning" | "default" | "secondary" | "success" | "destructive" }> = {
+  past_due: { label: "Past Due", variant: "destructive" },
   pending: { label: "Pending", variant: "warning" },
   scheduled: { label: "Scheduled", variant: "default" },
-  in_progress: { label: "In Progress", variant: "secondary" },
+  review: { label: "Needs Review", variant: "secondary" },
   completed: { label: "Completed", variant: "success" },
-  cancelled: { label: "Cancelled", variant: "destructive" },
+  inactive: { label: "Inactive", variant: "secondary" },
 };
 
 const normalizeText = (value: unknown) => String(value ?? "").trim().toLowerCase();
@@ -78,6 +81,28 @@ interface JobRow {
   productionValue?: string;
   subscriptionCategory?: string;
   source?: string;
+  // Date-window flags (precomputed server-side; see scope.ts computeFlags):
+  pastDue30?: boolean; // service due > 30 days ago
+  dueSoon?: boolean; // service due within ±30 days
+  overdueActionable?: boolean; // Past Due count (>30d, balance-ok, no constraint, not scheduled)
+  dueSoonActionable?: boolean; // Pending count (±30d, balance-ok, no constraint, not scheduled)
+  balanceOk?: boolean;
+  customerBalance?: number;
+  hasConstraint?: boolean;
+}
+
+// Bucket a job into the model the owner reasons about. Pending and Past Due are
+// the routable pools (balance-ok); over-balance / constrained stops fall into
+// Review so they stay visible and auditable without inflating the routable counts.
+type JobBucket = "scheduled" | "past_due" | "pending" | "review" | "completed" | "inactive";
+function jobBucket(j: JobRow): JobBucket {
+  const s = normalizeStatus(j.status);
+  if (s === "completed") return "completed";
+  if (s === "scheduled" || s === "in_progress") return "scheduled";
+  if (j.overdueActionable) return "past_due";
+  if (j.dueSoonActionable) return "pending";
+  if (s === "review") return "review";
+  return "inactive";
 }
 
 export default function JobsPage() {
@@ -94,15 +119,16 @@ export default function JobsPage() {
   const [filterSubscriptionStatus, setFilterSubscriptionStatus] = useState("all");
   const [filterBillingFrequency, setFilterBillingFrequency] = useState("all");
   const [filterServiceFrequency, setFilterServiceFrequency] = useState("all");
-  const [dateFrom, setDateFrom] = useState(format(startOfYear(new Date()), "yyyy-MM-dd"));
+  // Default range starts 2 years back so the full Past Due backlog (service dates
+  // far in the past) is loaded and the Past Due count matches the dashboard, not
+  // just stops dated this calendar year.
+  const [dateFrom, setDateFrom] = useState(format(startOfYear(new Date(new Date().getFullYear() - 2, 0, 1)), "yyyy-MM-dd"));
   const [dateTo, setDateTo] = useState(format(addDays(new Date(), 90), "yyyy-MM-dd"));
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkLoading, setBulkLoading] = useState(false);
   const [pageSize, setPageSize] = useState(50);
   const [currentPage, setCurrentPage] = useState(1);
   const syncAbortRef = useRef<AbortController | null>(null);
-
-  const today = format(new Date(), "yyyy-MM-dd");
 
   const toggleSelect = (id: string) => {
     setSelectedIds(prev => {
@@ -283,7 +309,7 @@ export default function JobsPage() {
       });
     }
     if (filterStatus !== "all") {
-      filtered = filtered.filter(j => normalizeStatus(j.status) === filterStatus);
+      filtered = filtered.filter(j => jobBucket(j) === filterStatus);
     }
     if (filterTech !== "all") {
       const selectedTech = techs.find((tech) => tech.id === filterTech);
@@ -459,18 +485,31 @@ export default function JobsPage() {
     return tech?.name || assignedTechId || "Unassigned";
   };
 
-  const isPastDue = (job: JobRow) => job.scheduledDate < today && normalizeStatus(job.status) === "pending";
+  // Counts mirror the routable model: Pending = due within ±30 days, Past Due =
+  // 30+ days overdue (both balance-ok). Over-balance / constrained stops are
+  // counted under Review so the routable numbers aren't inflated, but they remain
+  // in the table (filter "Needs Review") so they can be audited and addressed.
+  const pendingCount = jobs.filter(j => jobBucket(j) === "pending").length;
+  const scheduledCount = jobs.filter(j => jobBucket(j) === "scheduled").length;
+  const pastDueCount = jobs.filter(j => jobBucket(j) === "past_due").length;
+  const reviewCount = jobs.filter(j => jobBucket(j) === "review").length;
 
-  const pendingCount = jobs.filter(j => normalizeStatus(j.status) === "pending").length;
-  const scheduledCount = jobs.filter(j => normalizeStatus(j.status) === "scheduled").length;
-  const pastDueCount = jobs.filter(isPastDue).length;
+  // Per-row red highlight: any stop 30+ days overdue (incl. over-balance ones, so
+  // the rows that most need attention are visually flagged even under Review).
+  const isPastDue = (job: JobRow) => Boolean(job.pastDue30);
 
   return (
     <div className="flex flex-col h-full">
       <TopBar title="Jobs" />
       <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 animate-fade-in">
         {/* Summary stats */}
-        <div className="flex gap-4 text-sm">
+        <div className="flex flex-wrap gap-4 text-sm">
+          {pastDueCount > 0 && (
+            <div className="flex items-center gap-1.5">
+              <AlertTriangle className="w-3 h-3 text-red-400" />
+              <span className="text-red-400 font-medium">{pastDueCount} past due</span>
+            </div>
+          )}
           <div className="flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-yellow-400" />
             <span className="text-muted-foreground">{pendingCount} pending</span>
@@ -479,10 +518,10 @@ export default function JobsPage() {
             <div className="w-2 h-2 rounded-full bg-blue-400" />
             <span className="text-muted-foreground">{scheduledCount} scheduled</span>
           </div>
-          {pastDueCount > 0 && (
+          {reviewCount > 0 && (
             <div className="flex items-center gap-1.5">
-              <AlertTriangle className="w-3 h-3 text-red-400" />
-              <span className="text-red-400 font-medium">{pastDueCount} past due</span>
+              <div className="w-2 h-2 rounded-full bg-orange-400" />
+              <span className="text-muted-foreground">{reviewCount} needs review</span>
             </div>
           )}
           <div className="ml-auto text-muted-foreground">{jobs.length} total</div>
@@ -505,11 +544,12 @@ export default function JobsPage() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All Status</SelectItem>
-              <SelectItem value="pending">Pending</SelectItem>
+              <SelectItem value="past_due">Past Due (30+ days)</SelectItem>
+              <SelectItem value="pending">Pending (±30 days)</SelectItem>
               <SelectItem value="scheduled">Scheduled</SelectItem>
-              <SelectItem value="in_progress">In Progress</SelectItem>
+              <SelectItem value="review">Needs Review</SelectItem>
               <SelectItem value="completed">Completed</SelectItem>
-              <SelectItem value="cancelled">Cancelled</SelectItem>
+              <SelectItem value="inactive">Inactive / Future</SelectItem>
             </SelectContent>
           </Select>
           <Select value={filterTech} onValueChange={setFilterTech}>
@@ -737,8 +777,7 @@ export default function JobsPage() {
                   </thead>
                   <tbody>
                     {paginatedJobs.map((job) => {
-                      const status = normalizeStatus(job.status);
-                      const sc = statusConfig[status] || statusConfig.pending;
+                      const sc = bucketConfig[jobBucket(job)] || bucketConfig.inactive;
                       const pastDue = isPastDue(job);
                       const stopProduction = calculateStopProductionValue(job);
                       const scheduledRouteDate =
@@ -851,8 +890,7 @@ export default function JobsPage() {
               {/* Mobile/iPad cards */}
               <div className="lg:hidden divide-y divide-border/30">
                 {paginatedJobs.map(job => {
-                  const status = normalizeStatus(job.status);
-                  const sc = statusConfig[status] || statusConfig.pending;
+                  const sc = bucketConfig[jobBucket(job)] || bucketConfig.inactive;
                   const pastDue = isPastDue(job);
                   const stopProduction = calculateStopProductionValue(job);
                   const scheduledRouteDate =

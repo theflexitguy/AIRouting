@@ -4,7 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb, adminAuth } from "@/lib/firebase-admin";
-import { runSync, recomputePastDue, purgeNonRecurring } from "@/lib/fieldroutes/sync";
+import { runSync, recomputePastDue, purgeNonRecurring, reconcileActiveSubscriptions } from "@/lib/fieldroutes/sync";
 
 const MAX_MANUAL_SYNCS_PER_DAY = 3;
 
@@ -77,13 +77,26 @@ export async function POST(request: NextRequest) {
     // recompute them across ALL jobs — pure Firestore, zero FieldRoutes reads —
     // so dashboard counts stay accurate without spending API quota.
     if (result.done) {
-      // Purge any one-time/as-needed docs first (keeps the app recurring-only),
-      // then refresh derived flags on the surviving recurring docs.
+      // 1) Sweep job docs for subscriptions no longer active+recurring in
+      //    FieldRoutes (cancelled/frozen). One cheap ID-only search; the rest is
+      //    Firestore. This is what clears the stale past-dues for dead subs.
+      try {
+        const reconciled = await reconcileActiveSubscriptions();
+        console.log(
+          `[fieldroutes/manual-sync] reconciled active subs: deleted ${reconciled.deleted} stale, ` +
+            `${reconciled.activeCount} active, ${reconciled.scanned} scanned` +
+            (reconciled.skipped ? ` (SKIPPED: ${reconciled.reason})` : ""),
+        );
+      } catch (reconcileErr) {
+        console.error("[fieldroutes/manual-sync] active-subscription reconcile failed:", reconcileErr);
+      }
+      // 2) Purge any one-time/as-needed docs (keeps the app recurring-only).
       try {
         await purgeNonRecurring();
       } catch (purgeErr) {
         console.error("[fieldroutes/manual-sync] purge non-recurring after sync failed:", purgeErr);
       }
+      // 3) Refresh derived date-window flags on the surviving recurring docs.
       try {
         await recomputePastDue();
       } catch (recomputeErr) {

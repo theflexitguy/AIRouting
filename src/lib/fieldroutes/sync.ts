@@ -906,11 +906,15 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const specialScheduling = str(customer.specialScheduling);
       const onHold = num(sub.onHold);
       const frequency = num(sub.frequency);
+      const active = num(sub.active);
 
-      // One-Time (-1) and As Needed (0) subscriptions are out of scope entirely.
-      // Never write a doc for them, and delete any previously-written one so the
-      // Jobs tab and overdue metric stay recurring-only. (Pure Firestore op.)
-      if (!isRecurringFrequency(frequency)) {
+      // The app is recurring + ACTIVE only. Drop a subscription doc when it is no
+      // longer active (cancelled/frozen → active != 1) or not genuinely recurring
+      // (One-Time -1 / As Needed 0). This is how a sub that was deactivated in
+      // FieldRoutes stops showing stale past-dues: the incremental sync re-pulls
+      // it via dateUpdated, sees active != 1, and deletes the doc. (Pure Firestore
+      // op; the full-set sweep in reconcileActiveSubscriptions catches the rest.)
+      if (active !== 1 || !isRecurringFrequency(frequency)) {
         const stale = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
         batch.delete(stale);
         subsProcessed++;
@@ -1004,12 +1008,17 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         // Computed flags (also stored as columns for review feeds / debugging):
         inScope,
         pastDue: flags.pastDue,
+        pastDue30: flags.pastDue30,
+        dueSoon: flags.dueSoon,
         balanceOk: flags.balanceOk,
         hasConstraint: flags.hasConstraint,
         alreadyScheduled,
         autoRoutable: flags.autoRoutable,
         needsReview: flags.needsReview,
+        // "Past Due" (>30d overdue) and "Pending" (±30d) actionable counts — a
+        // completed-after-due stop is neither (servicing rolled the date forward).
         overdueActionable: flags.overdueActionable && !serviceDueAlreadyCompleted,
+        dueSoonActionable: flags.dueSoonActionable && !serviceDueAlreadyCompleted,
         customerBalance,
         onHold: onHold === 1,
         scheduledFor,
@@ -1146,10 +1155,17 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
     const hasConstraint = Boolean(d.hasConstraint);
     const alreadyScheduled = Boolean(d.alreadyScheduled);
 
-    const pastDue = Boolean(serviceDue) && serviceDue < today;
-    const autoRoutable = inScope && pastDue && balanceOk && !hasConstraint && !alreadyScheduled;
-    const needsReview = inScope && pastDue && !alreadyScheduled && (hasConstraint || !balanceOk);
-    const overdueActionable = inScope && pastDue && balanceOk && !alreadyScheduled;
+    // Recompute the date-window flags fresh — pastDue30/dueSoon flip with the
+    // passage of time, not a record edit, so they must be re-derived daily.
+    const flags = computeFlags({
+      inScope,
+      serviceDue,
+      customerBalance: num(d.customerBalance),
+      specialScheduling: hasConstraint ? "x" : "",
+      alreadyScheduled,
+      today,
+    });
+    const { pastDue, pastDue30, dueSoon, autoRoutable, needsReview, overdueActionable, dueSoonActionable } = flags;
 
     let status: string;
     if (alreadyScheduled) status = "scheduled";
@@ -1159,13 +1175,27 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
 
     if (
       pastDue !== Boolean(d.pastDue) ||
+      pastDue30 !== Boolean(d.pastDue30) ||
+      dueSoon !== Boolean(d.dueSoon) ||
       balanceOk !== Boolean(d.balanceOk) ||
       autoRoutable !== Boolean(d.autoRoutable) ||
       needsReview !== Boolean(d.needsReview) ||
       overdueActionable !== Boolean(d.overdueActionable) ||
+      dueSoonActionable !== Boolean(d.dueSoonActionable) ||
       status !== str(d.status)
     ) {
-      batch.update(doc.ref, { pastDue, balanceOk, autoRoutable, needsReview, overdueActionable, status, updatedAt: now });
+      batch.update(doc.ref, {
+        pastDue,
+        pastDue30,
+        dueSoon,
+        balanceOk,
+        autoRoutable,
+        needsReview,
+        overdueActionable,
+        dueSoonActionable,
+        status,
+        updatedAt: now,
+      });
       updated++;
       ops++;
       if (ops >= 450) {
@@ -1178,6 +1208,87 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
   if (ops > 0) await batch.commit();
 
   return { companyId, scanned: snap.size, updated };
+}
+
+/**
+ * Delete Firestore job docs for subscriptions that are no longer ACTIVE +
+ * recurring in FieldRoutes. Roots out the stale-past-due problem: a sub that was
+ * cancelled/frozen long ago never reappears in an incremental change set, so its
+ * job doc would otherwise linger forever showing a dead service-due date.
+ *
+ * Cost: one cheap `subscription` search (IDs only — no entity fetches) for the
+ * full active+recurring set, gated by the daily API budget. If that set can't be
+ * established (API error, budget exhausted, or an empty/zero result), the sweep
+ * is SKIPPED entirely — we never delete docs against an unconfirmed set, so a
+ * transient API hiccup can't wipe the jobs collection.
+ */
+export async function reconcileActiveSubscriptions(): Promise<{
+  companyId: string;
+  activeCount: number;
+  scanned: number;
+  deleted: number;
+  skipped: boolean;
+  reason?: string;
+}> {
+  const companyId = targetCompanyId();
+  const db = adminDb();
+
+  // Establish the authoritative active+recurring ID set before touching anything.
+  const client = new FieldRoutesClient();
+  const budget = await loadBudget(db, companyId);
+  client.setMaxReads(budget.remaining);
+  if (budget.remaining <= 0) {
+    return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "api cap reached" };
+  }
+
+  let activeIds: string[];
+  try {
+    activeIds = await client.searchIds("subscription", {
+      active: 1,
+      frequency: { operator: ">", value: 0 },
+    });
+  } catch (err) {
+    if (err instanceof FieldRoutesBudgetError) {
+      await recordApiUsage(db, companyId, { reads: client.readCount });
+      return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "api cap reached" };
+    }
+    // Filter unsupported → fall back to active-only (still excludes cancelled/frozen).
+    try {
+      activeIds = await client.searchIds("subscription", { active: 1 });
+    } catch (err2) {
+      await recordApiUsage(db, companyId, { reads: client.readCount });
+      console.warn("[fieldroutes/reconcile] active subscription search failed; skipping sweep:", String(err2));
+      return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "search failed" };
+    }
+  }
+  await recordApiUsage(db, companyId, { reads: client.readCount });
+
+  const activeSet = new Set(activeIds.map((id) => str(id)).filter(Boolean));
+  // Refuse to sweep against an empty set — that almost certainly means the search
+  // came back blank, and deleting every job doc would be catastrophic.
+  if (activeSet.size === 0) {
+    return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "empty active set" };
+  }
+
+  const snap = await db.collection(`companies/${companyId}/jobs`).where("source", "==", "api").get();
+  let batch = db.batch();
+  let ops = 0;
+  let deleted = 0;
+  for (const doc of snap.docs) {
+    const subId = str(doc.data().subscriptionId);
+    if (subId && activeSet.has(subId)) continue; // still active + recurring — keep
+    batch.delete(doc.ref);
+    deleted++;
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+
+  return { companyId, activeCount: activeSet.size, scanned: snap.size, deleted, skipped: false };
 }
 
 /**
