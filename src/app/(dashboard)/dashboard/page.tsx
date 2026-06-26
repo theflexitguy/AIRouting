@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { collection, query, where, getDocs, orderBy, limit, getCountFromServer } from "firebase/firestore";
+import { collection, query, where, getDocs, orderBy, limit } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -94,15 +94,18 @@ export default function DashboardPage() {
         ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
         : 0;
 
-      // Overdue Stops = "Past Due": service due more than 30 days ago, in-scope,
-      // not scheduled, not completed, no constraint, balance <= $149. This is the
-      // highest-priority routing backlog. Pre-computed as a single boolean
-      // (overdueActionable) on each job doc, so the count is a cheap aggregate.
+      // Overdue Stops = distinct CUSTOMERS with at least one overdueActionable
+      // subscription. FieldRoutes' "Customers Due For Service" counts by customer,
+      // so we deduplicate by customerId to match. Routing still operates on
+      // individual subscriptions — this only affects the dashboard display number.
       const jobsCol = collection(db, `companies/${companyId}/jobs`);
-      const overdueSnap = await getCountFromServer(
+      const overdueSnap = await getDocs(
         query(jobsCol, where("overdueActionable", "==", true))
       );
-      const overdueStops = overdueSnap.data().count;
+      const overdueCustomerIds = new Set(
+        overdueSnap.docs.map(d => d.data().customerId as string)
+      );
+      const overdueStops = overdueCustomerIds.size;
 
       const jobsDueThisWeek = [];
       for (let i = 0; i < 7; i++) {
