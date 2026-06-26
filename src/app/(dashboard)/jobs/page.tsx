@@ -83,7 +83,8 @@ interface JobRow {
   subscriptionCategory?: string;
   source?: string;
   // Date-window flags (precomputed server-side; see scope.ts computeFlags):
-  pastDue30?: boolean; // service due > 30 days ago
+  pastDue?: boolean; // service due before today (any amount)
+  pastDue30?: boolean; // service due 30 days–1 year ago (capped; older = ignored)
   dueSoon?: boolean; // service due within ±30 days
   overdueActionable?: boolean; // Past Due count (>30d, balance-ok, no constraint, not scheduled)
   dueSoonActionable?: boolean; // Pending count (±30d, balance-ok, no constraint, not scheduled)
@@ -103,9 +104,9 @@ function jobBucket(j: JobRow): JobBucket {
   if (j.dueSoonActionable) return "pending"; // within ±30d, routable
   if (s === "review") return "review"; // over-balance / constrained
   if (s === "completed") return "completed"; // FieldRoutes marked complete
-  // Not overdue, not due-soon, not flagged → next service is >30d out: the
-  // current cycle is done. Treat as Completed (owner's definition).
-  if (j.dueSoon === false && j.pastDue30 === false) return "completed";
+  // Next service is >30d in the FUTURE (not overdue at all): current cycle done.
+  if (!j.pastDue && j.dueSoon === false && j.pastDue30 === false) return "completed";
+  // Anything left (incl. >1-year-overdue stale stops we now ignore) → Inactive.
   return "inactive";
 }
 

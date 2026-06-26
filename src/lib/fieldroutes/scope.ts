@@ -25,6 +25,14 @@ export const BALANCE_GATE = 149;
 export const WINDOW_DAYS = 30;
 
 /**
+ * Upper bound on how far back a "Past Due" stop can be. Anything due more than
+ * this many days ago is treated as stale (long-dead service date) and dropped
+ * from the Past Due / overdue counts and from routing — these are almost always
+ * abandoned subscriptions, not real backlog worth chasing.
+ */
+export const MAX_OVERDUE_DAYS = 365;
+
+/**
  * Shift a YYYY-MM-DD calendar date by a number of days. Pure calendar math via
  * UTC (no time component, no DST drift) — the inputs are already Central-day
  * strings from centralTodayISO/toDateOnly, so this just moves the calendar day.
@@ -150,12 +158,16 @@ export function computeFlags(input: JobFlagsInput): JobFlags {
   const today = input.today;
   const windowStart = shiftISODate(today, -WINDOW_DAYS); // today − 30 days
   const windowEnd = shiftISODate(today, WINDOW_DAYS); // today + 30 days
+  const overdueFloor = shiftISODate(today, -MAX_OVERDUE_DAYS); // today − 365 days
   const sd = input.serviceDue;
   const hasDate = Boolean(sd);
 
   const pastDue = hasDate && sd < today;
-  // "Past Due" = strictly more than 30 days overdue (service_due < today − 30).
-  const pastDue30 = hasDate && sd < windowStart;
+  // Older than the 1-year floor = stale/abandoned; ignored everywhere below.
+  const tooOld = hasDate && sd < overdueFloor;
+  // "Past Due" = more than 30 days overdue, but not more than a year (service_due
+  // in [today − 365, today − 30)). The floor drops dead service dates.
+  const pastDue30 = hasDate && sd < windowStart && !tooOld;
   // "Pending" / due soon = within ±30 days of today (inclusive). A date exactly
   // 30 days ago is Pending, not Past Due; 31+ days ago is Past Due.
   const dueSoon = hasDate && sd >= windowStart && sd <= windowEnd;
