@@ -8,7 +8,25 @@ import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
+import { Progress } from "@/components/ui/progress";
 import { formatTime, getConfidenceColor, getConfidenceLabel } from "@/lib/utils";
+import {
+  stopsPerRoute,
+  stopsPerHour,
+  avgDriveTime,
+  stopVariance,
+  completionRate,
+  paceFor,
+  meetsTarget,
+  STOPS_PER_ROUTE_TARGET,
+  STOPS_PER_HOUR_TARGET,
+  DRIVE_TIME_TARGET,
+  STOP_VARIANCE_TARGET,
+  COMPLETION_RATE_TARGET,
+  type RouteLike,
+  type JobLike,
+  type Pace,
+} from "@/lib/metrics/operational";
 import {
   Route,
   Briefcase,
@@ -17,6 +35,8 @@ import {
   CheckCircle2,
   RefreshCw,
   AlertTriangle,
+  Target,
+  Gauge,
 } from "lucide-react";
 import {
   BarChart,
@@ -29,7 +49,34 @@ import {
   Area,
   AreaChart,
 } from "recharts";
-import { format, addDays } from "date-fns";
+import {
+  format,
+  addDays,
+  parseISO,
+  startOfWeek,
+  endOfWeek,
+  startOfMonth,
+  endOfMonth,
+  subWeeks,
+} from "date-fns";
+
+interface WeekKpis {
+  stopsPerRoute: number | null;
+  stopsPerHour: number | null;
+  avgDriveTime: number | null;
+  stopVariance: number | null;
+  completionRate: number | null;
+  routeCount: number;
+}
+
+interface TrendRow {
+  label: string; // week start, e.g. "Jun 1"
+  routeCount: number;
+  stopsPerRoute: number | null;
+  avgDriveTime: number | null;
+  stopVariance: number | null;
+  stopsPerHour: number | null;
+}
 
 interface DashboardStats {
   todayRoutes: number;
@@ -37,6 +84,10 @@ interface DashboardStats {
   overdueStops: number;
   estimatedDriveTime: number;
   avgConfidence: number;
+  weekKpis: WeekKpis;
+  monthlyPace: Pace;
+  weeklyPace: Pace;
+  trend: TrendRow[];
   jobsDueThisWeek: Array<{ date: string; count: number }>;
   confidenceTrend: Array<{ date: string; confidence: number }>;
   recentActivity: Array<{
@@ -60,6 +111,16 @@ const activityColors = {
   route_approved: "text-emerald-400",
   route_modified: "text-yellow-400",
   sync_complete: "text-purple-400",
+};
+
+const EMPTY_PACE: Pace = { target: 0, done: 0, remaining: 0, pct: 0 };
+const EMPTY_WEEK_KPIS: WeekKpis = {
+  stopsPerRoute: null,
+  stopsPerHour: null,
+  avgDriveTime: null,
+  stopVariance: null,
+  completionRate: null,
+  routeCount: 0,
 };
 
 export default function DashboardPage() {
@@ -107,6 +168,68 @@ export default function DashboardPage() {
       );
       const overdueStops = overdueCustomerIds.size;
 
+      // --- Period boundaries (calendar dates; compared as YYYY-MM-DD strings) ---
+      const todayDate = parseISO(today);
+      const weekStart = format(startOfWeek(todayDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
+      const weekEnd = format(endOfWeek(todayDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
+      const monthStart = format(startOfMonth(todayDate), "yyyy-MM-dd");
+      const monthEnd = format(endOfMonth(todayDate), "yyyy-MM-dd");
+
+      // --- THIS WEEK KPIs (auto-computed from this week's route docs) ---
+      const weekRoutesSnap = await getDocs(
+        query(
+          collection(db, `companies/${companyId}/routes`),
+          where("date", ">=", weekStart),
+          where("date", "<=", weekEnd)
+        )
+      );
+      const weekRoutes = weekRoutesSnap.docs.map(d => d.data() as RouteLike);
+
+      // --- Pace: one broad read of the active base, reused for month + week ---
+      const allJobsSnap = await getDocs(query(jobsCol, where("inScope", "==", true)));
+      const allJobs = allJobsSnap.docs.map(d => d.data() as JobLike);
+      const monthlyPace = paceFor(allJobs, monthStart, monthEnd, today);
+      const weeklyPace = paceFor(allJobs, weekStart, weekEnd, today);
+
+      const weekKpis: WeekKpis = {
+        stopsPerRoute: stopsPerRoute(weekRoutes),
+        stopsPerHour: stopsPerHour(weekRoutes),
+        avgDriveTime: avgDriveTime(weekRoutes),
+        stopVariance: stopVariance(weekRoutes),
+        // Completion rate this week = subs serviced ÷ subs due this week.
+        completionRate: completionRate(weeklyPace.done, weeklyPace.target),
+        routeCount: weekRoutes.length,
+      };
+
+      // --- 8-week trend (auto-derived from the last 8 weeks of route docs) ---
+      const trendStart = format(startOfWeek(subWeeks(todayDate, 7), { weekStartsOn: 1 }), "yyyy-MM-dd");
+      const trendRoutesSnap = await getDocs(
+        query(
+          collection(db, `companies/${companyId}/routes`),
+          where("date", ">=", trendStart),
+          where("date", "<=", weekEnd)
+        )
+      );
+      const trendRoutes = trendRoutesSnap.docs.map(d => d.data() as RouteLike & { date?: string });
+      const trend: TrendRow[] = [];
+      for (let w = 7; w >= 0; w--) {
+        const wkStartDate = startOfWeek(subWeeks(todayDate, w), { weekStartsOn: 1 });
+        const wkStart = format(wkStartDate, "yyyy-MM-dd");
+        const wkEnd = format(endOfWeek(wkStartDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
+        const wkRoutes = trendRoutes.filter(r => {
+          const d = String(r.date || "");
+          return d >= wkStart && d <= wkEnd;
+        });
+        trend.push({
+          label: format(wkStartDate, "MMM d"),
+          routeCount: wkRoutes.length,
+          stopsPerRoute: stopsPerRoute(wkRoutes),
+          avgDriveTime: avgDriveTime(wkRoutes),
+          stopVariance: stopVariance(wkRoutes),
+          stopsPerHour: stopsPerHour(wkRoutes),
+        });
+      }
+
       const jobsDueThisWeek = [];
       for (let i = 0; i < 7; i++) {
         const d = format(addDays(new Date(), i), "yyyy-MM-dd");
@@ -146,6 +269,10 @@ export default function DashboardPage() {
         overdueStops,
         estimatedDriveTime,
         avgConfidence,
+        weekKpis,
+        monthlyPace,
+        weeklyPace,
+        trend,
         jobsDueThisWeek,
         confidenceTrend,
         recentActivity: activity,
@@ -159,6 +286,10 @@ export default function DashboardPage() {
         overdueStops: 0,
         estimatedDriveTime: 0,
         avgConfidence: 0,
+        weekKpis: EMPTY_WEEK_KPIS,
+        monthlyPace: EMPTY_PACE,
+        weeklyPace: EMPTY_PACE,
+        trend: [],
         jobsDueThisWeek: [],
         confidenceTrend: [],
         recentActivity: [],
@@ -174,6 +305,17 @@ export default function DashboardPage() {
     { title: "Total Stops", value: stats.totalStops, subtitle: "Across all techs", icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: "Total estimated", icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },
+  ] : [];
+
+  // THIS WEEK KPI cards. Each shows the value vs its target; green when on target,
+  // red when missing it, and a muted "—" when there's no route data yet.
+  const fmt1 = (v: number | null) => (v === null ? "—" : v.toFixed(1));
+  const kpiCards = stats ? [
+    { title: "Stops / Route", value: fmt1(stats.weekKpis.stopsPerRoute), target: `≥ ${STOPS_PER_ROUTE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopsPerRoute, STOPS_PER_ROUTE_TARGET) },
+    { title: "Stops / Hour", value: fmt1(stats.weekKpis.stopsPerHour), target: `≥ ${STOPS_PER_HOUR_TARGET.toFixed(1)}`, ok: meetsTarget(stats.weekKpis.stopsPerHour, STOPS_PER_HOUR_TARGET) },
+    { title: "Avg Drive Time", value: stats.weekKpis.avgDriveTime === null ? "—" : `${Math.round(stats.weekKpis.avgDriveTime)}m`, target: `< ${DRIVE_TIME_TARGET}m`, ok: meetsTarget(stats.weekKpis.avgDriveTime, DRIVE_TIME_TARGET, true) },
+    { title: "Stop Variance", value: stats.weekKpis.stopVariance === null ? "—" : String(stats.weekKpis.stopVariance), target: `≤ ${STOP_VARIANCE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopVariance, STOP_VARIANCE_TARGET, true) },
+    { title: "Completion Rate", value: stats.weekKpis.completionRate === null ? "—" : `${Math.round(stats.weekKpis.completionRate * 100)}%`, target: `≥ ${Math.round(COMPLETION_RATE_TARGET * 100)}%`, ok: meetsTarget(stats.weekKpis.completionRate, COMPLETION_RATE_TARGET) },
   ] : [];
 
   return (
@@ -195,7 +337,8 @@ export default function DashboardPage() {
           </div>
         ) : stats ? (
           <>
-            {/* Stat cards */}
+            {/* TODAY — operational snapshot */}
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Today</p>
             <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
               {statCards.map((stat, i) => {
                 const Icon = stat.icon;
@@ -211,6 +354,57 @@ export default function DashboardPage() {
                         <div className={`p-2 rounded-lg ${stat.bgColor} ${stat.color}`}>
                           <Icon className="w-4 h-4" />
                         </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
+
+            {/* THIS WEEK — efficiency KPIs vs targets (auto-computed) */}
+            <div className="flex items-center justify-between pt-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">This Week</p>
+              <p className="text-xs text-muted-foreground/50">{stats.weekKpis.routeCount} routes</p>
+            </div>
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+              {kpiCards.map((kpi) => {
+                const color = kpi.ok === null ? "text-muted-foreground/50" : kpi.ok ? "text-emerald-400" : "text-red-400";
+                return (
+                  <Card key={kpi.title} className="border-border/40 animate-fade-in">
+                    <CardContent className="p-5">
+                      <p className="text-[13px] text-muted-foreground font-medium">{kpi.title}</p>
+                      <p className={`text-2xl font-bold tracking-tight ${color}`}>{kpi.value}</p>
+                      <p className="text-xs text-muted-foreground/70">Target {kpi.target}</p>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
+
+            {/* PACE — progress toward the auto-derived service target */}
+            <div className="grid lg:grid-cols-2 gap-4">
+              {[
+                { label: "Monthly Target", sub: "Services due this month", pace: stats.monthlyPace, icon: Target, color: "text-blue-400", bg: "bg-blue-500/10" },
+                { label: "Weekly Target", sub: "Services due this week", pace: stats.weeklyPace, icon: Gauge, color: "text-purple-400", bg: "bg-purple-500/10" },
+              ].map((p) => {
+                const Icon = p.icon;
+                const pctRounded = Math.min(100, Math.round(p.pace.pct * 100));
+                return (
+                  <Card key={p.label} className="border-border/40 animate-fade-in">
+                    <CardContent className="p-5 space-y-3">
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <p className="text-[13px] text-muted-foreground font-medium">{p.label}</p>
+                          <p className="text-3xl font-bold text-foreground tracking-tight">{p.pace.remaining} <span className="text-base font-medium text-muted-foreground/70">left</span></p>
+                          <p className="text-xs text-muted-foreground/70">{p.pace.done} done · {p.pace.target} target</p>
+                        </div>
+                        <div className={`p-2 rounded-lg ${p.bg} ${p.color}`}>
+                          <Icon className="w-4 h-4" />
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <Progress value={pctRounded} className="h-2" />
+                        <p className="text-xs text-muted-foreground/60">{pctRounded}% complete · {p.sub}</p>
                       </div>
                     </CardContent>
                   </Card>
@@ -268,6 +462,40 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
             </div>
+
+            {/* 8-week trend — efficiency over the last 8 weeks (auto-derived) */}
+            <Card className="border-border/40 animate-fade-in">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-semibold">8-Week Trend</CardTitle>
+                <CardDescription className="text-xs">Weekly routing efficiency</CardDescription>
+              </CardHeader>
+              <CardContent className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                      <th className="py-2 pr-4 font-medium">Week of</th>
+                      <th className="py-2 pr-4 font-medium text-right">Routes</th>
+                      <th className="py-2 pr-4 font-medium text-right">Stops/Route</th>
+                      <th className="py-2 pr-4 font-medium text-right">Avg Drive</th>
+                      <th className="py-2 pr-4 font-medium text-right">Variance</th>
+                      <th className="py-2 font-medium text-right">Stops/Hr</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stats.trend.map((row) => (
+                      <tr key={row.label} className="border-b border-border/20 last:border-0">
+                        <td className="py-2 pr-4 text-foreground">{row.label}</td>
+                        <td className="py-2 pr-4 text-right text-muted-foreground">{row.routeCount}</td>
+                        <td className="py-2 pr-4 text-right text-muted-foreground">{row.stopsPerRoute === null ? "—" : row.stopsPerRoute.toFixed(1)}</td>
+                        <td className="py-2 pr-4 text-right text-muted-foreground">{row.avgDriveTime === null ? "—" : `${Math.round(row.avgDriveTime)}m`}</td>
+                        <td className="py-2 pr-4 text-right text-muted-foreground">{row.stopVariance === null ? "—" : row.stopVariance}</td>
+                        <td className="py-2 text-right text-muted-foreground">{row.stopsPerHour === null ? "—" : row.stopsPerHour.toFixed(1)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </CardContent>
+            </Card>
 
             {/* Activity feed */}
             <Card className="border-border/40 animate-fade-in stagger-5">

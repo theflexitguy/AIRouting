@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { SkeletonRow } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
@@ -97,11 +98,14 @@ interface JobRow {
 type JobBucket = "scheduled" | "past_due" | "pending" | "review" | "completed" | "inactive";
 function jobBucket(j: JobRow): JobBucket {
   const s = normalizeStatus(j.status);
-  if (s === "completed") return "completed";
-  if (s === "scheduled" || s === "in_progress") return "scheduled";
-  if (j.overdueActionable) return "past_due";
-  if (j.dueSoonActionable) return "pending";
-  if (s === "review") return "review";
+  if (s === "scheduled" || s === "in_progress") return "scheduled"; // FieldRoutes-scheduled
+  if (j.overdueActionable) return "past_due"; // >30d overdue, routable
+  if (j.dueSoonActionable) return "pending"; // within ±30d, routable
+  if (s === "review") return "review"; // over-balance / constrained
+  if (s === "completed") return "completed"; // FieldRoutes marked complete
+  // Not overdue, not due-soon, not flagged → next service is >30d out: the
+  // current cycle is done. Treat as Completed (owner's definition).
+  if (j.dueSoon === false && j.pastDue30 === false) return "completed";
   return "inactive";
 }
 
@@ -119,9 +123,11 @@ export default function JobsPage() {
   const [filterSubscriptionStatus, setFilterSubscriptionStatus] = useState("all");
   const [filterBillingFrequency, setFilterBillingFrequency] = useState("all");
   const [filterServiceFrequency, setFilterServiceFrequency] = useState("all");
-  // Default range starts 2 years back so the full Past Due backlog (service dates
-  // far in the past) is loaded and the Past Due count matches the dashboard, not
-  // just stops dated this calendar year.
+  // Date filter is OPTIONAL and OFF by default: the tab shows the entire active
+  // base so the five bucket counts reflect the whole customer book at a glance.
+  // When enabled, the range below narrows the Firestore query. Defaults span 2
+  // years back → +90 days so the full Past Due backlog is covered when used.
+  const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
   const [dateFrom, setDateFrom] = useState(format(startOfYear(new Date(new Date().getFullYear() - 2, 0, 1)), "yyyy-MM-dd"));
   const [dateTo, setDateTo] = useState(format(addDays(new Date(), 90), "yyyy-MM-dd"));
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -222,13 +228,23 @@ export default function JobsPage() {
     try {
       const companyId = userProfile.companyId;
 
-      const jobsQuery = query(
-        collection(db, `companies/${companyId}/jobs`),
-        where("inScope", "==", true),
-        where("scheduledDate", ">=", dateFrom),
-        where("scheduledDate", "<=", dateTo),
-        orderBy("scheduledDate", "asc")
-      );
+      // Default: load the entire active base (no date constraint) so the bucket
+      // counts cover the whole book. ~5k subs is fine — only `pageSize` rows
+      // render at once. When the optional date filter is on, narrow by service
+      // date. Both variants use the existing (inScope, scheduledDate) index.
+      const jobsQuery = dateFilterEnabled
+        ? query(
+            collection(db, `companies/${companyId}/jobs`),
+            where("inScope", "==", true),
+            where("scheduledDate", ">=", dateFrom),
+            where("scheduledDate", "<=", dateTo),
+            orderBy("scheduledDate", "asc")
+          )
+        : query(
+            collection(db, `companies/${companyId}/jobs`),
+            where("inScope", "==", true),
+            orderBy("scheduledDate", "asc")
+          );
       const snap = await getDocs(jobsQuery);
       const jobData = snap.docs.map(d => ({ id: d.id, ...d.data() } as JobRow));
       setJobs(jobData);
@@ -255,7 +271,7 @@ export default function JobsPage() {
     } finally {
       setLoading(false);
     }
-  }, [userProfile, dateFrom, dateTo]);
+  }, [userProfile, dateFilterEnabled, dateFrom, dateTo]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
@@ -493,6 +509,7 @@ export default function JobsPage() {
   const scheduledCount = jobs.filter(j => jobBucket(j) === "scheduled").length;
   const pastDueCount = jobs.filter(j => jobBucket(j) === "past_due").length;
   const reviewCount = jobs.filter(j => jobBucket(j) === "review").length;
+  const completedCount = jobs.filter(j => jobBucket(j) === "completed").length;
 
   // Per-row red highlight: any stop 30+ days overdue (incl. over-balance ones, so
   // the rows that most need attention are visually flagged even under Review).
@@ -502,14 +519,13 @@ export default function JobsPage() {
     <div className="flex flex-col h-full">
       <TopBar title="Jobs" />
       <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 animate-fade-in">
-        {/* Summary stats */}
+        {/* Summary stats — all five buckets, relative to today, across whatever
+            is loaded (whole base by default; the date filter narrows it). */}
         <div className="flex flex-wrap gap-4 text-sm">
-          {pastDueCount > 0 && (
-            <div className="flex items-center gap-1.5">
-              <AlertTriangle className="w-3 h-3 text-red-400" />
-              <span className="text-red-400 font-medium">{pastDueCount} past due</span>
-            </div>
-          )}
+          <div className="flex items-center gap-1.5">
+            <AlertTriangle className="w-3 h-3 text-red-400" />
+            <span className="text-red-400 font-medium">{pastDueCount} past due</span>
+          </div>
           <div className="flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-yellow-400" />
             <span className="text-muted-foreground">{pendingCount} pending</span>
@@ -518,12 +534,14 @@ export default function JobsPage() {
             <div className="w-2 h-2 rounded-full bg-blue-400" />
             <span className="text-muted-foreground">{scheduledCount} scheduled</span>
           </div>
-          {reviewCount > 0 && (
-            <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-orange-400" />
-              <span className="text-muted-foreground">{reviewCount} needs review</span>
-            </div>
-          )}
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-orange-400" />
+            <span className="text-muted-foreground">{reviewCount} needs review</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-emerald-400" />
+            <span className="text-muted-foreground">{completedCount} completed</span>
+          </div>
           <div className="ml-auto text-muted-foreground">{jobs.length} total</div>
         </div>
 
@@ -571,6 +589,7 @@ export default function JobsPage() {
               <SelectItem value="50">50 rows</SelectItem>
               <SelectItem value="100">100 rows</SelectItem>
               <SelectItem value="250">250 rows</SelectItem>
+              <SelectItem value="500">500 rows</SelectItem>
             </SelectContent>
           </Select>
           <Button
@@ -644,12 +663,26 @@ export default function JobsPage() {
           </Button>
         </div>
 
-        {/* Date range filter */}
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-muted-foreground">Showing jobs from</span>
-          <DatePicker value={dateFrom} onChange={setDateFrom} className="h-8 text-xs" />
-          <span className="text-muted-foreground">to</span>
-          <DatePicker value={dateTo} onChange={setDateTo} className="h-8 text-xs" />
+        {/* Optional date range filter — off by default (whole active base). */}
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <Switch
+            id="date-filter"
+            checked={dateFilterEnabled}
+            onCheckedChange={setDateFilterEnabled}
+          />
+          <label htmlFor="date-filter" className="text-muted-foreground cursor-pointer">
+            Filter by date range
+          </label>
+          {dateFilterEnabled ? (
+            <>
+              <span className="text-muted-foreground ml-2">from</span>
+              <DatePicker value={dateFrom} onChange={setDateFrom} className="h-8 text-xs" />
+              <span className="text-muted-foreground">to</span>
+              <DatePicker value={dateTo} onChange={setDateTo} className="h-8 text-xs" />
+            </>
+          ) : (
+            <span className="ml-2 text-muted-foreground/60">Showing entire active base</span>
+          )}
         </div>
 
 
