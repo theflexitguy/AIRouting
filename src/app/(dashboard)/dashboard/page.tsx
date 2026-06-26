@@ -74,7 +74,7 @@ export default function DashboardPage() {
 
   async function loadDashboardData(companyId: string) {
     try {
-      const today = format(new Date(), "yyyy-MM-dd");
+      const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Chicago" });
 
       const routesQuery = query(
         collection(db, `companies/${companyId}/routes`),
