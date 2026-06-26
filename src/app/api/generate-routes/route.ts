@@ -15,6 +15,7 @@ import {
   type RoutePoint,
 } from "@/lib/google-routing";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
+import { calculateStopProductionValue } from "@/lib/production-value";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -26,6 +27,12 @@ const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"
 const ROUTE_SPREAD_WEIGHT = 1.35;
 const TUESDAY_STOP_REDUCTION = 3;
 const DRIVE_CAP_SLACK_MINUTES = 3;
+// Pending fill window: jobs due within this many days on either side of the
+// route date range are the preferred fill pool (jobs beyond it are last resort).
+const PENDING_WINDOW_DAYS = 30;
+// How many dollars of stop value offset one drive-minute when the Max-drive cap
+// forces a stop to be dropped — keeps high-value stops on the route.
+const VALUE_PER_DRIVE_MINUTE = 50;
 
 function _dateOffset(dateStr: string, days: number): string {
   const d = new Date(dateStr + "T00:00:00");
@@ -263,20 +270,62 @@ function dateTier(job: JobDoc, rangeStart: string, rangeEnd: string) {
   return 2;
 }
 
+// Per-stop production value, memoized on the job doc so the comparator/trim
+// (called many times) don't recompute it.
+function jobRouteValue(job: JobDoc): number {
+  const cached = job._routeValue;
+  if (typeof cached === "number") return cached;
+  const value =
+    calculateStopProductionValue({
+      recurringPrice: job.recurringPrice,
+      billingPrice: job.billingPrice,
+      recurringFrequency: job.recurringFrequency,
+      billingFrequency: job.billingFrequency,
+      revenue: job.revenue,
+      productionValue: job.productionValue,
+    }).value || 0;
+  job._routeValue = value;
+  return value;
+}
+
+// Routing priority tier for a NON-pinned job (FieldRoutes-scheduled jobs are
+// handled separately and always rank first):
+//   1 = overdue (the site's Overdue Stops), 2 = pending within ±30d of the
+//   route range, 3 = pending beyond that window (last-resort fill).
+function routingTier(job: JobDoc, windowStart: string, windowEnd: string) {
+  if (job.overdueActionable === true) return 1;
+  const sd = String(job.scheduledDate || "");
+  if (sd && sd >= windowStart && sd <= windowEnd) return 2;
+  return 3;
+}
+
 function jobPriorityComparator(rangeStart: string, rangeEnd: string) {
+  const windowStart = _dateOffset(rangeStart, -PENDING_WINDOW_DAYS);
+  const windowEnd = _dateOffset(rangeEnd, PENDING_WINDOW_DAYS);
   return (a: JobDoc, b: JobDoc) => {
+    // 1) FieldRoutes-scheduled stops always first (locked to their slot).
     const scheduledDiff = Number(Boolean(isFieldRoutesScheduledJob(b))) - Number(Boolean(isFieldRoutesScheduledJob(a)));
     if (scheduledDiff !== 0) return scheduledDiff;
 
-    const tierDiff = dateTier(a, rangeStart, rangeEnd) - dateTier(b, rangeStart, rangeEnd);
-    if (tierDiff !== 0) return tierDiff;
+    // 2) Tier: overdue → pending in-window → pending beyond window.
+    const tierA = routingTier(a, windowStart, windowEnd);
+    const tierB = routingTier(b, windowStart, windowEnd);
+    if (tierA !== tierB) return tierA - tierB;
 
+    // 3) Within overdue, oldest due first; within pending, highest value first.
+    if (tierA === 1) {
+      const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
+      if (dateDiff !== 0) return dateDiff;
+    } else {
+      const valueDiff = jobRouteValue(b) - jobRouteValue(a);
+      if (Math.abs(valueDiff) > 0.005) return valueDiff;
+    }
+
+    // 4) Tiebreakers: earlier due date, then more frequent service, then name.
     const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
     if (dateDiff !== 0) return dateDiff;
-
     const freqDiff = serviceFrequencyDays(a) - serviceFrequencyDays(b);
     if (freqDiff !== 0) return freqDiff;
-
     return String(a.customerName || a.docId).localeCompare(String(b.customerName || b.docId));
   };
 }
@@ -692,7 +741,12 @@ function chooseDriveCapRemoval({
     const reducedDrive = driveMinutesForOrderedSubset(without, matrixById, matrix);
     const driveReduction = Math.max(0, currentDrive - reducedDrive);
     const priorityPenalty = routeDateTier(job, rangeStart, rangeEnd) * 15;
-    const score = driveReduction - priorityPenalty;
+    // Shed the stop that frees the most drive for the LEAST value — converting
+    // value to drive-minute-equivalents so the kept stops are the high-value
+    // ones (value-per-drive-minute). Overdue stops are also protected via the
+    // priorityPenalty above.
+    const valuePenalty = jobRouteValue(job) / VALUE_PER_DRIVE_MINUTE;
+    const score = driveReduction - priorityPenalty - valuePenalty;
     if (!best || score > best.score) best = { job, score };
   }
 
@@ -1610,7 +1664,7 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const allJobDocs = Array.from(jobDocMap.values());
+    let allJobDocs = Array.from(jobDocMap.values());
 
     // Pin FieldRoutes-scheduled stops to their scheduled slot too — these are
     // already committed in FieldRoutes and must never be dropped from a route.
@@ -1619,7 +1673,24 @@ export async function POST(request: NextRequest) {
       const frSlot = pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd);
       if (frSlot) pinnedSlotByJobId.set(job.docId, frSlot);
     }
-    console.log(`[generate-routes] STEP 3 DONE: ${allJobDocs.length} job docs, ${releasedJobDocMap.size} released job docs, ${pinnedSlotByJobId.size} pinned stops`);
+
+    // Eligibility: auto-routing draws from the SAME routable pool the dashboard
+    // counts — overdue stops and balance-ok / unconstrained pending. Always keep
+    // pinned stops (FieldRoutes-scheduled or released from a route being rebuilt)
+    // and overdue stops; drop the Review bucket (over-balance or blocking
+    // scheduling constraint) for API jobs so it never auto-routes. CSV/manual
+    // jobs (no `source: "api"`) are unaffected.
+    const isRoutingEligible = (job: JobDoc): boolean => {
+      if (pinnedSlotByJobId.has(job.docId)) return true;
+      if (isFieldRoutesScheduledJob(job)) return true;
+      if (job.overdueActionable === true) return true;
+      if (job.serviceDueAlreadyCompleted === true) return false;
+      if (job.source === "api" && (job.balanceOk === false || job.hasConstraint === true)) return false;
+      return true;
+    };
+    const eligibleCountBefore = allJobDocs.length;
+    allJobDocs = allJobDocs.filter(isRoutingEligible);
+    console.log(`[generate-routes] STEP 3 DONE: ${allJobDocs.length} routable job docs (of ${eligibleCountBefore}), ${releasedJobDocMap.size} released job docs, ${pinnedSlotByJobId.size} pinned stops`);
 
     if (allJobDocs.length === 0) {
       await lockRef.delete().catch(() => {});
@@ -1681,21 +1752,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // --- 4. Tiered selection: overdue → in-window → future → no-date.
-    // scheduledDate is normalized to YYYY-MM-DD, so lexicographic sort equals chronological sort.
+    // --- 4. Tiered selection (priority): FieldRoutes-pinned → overdue → pending
+    // in ±30d window → pending beyond. overdue = the site's Overdue Stops
+    // (overdueActionable); pending is bucketed by the ±30-day window around the
+    // route range. (Pinned FieldRoutes stops are excluded from these tallies.)
+    const windowStart = _dateOffset(rangeStart, -PENDING_WINDOW_DAYS);
+    const windowEnd = _dateOffset(rangeEnd, PENDING_WINDOW_DAYS);
     const overdue: JobDoc[] = [];
     const inWindow: JobDoc[] = [];
     const future: JobDoc[] = [];
     const noDate: JobDoc[] = [];
 
     for (const j of allJobDocs) {
-      const sd = String(j.scheduledDate || "");
-      if (!sd) {
-        noDate.push(j);
+      if (pinnedSlotByJobId.has(j.docId) || isFieldRoutesScheduledJob(j)) continue;
+      if (j.overdueActionable === true) {
+        overdue.push(j);
         continue;
       }
-      if (sd < rangeStart) overdue.push(j);
-      else if (sd <= rangeEnd) inWindow.push(j);
+      const sd = String(j.scheduledDate || "");
+      if (!sd) noDate.push(j);
+      else if (sd >= windowStart && sd <= windowEnd) inWindow.push(j);
       else future.push(j);
     }
 
@@ -1749,17 +1825,21 @@ export async function POST(request: NextRequest) {
     capacityDeferred = capacityDeferred.filter((job) => !jobsToRouteIds.has(job.docId));
     const jobsDeferred = capacityDeferred.length;
 
-    const selectedOverdueCount = jobsToRoute.filter((j) => {
+    // Counts mirror the new tiers (FieldRoutes-pinned stops excluded): overdue =
+    // overdueActionable; inWindow = pending within ±30d; future = pending beyond.
+    const selectableSelected = jobsToRoute.filter(
+      (j) => !pinnedSlotByJobId.has(j.docId) && !isFieldRoutesScheduledJob(j),
+    );
+    const selectedOverdueCount = selectableSelected.filter((j) => j.overdueActionable === true).length;
+    const selectedInWindowCount = selectableSelected.filter((j) => {
+      if (j.overdueActionable === true) return false;
       const sd = String(j.scheduledDate || "");
-      return sd && sd < rangeStart;
+      return sd && sd >= windowStart && sd <= windowEnd;
     }).length;
-    const selectedInWindowCount = jobsToRoute.filter((j) => {
+    const selectedFutureCount = selectableSelected.filter((j) => {
+      if (j.overdueActionable === true) return false;
       const sd = String(j.scheduledDate || "");
-      return sd && sd >= rangeStart && sd <= rangeEnd;
-    }).length;
-    const selectedFutureCount = jobsToRoute.filter((j) => {
-      const sd = String(j.scheduledDate || "");
-      return sd && sd > rangeEnd;
+      return sd && (sd < windowStart || sd > windowEnd);
     }).length;
 
     console.log(
