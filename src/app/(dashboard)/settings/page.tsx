@@ -38,6 +38,11 @@ export default function SettingsPage() {
   const [newService, setNewService] = useState({ name: "", id: "" });
   const [pullingServices, setPullingServices] = useState(false);
   const [availableServices, setAvailableServices] = useState<Array<{ id: string; description: string; selected: boolean }> | null>(null);
+  // Route groups the app uses as dashboard filter options (titles like "GPC").
+  const [routeGroups, setRouteGroups] = useState<string[]>([]);
+  const [pullingRouteGroups, setPullingRouteGroups] = useState(false);
+  const [savingRouteGroups, setSavingRouteGroups] = useState(false);
+  const [availableRouteGroups, setAvailableRouteGroups] = useState<Array<{ title: string; selected: boolean }> | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [techs, setTechs] = useState<Technician[]>([]);
   const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
@@ -92,6 +97,9 @@ export default function SettingsPage() {
           setServiceIdMap(
             Object.entries(data.fieldRoutesServiceIdMap).map(([name, id]) => ({ name, id: String(id) }))
           );
+        }
+        if (Array.isArray(data.fieldRoutesRouteGroups)) {
+          setRouteGroups(data.fieldRoutesRouteGroups.map((t: unknown) => String(t)).filter(Boolean));
         }
       }
       setSettingsLoaded(true);
@@ -201,6 +209,53 @@ export default function SettingsPage() {
     setServiceIdMap(selected.map(s => ({ name: s.description, id: s.id })));
     setAvailableServices(null);
     toast.success(`${selected.length} service${selected.length !== 1 ? "s" : ""} selected — click Save to persist`);
+  }
+
+  async function pullRouteGroups() {
+    if (!userProfile?.companyId) return;
+    setPullingRouteGroups(true);
+    try {
+      const res = await fetch("/api/fieldroutes/route-groups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companyId: userProfile.companyId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to fetch route groups");
+      const existing = new Set(routeGroups);
+      const pulled = (data.routeGroups as string[]) || [];
+      // Keep any already-selected groups even if they didn't appear in the window.
+      const titles = Array.from(new Set([...pulled, ...routeGroups])).sort((a, b) => a.localeCompare(b));
+      setAvailableRouteGroups(titles.map(title => ({ title, selected: existing.has(title) })));
+      if (pulled.length === 0) toast.message("No route groups found on recent routes.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to pull route groups");
+    } finally {
+      setPullingRouteGroups(false);
+    }
+  }
+
+  async function saveRouteGroups() {
+    if (!userProfile?.companyId) return;
+    const selected = availableRouteGroups
+      ? availableRouteGroups.filter(g => g.selected).map(g => g.title)
+      : routeGroups;
+    setSavingRouteGroups(true);
+    try {
+      await setDoc(
+        doc(db, "companies", userProfile.companyId),
+        { fieldRoutesRouteGroups: selected },
+        { merge: true },
+      );
+      setRouteGroups(selected);
+      setAvailableRouteGroups(null);
+      toast.success(`Saved ${selected.length} route group${selected.length !== 1 ? "s" : ""}`);
+    } catch (err) {
+      console.error("Save route groups error:", err);
+      toast.error("Failed to save route groups");
+    } finally {
+      setSavingRouteGroups(false);
+    }
   }
 
   async function addTechnician() {
@@ -442,6 +497,82 @@ export default function SettingsPage() {
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   Save FieldRoutes Settings
                 </Button>
+              </CardContent>
+            </Card>
+
+            <Card className="border-border/40">
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold">Route Groups</CardTitle>
+                <CardDescription className="text-xs">
+                  Choose which FieldRoutes route groups appear as dashboard filters (e.g. GPC, Specialty, Wildlife, Lawn). Each group has its own KPI targets.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground/50">
+                    {routeGroups.length} group{routeGroups.length !== 1 ? "s" : ""} selected
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs gap-1.5"
+                    disabled={pullingRouteGroups}
+                    onClick={pullRouteGroups}
+                  >
+                    {pullingRouteGroups ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                    Pull from FieldRoutes
+                  </Button>
+                </div>
+
+                {availableRouteGroups !== null ? (
+                  <div className="space-y-2">
+                    <p className="text-xs font-medium text-blue-400">{availableRouteGroups.length} route groups found</p>
+                    <div className="max-h-64 overflow-y-auto rounded-lg border border-border/30 divide-y divide-border/20">
+                      {availableRouteGroups.map((g, i) => (
+                        <label
+                          key={g.title}
+                          className="flex items-center gap-3 px-3 py-2 hover:bg-accent/15 cursor-pointer transition-colors"
+                        >
+                          <div
+                            className={`w-4 h-4 rounded border shrink-0 flex items-center justify-center transition-colors ${
+                              g.selected ? "bg-blue-500 border-blue-500" : "border-muted-foreground/30"
+                            }`}
+                            onClick={() => setAvailableRouteGroups(prev =>
+                              prev?.map((s, j) => j === i ? { ...s, selected: !s.selected } : s) ?? null
+                            )}
+                          >
+                            {g.selected && <Check className="w-3 h-3 text-white" />}
+                          </div>
+                          <span className="text-sm flex-1 truncate">{g.title}</span>
+                        </label>
+                      ))}
+                    </div>
+                    <div className="flex gap-2 justify-end">
+                      <Button variant="ghost" size="sm" className="h-8 text-xs" onClick={() => setAvailableRouteGroups(null)}>
+                        Cancel
+                      </Button>
+                      <Button
+                        size="sm"
+                        className="h-8 text-xs bg-blue-500 hover:bg-blue-600 text-white"
+                        disabled={savingRouteGroups}
+                        onClick={saveRouteGroups}
+                      >
+                        {savingRouteGroups ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+                        Save {availableRouteGroups.filter(g => g.selected).length} selected
+                      </Button>
+                    </div>
+                  </div>
+                ) : routeGroups.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {routeGroups.map(title => (
+                      <Badge key={title} variant="secondary" className="text-xs">{title}</Badge>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground/50">
+                    No route groups selected yet. Pull from FieldRoutes to choose which groups to filter by.
+                  </p>
+                )}
               </CardContent>
             </Card>
 

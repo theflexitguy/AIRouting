@@ -12,6 +12,7 @@ export interface Company {
   fieldRoutesOutdoorPackageServiceId?: string;
   fieldRoutesDefaultServiceId?: string;
   fieldRoutesServiceIdMap?: Record<string, number>;
+  fieldRoutesRouteGroups?: string[]; // route-group titles used as dashboard filters
   allowCrossTechRouteEdits?: boolean;
   createdAt: string;
   active: boolean;
@@ -69,6 +70,7 @@ export interface Job {
   fieldRoutesServicedBy?: string;
   fieldRoutesServicedById?: string;
   fieldRoutesRouteId?: string;
+  fieldRoutesRouteGroup?: string; // route.groupTitle for the scheduled route
   revenue?: string;
   productionValue?: string;
   subscriptionCategory?: string;
@@ -90,6 +92,7 @@ export interface Route {
   totalWorkMinutes?: number;
   totalServiceMinutes?: number;
   totalStops: number;
+  routeGroupTitle?: string; // FieldRoutes route.groupTitle (dashboard filter)
   driveTimeSource?: string;
   polylineSource?: string;
   encodedPolyline?: string;

@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { collection, query, where, getDocs, orderBy, limit } from "firebase/firestore";
+import { useEffect, useMemo, useState } from "react";
+import { collection, query, where, getDocs, doc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
@@ -9,6 +9,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
+import { Switch } from "@/components/ui/switch";
+import { DatePicker } from "@/components/ui/date-picker";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatTime, getConfidenceColor, getConfidenceLabel } from "@/lib/utils";
 import {
   stopsPerRoute,
@@ -113,210 +116,274 @@ const activityColors = {
   sync_complete: "text-purple-400",
 };
 
-const EMPTY_PACE: Pace = { target: 0, done: 0, remaining: 0, pct: 0 };
-const EMPTY_WEEK_KPIS: WeekKpis = {
-  stopsPerRoute: null,
-  stopsPerHour: null,
-  avgDriveTime: null,
-  stopVariance: null,
-  completionRate: null,
-  routeCount: 0,
-};
+// Raw doc shapes the dashboard fetches once, then filters/derives client-side.
+interface RouteRec extends RouteLike {
+  date: string;
+  confidence?: number;
+  generatedBy?: string;
+  techId?: string;
+  techName?: string;
+  routeGroupTitle?: string;
+}
+interface JobRec extends JobLike {
+  status?: string;
+  overdueActionable?: boolean;
+  fieldRoutesServicedById?: string;
+  fieldRoutesServicedBy?: string;
+  assignedTechId?: string;
+}
+interface TechOption {
+  id: string;
+  name: string;
+  employeeId?: string;
+  fieldRoutesEmployeeId?: string;
+  fieldRoutesTechId?: string;
+}
+
+const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+
+// Does a route belong to the selected technician? Routes carry techId/techName;
+// match against any of the tech's known identifiers.
+function routeMatchesTech(r: RouteRec, keys: Set<string>): boolean {
+  if (keys.size === 0) return true;
+  return [r.techId, r.techName].map(norm).filter(Boolean).some((k) => keys.has(k));
+}
 
 export default function DashboardPage() {
   const { userProfile } = useAuth();
-  const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Raw data, fetched once. All displayed metrics derive from these via useMemo
+  // so the date / technician / route-group filters recompute without re-fetching.
+  const today = useMemo(() => new Date().toLocaleDateString("en-CA", { timeZone: "America/Chicago" }), []);
+  const [rawRoutes, setRawRoutes] = useState<RouteRec[]>([]); // [trendStart, weekEnd]
+  const [rawJobs, setRawJobs] = useState<JobRec[]>([]); // inScope subscriptions
+  const [techs, setTechs] = useState<TechOption[]>([]);
+  const [groupOptions, setGroupOptions] = useState<string[]>([]);
+
+  // Filters
+  const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
+  const [dateFrom, setDateFrom] = useState(() => format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd"));
+  const [dateTo, setDateTo] = useState(today);
+  const [filterTech, setFilterTech] = useState("all");
+  const [filterGroup, setFilterGroup] = useState("all");
+  const [rangeRoutes, setRangeRoutes] = useState<RouteRec[] | null>(null);
+
+  // Calendar boundaries (compared as YYYY-MM-DD strings).
+  const bounds = useMemo(() => {
+    const d = parseISO(today);
+    return {
+      weekStart: format(startOfWeek(d, { weekStartsOn: 1 }), "yyyy-MM-dd"),
+      weekEnd: format(endOfWeek(d, { weekStartsOn: 1 }), "yyyy-MM-dd"),
+      monthStart: format(startOfMonth(d), "yyyy-MM-dd"),
+      monthEnd: format(endOfMonth(d), "yyyy-MM-dd"),
+      trendStart: format(startOfWeek(subWeeks(d, 7), { weekStartsOn: 1 }), "yyyy-MM-dd"),
+    };
+  }, [today]);
 
   useEffect(() => {
     if (!userProfile?.companyId) return;
     loadDashboardData(userProfile.companyId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userProfile]);
 
   async function loadDashboardData(companyId: string) {
     try {
-      const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/Chicago" });
-
-      const routesQuery = query(
-        collection(db, `companies/${companyId}/routes`),
-        where("date", "==", today)
-      );
-      const routesSnap = await getDocs(routesQuery);
-      const todayRoutes = routesSnap.docs.map(d => d.data());
-
-      // FieldRoutes-scheduled appointments are materialized into real route docs
-      // by the sync (see reconcileScheduledRoutes), so counting route docs here
-      // already includes them alongside AI-generated routes — no separate
-      // scheduled-jobs tally needed (that would double-count).
-      const routesToday = todayRoutes.length;
-      const totalStops = todayRoutes.reduce((sum, r) => sum + (r.totalStops || 0), 0);
-      const estimatedDriveTime = todayRoutes.reduce((sum, r) => sum + (r.totalDriveTimeMinutes || 0), 0);
-      const avgConfidence = todayRoutes.length > 0
-        ? todayRoutes.reduce((sum, r) => sum + (r.confidence || 0), 0) / todayRoutes.length
-        : 0;
-
-      // Overdue Stops = distinct CUSTOMERS with at least one overdueActionable
-      // subscription. FieldRoutes' "Customers Due For Service" counts by customer,
-      // so we deduplicate by customerId to match. Routing still operates on
-      // individual subscriptions — this only affects the dashboard display number.
-      const jobsCol = collection(db, `companies/${companyId}/jobs`);
-      const overdueSnap = await getDocs(
-        query(jobsCol, where("overdueActionable", "==", true))
-      );
-      const overdueCustomerIds = new Set(
-        overdueSnap.docs.map(d => d.data().customerId as string)
-      );
-      const overdueStops = overdueCustomerIds.size;
-
-      // --- Period boundaries (calendar dates; compared as YYYY-MM-DD strings) ---
-      const todayDate = parseISO(today);
-      const weekStart = format(startOfWeek(todayDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
-      const weekEnd = format(endOfWeek(todayDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
-      const monthStart = format(startOfMonth(todayDate), "yyyy-MM-dd");
-      const monthEnd = format(endOfMonth(todayDate), "yyyy-MM-dd");
-
-      // --- THIS WEEK KPIs (auto-computed from this week's route docs) ---
-      const weekRoutesSnap = await getDocs(
+      // One routes read covering the 8-week trend through end of this week (which
+      // includes today + this week); one inScope jobs read for overdue + pace.
+      const routesSnap = await getDocs(
         query(
           collection(db, `companies/${companyId}/routes`),
-          where("date", ">=", weekStart),
-          where("date", "<=", weekEnd)
+          where("date", ">=", bounds.trendStart),
+          where("date", "<=", bounds.weekEnd)
         )
       );
-      const weekRoutes = weekRoutesSnap.docs.map(d => d.data() as RouteLike);
+      setRawRoutes(routesSnap.docs.map(d => d.data() as RouteRec));
 
-      // --- Pace: one broad read of the active base, reused for month + week ---
-      const allJobsSnap = await getDocs(query(jobsCol, where("inScope", "==", true)));
-      const allJobs = allJobsSnap.docs.map(d => d.data() as JobLike);
-      const monthlyPace = paceFor(allJobs, monthStart, monthEnd, today);
-      const weeklyPace = paceFor(allJobs, weekStart, weekEnd, today);
-
-      const weekKpis: WeekKpis = {
-        stopsPerRoute: stopsPerRoute(weekRoutes),
-        stopsPerHour: stopsPerHour(weekRoutes),
-        avgDriveTime: avgDriveTime(weekRoutes),
-        stopVariance: stopVariance(weekRoutes),
-        // Completion rate this week = subs serviced ÷ subs due this week.
-        completionRate: completionRate(weeklyPace.done, weeklyPace.target),
-        routeCount: weekRoutes.length,
-      };
-
-      // --- 8-week trend (auto-derived from the last 8 weeks of route docs) ---
-      const trendStart = format(startOfWeek(subWeeks(todayDate, 7), { weekStartsOn: 1 }), "yyyy-MM-dd");
-      const trendRoutesSnap = await getDocs(
-        query(
-          collection(db, `companies/${companyId}/routes`),
-          where("date", ">=", trendStart),
-          where("date", "<=", weekEnd)
-        )
+      const jobsSnap = await getDocs(
+        query(collection(db, `companies/${companyId}/jobs`), where("inScope", "==", true))
       );
-      const trendRoutes = trendRoutesSnap.docs.map(d => d.data() as RouteLike & { date?: string });
-      const trend: TrendRow[] = [];
-      for (let w = 7; w >= 0; w--) {
-        const wkStartDate = startOfWeek(subWeeks(todayDate, w), { weekStartsOn: 1 });
-        const wkStart = format(wkStartDate, "yyyy-MM-dd");
-        const wkEnd = format(endOfWeek(wkStartDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
-        const wkRoutes = trendRoutes.filter(r => {
-          const d = String(r.date || "");
-          return d >= wkStart && d <= wkEnd;
-        });
-        trend.push({
-          label: format(wkStartDate, "MMM d"),
-          routeCount: wkRoutes.length,
-          stopsPerRoute: stopsPerRoute(wkRoutes),
-          avgDriveTime: avgDriveTime(wkRoutes),
-          stopVariance: stopVariance(wkRoutes),
-          stopsPerHour: stopsPerHour(wkRoutes),
-        });
-      }
+      setRawJobs(jobsSnap.docs.map(d => d.data() as JobRec));
 
-      const jobsDueThisWeek = [];
-      for (let i = 0; i < 7; i++) {
-        const d = format(addDays(new Date(), i), "yyyy-MM-dd");
-        const jq = query(
-          collection(db, `companies/${companyId}/jobs`),
-          where("scheduledDate", "==", d),
-          where("status", "in", ["pending", "scheduled"])
-        );
-        const jsnap = await getDocs(jq);
-        jobsDueThisWeek.push({ date: format(addDays(new Date(), i), "EEE"), count: jsnap.size });
-      }
-
-      const recentRoutesQuery = query(
-        collection(db, `companies/${companyId}/routes`),
-        orderBy("createdAt", "desc"),
-        limit(14)
-      );
-      const recentRoutesSnap = await getDocs(recentRoutesQuery);
-      const confidenceTrend = recentRoutesSnap.docs.map(d => ({
-        date: d.data().date || today,
-        confidence: Math.round((d.data().confidence || 0) * 100),
-      })).reverse();
-
-      const activity: DashboardStats["recentActivity"] = todayRoutes.slice(0, 5).map((r, i) => ({
-        id: `route-${i}`,
-        type: r.generatedBy === "ai" ? "route_generated" : "route_modified",
-        message: r.generatedBy === "ai"
-          ? `AI generated route for ${r.totalStops} stops`
-          : `Route manually updated (${r.totalStops} stops)`,
-        time: "Today",
-        confidence: r.confidence,
+      const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
+      setTechs(techSnap.docs.map(d => {
+        const data = d.data();
+        return {
+          id: d.id,
+          name: String(data.name || d.id),
+          employeeId: data.employeeId ? String(data.employeeId) : undefined,
+          fieldRoutesEmployeeId: data.fieldRoutesEmployeeId ? String(data.fieldRoutesEmployeeId) : undefined,
+          fieldRoutesTechId: data.fieldRoutesTechId ? String(data.fieldRoutesTechId) : undefined,
+        };
       }));
 
-      setStats({
-        todayRoutes: routesToday,
-        totalStops,
-        overdueStops,
-        estimatedDriveTime,
-        avgConfidence,
-        weekKpis,
-        monthlyPace,
-        weeklyPace,
-        trend,
-        jobsDueThisWeek,
-        confidenceTrend,
-        recentActivity: activity,
-      });
+      const companySnap = await getDoc(doc(db, "companies", companyId));
+      const saved = companySnap.exists() ? companySnap.data().fieldRoutesRouteGroups : undefined;
+      setGroupOptions(Array.isArray(saved) ? saved.map((t: unknown) => String(t)).filter(Boolean) : []);
     } catch (error) {
       console.error("Dashboard data error:", error);
-      // Show empty state when Firestore is unavailable
-      setStats({
-        todayRoutes: 0,
-        totalStops: 0,
-        overdueStops: 0,
-        estimatedDriveTime: 0,
-        avgConfidence: 0,
-        weekKpis: EMPTY_WEEK_KPIS,
-        monthlyPace: EMPTY_PACE,
-        weeklyPace: EMPTY_PACE,
-        trend: [],
-        jobsDueThisWeek: [],
-        confidenceTrend: [],
-        recentActivity: [],
-      });
+      setRawRoutes([]);
+      setRawJobs([]);
     } finally {
       setLoading(false);
     }
   }
 
-  const statCards = stats ? [
-    { title: "Today's Routes", value: stats.todayRoutes, subtitle: "Active routes", icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
-    { title: "Overdue Stops", value: stats.overdueStops, subtitle: "Past due 30+ days", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
-    { title: "Total Stops", value: stats.totalStops, subtitle: "Across all techs", icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
-    { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: "Total estimated", icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
+  // Fetch routes for a custom date range only while that filter is enabled.
+  useEffect(() => {
+    const companyId = userProfile?.companyId;
+    if (!companyId || !dateFilterEnabled) { setRangeRoutes(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const snap = await getDocs(
+          query(
+            collection(db, `companies/${companyId}/routes`),
+            where("date", ">=", dateFrom),
+            where("date", "<=", dateTo)
+          )
+        );
+        if (!cancelled) setRangeRoutes(snap.docs.map(d => d.data() as RouteRec));
+      } catch (e) {
+        console.error("Range routes error:", e);
+        if (!cancelled) setRangeRoutes([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [userProfile, dateFilterEnabled, dateFrom, dateTo]);
+
+  // Identifier set for the selected technician (matched against route/job fields).
+  const techKeys = useMemo(() => {
+    if (filterTech === "all") return new Set<string>();
+    const t = techs.find(x => x.id === filterTech);
+    return new Set([t?.id, t?.name, t?.employeeId, t?.fieldRoutesEmployeeId, t?.fieldRoutesTechId].map(norm).filter(Boolean));
+  }, [filterTech, techs]);
+
+  const filtersActive = dateFilterEnabled || filterTech !== "all" || filterGroup !== "all";
+
+  // Apply technician + route-group filters to a set of routes.
+  const filterRoutes = useMemo(() => {
+    return (routes: RouteRec[]) => routes.filter(r => {
+      if (filterGroup !== "all" && String(r.routeGroupTitle || "") !== filterGroup) return false;
+      if (!routeMatchesTech(r, techKeys)) return false;
+      return true;
+    });
+  }, [filterGroup, techKeys]);
+
+  const stats: DashboardStats = useMemo(() => {
+    // Route set for the "Today" cards + KPIs: the custom range when the date
+    // filter is on, otherwise today's routes (cards) / this week's (KPIs).
+    const todaySet = filterRoutes(
+      dateFilterEnabled ? (rangeRoutes ?? []) : rawRoutes.filter(r => r.date === today)
+    );
+    const kpiSet = filterRoutes(
+      dateFilterEnabled ? (rangeRoutes ?? []) : rawRoutes.filter(r => r.date >= bounds.weekStart && r.date <= bounds.weekEnd)
+    );
+
+    const totalStops = todaySet.reduce((s, r) => s + (r.totalStops || 0), 0);
+    const estimatedDriveTime = todaySet.reduce((s, r) => s + (r.totalDriveTimeMinutes || 0), 0);
+    const avgConfidence = todaySet.length > 0
+      ? todaySet.reduce((s, r) => s + (r.confidence || 0), 0) / todaySet.length
+      : 0;
+
+    // Overdue + pace stay company-wide (subscriptions aren't tied to a route
+    // group, and overdue subs are typically unassigned).
+    const overdueStops = new Set(
+      rawJobs.filter(j => j.overdueActionable).map(j => String(j.customerId))
+    ).size;
+    const monthlyPace = paceFor(rawJobs, bounds.monthStart, bounds.monthEnd, today);
+    const weeklyPace = paceFor(rawJobs, bounds.weekStart, bounds.weekEnd, today);
+
+    const weekKpis: WeekKpis = {
+      stopsPerRoute: stopsPerRoute(kpiSet),
+      stopsPerHour: stopsPerHour(kpiSet),
+      avgDriveTime: avgDriveTime(kpiSet),
+      stopVariance: stopVariance(kpiSet),
+      completionRate: completionRate(weeklyPace.done, weeklyPace.target),
+      routeCount: kpiSet.length,
+    };
+
+    // 8-week trend: always the last 8 weeks of routes, with tech/group filters
+    // applied (but not the date-range filter).
+    const trendSet = filterRoutes(rawRoutes);
+    const trend: TrendRow[] = [];
+    const d0 = parseISO(today);
+    for (let w = 7; w >= 0; w--) {
+      const wkStartDate = startOfWeek(subWeeks(d0, w), { weekStartsOn: 1 });
+      const wkStart = format(wkStartDate, "yyyy-MM-dd");
+      const wkEnd = format(endOfWeek(wkStartDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
+      const wk = trendSet.filter(r => r.date >= wkStart && r.date <= wkEnd);
+      trend.push({
+        label: format(wkStartDate, "MMM d"),
+        routeCount: wk.length,
+        stopsPerRoute: stopsPerRoute(wk),
+        avgDriveTime: avgDriveTime(wk),
+        stopVariance: stopVariance(wk),
+        stopsPerHour: stopsPerHour(wk),
+      });
+    }
+
+    // Jobs due over the next 7 days (company-wide).
+    const jobsDueThisWeek = Array.from({ length: 7 }, (_, i) => {
+      const dd = format(addDays(parseISO(today), i), "yyyy-MM-dd");
+      const count = rawJobs.filter(j =>
+        j.scheduledDate === dd && (j.status === "pending" || j.status === "scheduled")
+      ).length;
+      return { date: format(addDays(parseISO(today), i), "EEE"), count };
+    });
+
+    const confidenceTrend = [...trendSet]
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .slice(-14)
+      .map(r => ({ date: r.date, confidence: Math.round((r.confidence || 0) * 100) }));
+
+    const recentActivity: DashboardStats["recentActivity"] = todaySet.slice(0, 5).map((r, i) => ({
+      id: `route-${i}`,
+      type: r.generatedBy === "ai" ? "route_generated" : "route_modified",
+      message: r.generatedBy === "ai"
+        ? `AI generated route for ${r.totalStops} stops`
+        : `Route updated (${r.totalStops} stops)`,
+      time: "Today",
+      confidence: r.confidence,
+    }));
+
+    return {
+      todayRoutes: todaySet.length,
+      totalStops,
+      overdueStops,
+      estimatedDriveTime,
+      avgConfidence,
+      weekKpis,
+      monthlyPace,
+      weeklyPace,
+      trend,
+      jobsDueThisWeek,
+      confidenceTrend,
+      recentActivity,
+    };
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, filterRoutes, bounds, today]);
+
+  const routeWindowLabel = dateFilterEnabled ? "Selected range" : "Today";
+  const kpiWindowLabel = dateFilterEnabled ? "Selected range" : "This Week";
+
+  const statCards = [
+    { title: "Routes", value: stats.todayRoutes, subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
+    { title: "Overdue Stops", value: stats.overdueStops, subtitle: filtersActive ? "Past due 30+ days · company-wide" : "Past due 30+ days", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
+    { title: "Total Stops", value: stats.totalStops, subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
+    { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },
-  ] : [];
+  ];
 
   // THIS WEEK KPI cards. Each shows the value vs its target; green when on target,
   // red when missing it, and a muted "—" when there's no route data yet.
   const fmt1 = (v: number | null) => (v === null ? "—" : v.toFixed(1));
-  const kpiCards = stats ? [
+  const kpiCards = [
     { title: "Stops / Route", value: fmt1(stats.weekKpis.stopsPerRoute), target: `≥ ${STOPS_PER_ROUTE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopsPerRoute, STOPS_PER_ROUTE_TARGET) },
     { title: "Stops / Hour", value: fmt1(stats.weekKpis.stopsPerHour), target: `≥ ${STOPS_PER_HOUR_TARGET.toFixed(1)}`, ok: meetsTarget(stats.weekKpis.stopsPerHour, STOPS_PER_HOUR_TARGET) },
     { title: "Avg Drive Time", value: stats.weekKpis.avgDriveTime === null ? "—" : `${Math.round(stats.weekKpis.avgDriveTime)}m`, target: `< ${DRIVE_TIME_TARGET}m`, ok: meetsTarget(stats.weekKpis.avgDriveTime, DRIVE_TIME_TARGET, true) },
     { title: "Stop Variance", value: stats.weekKpis.stopVariance === null ? "—" : String(stats.weekKpis.stopVariance), target: `≤ ${STOP_VARIANCE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopVariance, STOP_VARIANCE_TARGET, true) },
     { title: "Completion Rate", value: stats.weekKpis.completionRate === null ? "—" : `${Math.round(stats.weekKpis.completionRate * 100)}%`, target: `≥ ${Math.round(COMPLETION_RATE_TARGET * 100)}%`, ok: meetsTarget(stats.weekKpis.completionRate, COMPLETION_RATE_TARGET) },
-  ] : [];
+  ];
 
   return (
     <div className="flex flex-col h-full">
@@ -337,8 +404,53 @@ export default function DashboardPage() {
           </div>
         ) : stats ? (
           <>
+            {/* Filter bar — date range / technician / route group */}
+            <div className="flex flex-col gap-2.5 rounded-lg border border-border/40 bg-card/40 p-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <div className="flex items-center gap-2">
+                  <Switch id="dash-date" checked={dateFilterEnabled} onCheckedChange={setDateFilterEnabled} />
+                  <label htmlFor="dash-date" className="text-sm text-muted-foreground cursor-pointer">Date range</label>
+                </div>
+                {dateFilterEnabled && (
+                  <>
+                    <DatePicker value={dateFrom} onChange={setDateFrom} className="h-8 text-xs" />
+                    <span className="text-muted-foreground text-sm">to</span>
+                    <DatePicker value={dateTo} onChange={setDateTo} className="h-8 text-xs" />
+                  </>
+                )}
+                <Select value={filterTech} onValueChange={setFilterTech}>
+                  <SelectTrigger className="w-full sm:w-44 h-8 text-xs"><SelectValue placeholder="Technician" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All Technicians</SelectItem>
+                    {techs.map(t => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <Select value={filterGroup} onValueChange={setFilterGroup}>
+                  <SelectTrigger className="w-full sm:w-44 h-8 text-xs"><SelectValue placeholder="Route group" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All Route Groups</SelectItem>
+                    {groupOptions.map(g => <SelectItem key={g} value={g}>{g}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                {filtersActive && (
+                  <button
+                    type="button"
+                    className="text-xs text-muted-foreground/60 hover:text-foreground underline underline-offset-2 ml-auto"
+                    onClick={() => { setDateFilterEnabled(false); setFilterTech("all"); setFilterGroup("all"); }}
+                  >
+                    Clear filters
+                  </button>
+                )}
+              </div>
+              {groupOptions.length === 0 && (
+                <p className="text-xs text-muted-foreground/50">
+                  Tip: pull and select your route groups in Settings to filter KPIs by GPC / Specialty / Wildlife / Lawn.
+                </p>
+              )}
+            </div>
+
             {/* TODAY — operational snapshot */}
-            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Today</p>
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{routeWindowLabel}</p>
             <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
               {statCards.map((stat, i) => {
                 const Icon = stat.icon;
@@ -363,7 +475,7 @@ export default function DashboardPage() {
 
             {/* THIS WEEK — efficiency KPIs vs targets (auto-computed) */}
             <div className="flex items-center justify-between pt-2">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">This Week</p>
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{kpiWindowLabel}</p>
               <p className="text-xs text-muted-foreground/50">{stats.weekKpis.routeCount} routes</p>
             </div>
             <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
@@ -382,6 +494,9 @@ export default function DashboardPage() {
             </div>
 
             {/* PACE — progress toward the auto-derived service target */}
+            {filtersActive && (
+              <p className="text-xs text-muted-foreground/50">Overdue & pace are company-wide (all groups & techs).</p>
+            )}
             <div className="grid lg:grid-cols-2 gap-4">
               {[
                 { label: "Monthly Target", sub: "Services due this month", pace: stats.monthlyPace, icon: Target, color: "text-blue-400", bg: "bg-blue-500/10" },
