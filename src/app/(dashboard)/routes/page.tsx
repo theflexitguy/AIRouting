@@ -2283,10 +2283,28 @@ export default function RoutesPage() {
             });
           } else {
             polyline.setMap(null);
-            warnRoadSnapFailure(
-              tr.route.id,
-              `${tr.tech.name}'s ${tr.route.date} route has stops missing coordinates, so the road path could not be drawn.`,
+            // Stay silent while the missing stops can still self-heal (they have
+            // an address we haven't tried to geocode yet) — the auto-geocode
+            // effect backfills the coords and the path redraws on its own. Only
+            // warn for stops that are genuinely unresolvable (already attempted,
+            // or no address to geocode from), with an actionable message.
+            const missing = (tr.route.stopSequence || [])
+              .map((id) => allJobs[id])
+              .filter(
+                (j): j is Job => Boolean(j) && (typeof j.lat !== "number" || typeof j.lng !== "number"),
+              );
+            const healPending = missing.some(
+              (j) =>
+                String(j.address || (j as { addressRaw?: string }).addressRaw || "").trim() &&
+                !autoGeocodeAttemptedRef.current.has(j.id),
             );
+            if (!healPending && missing.length > 0) {
+              const names = missing.map((j) => j.customerName || j.id).slice(0, 3).join(", ");
+              warnRoadSnapFailure(
+                tr.route.id,
+                `${tr.tech.name}'s ${tr.route.date} route has ${missing.length} stop${missing.length === 1 ? "" : "s"} whose address couldn't be geocoded (${names}${missing.length > 3 ? "…" : ""}). Fix the address in FieldRoutes.`,
+              );
+            }
           }
         }
       }
