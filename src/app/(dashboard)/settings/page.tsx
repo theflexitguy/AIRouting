@@ -15,6 +15,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Technician } from "@/types";
 import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal, Gauge, RefreshCw, Download, Check } from "lucide-react";
 import { toast } from "sonner";
+import { groupRouteGroupTitles } from "@/lib/route-groups";
 
 // Headroom under FieldRoutes' account-wide 3,000 reads/day limit. Mirrors
 // DEFAULT_API_DAILY_CAP in src/lib/fieldroutes/usage.ts.
@@ -42,7 +43,7 @@ export default function SettingsPage() {
   const [routeGroups, setRouteGroups] = useState<string[]>([]);
   const [pullingRouteGroups, setPullingRouteGroups] = useState(false);
   const [savingRouteGroups, setSavingRouteGroups] = useState(false);
-  const [availableRouteGroups, setAvailableRouteGroups] = useState<Array<{ title: string; selected: boolean }> | null>(null);
+  const [availableRouteGroups, setAvailableRouteGroups] = useState<Array<{ canonical: string; variants: string[]; selected: boolean }> | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [techs, setTechs] = useState<Technician[]>([]);
   const [newTech, setNewTech] = useState({ name: "", employeeId: "", maxStopsPerDay: 15 });
@@ -224,9 +225,12 @@ export default function SettingsPage() {
       if (!res.ok) throw new Error(data.error || "Failed to fetch route groups");
       const existing = new Set(routeGroups);
       const pulled = (data.routeGroups as string[]) || [];
-      // Keep any already-selected groups even if they didn't appear in the window.
-      const titles = Array.from(new Set([...pulled, ...routeGroups])).sort((a, b) => a.localeCompare(b));
-      setAvailableRouteGroups(titles.map(title => ({ title, selected: existing.has(title) })));
+      // Fold FieldRoutes' spelling/casing variants into canonical buckets so the
+      // owner selects one box per real group instead of a dozen near-duplicates.
+      const buckets = groupRouteGroupTitles([...pulled, ...routeGroups]);
+      setAvailableRouteGroups(
+        buckets.map(b => ({ ...b, selected: existing.has(b.canonical) })),
+      );
       if (pulled.length === 0) toast.message("No route groups found on recent routes.");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to pull route groups");
@@ -238,7 +242,7 @@ export default function SettingsPage() {
   async function saveRouteGroups() {
     if (!userProfile?.companyId) return;
     const selected = availableRouteGroups
-      ? availableRouteGroups.filter(g => g.selected).map(g => g.title)
+      ? availableRouteGroups.filter(g => g.selected).map(g => g.canonical)
       : routeGroups;
     setSavingRouteGroups(true);
     try {
@@ -526,15 +530,17 @@ export default function SettingsPage() {
 
                 {availableRouteGroups !== null ? (
                   <div className="space-y-2">
-                    <p className="text-xs font-medium text-blue-400">{availableRouteGroups.length} route groups found</p>
-                    <div className="max-h-64 overflow-y-auto rounded-lg border border-border/30 divide-y divide-border/20">
+                    <p className="text-xs font-medium text-blue-400">
+                      {availableRouteGroups.length} group{availableRouteGroups.length !== 1 ? "s" : ""} (spelling variants merged)
+                    </p>
+                    <div className="max-h-72 overflow-y-auto rounded-lg border border-border/30 divide-y divide-border/20">
                       {availableRouteGroups.map((g, i) => (
                         <label
-                          key={g.title}
-                          className="flex items-center gap-3 px-3 py-2 hover:bg-accent/15 cursor-pointer transition-colors"
+                          key={g.canonical}
+                          className="flex items-start gap-3 px-3 py-2.5 hover:bg-accent/15 cursor-pointer transition-colors"
                         >
                           <div
-                            className={`w-4 h-4 rounded border shrink-0 flex items-center justify-center transition-colors ${
+                            className={`w-4 h-4 mt-0.5 rounded border shrink-0 flex items-center justify-center transition-colors ${
                               g.selected ? "bg-blue-500 border-blue-500" : "border-muted-foreground/30"
                             }`}
                             onClick={() => setAvailableRouteGroups(prev =>
@@ -543,7 +549,14 @@ export default function SettingsPage() {
                           >
                             {g.selected && <Check className="w-3 h-3 text-white" />}
                           </div>
-                          <span className="text-sm flex-1 truncate">{g.title}</span>
+                          <div className="flex-1 min-w-0">
+                            <span className="text-sm font-medium">{g.canonical}</span>
+                            {(g.variants.length > 1 || g.variants[0] !== g.canonical) && (
+                              <p className="text-xs text-muted-foreground/50 truncate">
+                                {g.variants.length} variant{g.variants.length !== 1 ? "s" : ""}: {g.variants.join(", ")}
+                              </p>
+                            )}
+                          </div>
                         </label>
                       ))}
                     </div>

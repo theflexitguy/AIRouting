@@ -30,6 +30,7 @@ import {
   type JobLike,
   type Pace,
 } from "@/lib/metrics/operational";
+import { canonicalRouteGroup } from "@/lib/route-groups";
 import {
   Route,
   Briefcase,
@@ -264,7 +265,9 @@ export default function DashboardPage() {
   // Apply technician + route-group filters to a set of routes.
   const filterRoutes = useMemo(() => {
     return (routes: RouteRec[]) => routes.filter(r => {
-      if (filterGroup !== "all" && String(r.routeGroupTitle || "") !== filterGroup) return false;
+      // Match on the canonical bucket so every FieldRoutes spelling variant of a
+      // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
+      if (filterGroup !== "all" && canonicalRouteGroup(String(r.routeGroupTitle || "")) !== filterGroup) return false;
       if (!routeMatchesTech(r, techKeys)) return false;
       return true;
     });
