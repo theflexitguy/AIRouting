@@ -129,6 +129,8 @@ export interface JobFlagsInput {
   customerBalance: number;
   specialScheduling: string;
   alreadyScheduled: boolean;
+  pendingCancel: boolean;
+  potentialCustomer: boolean;
   today: string; // YYYY-MM-DD (Central)
 }
 
@@ -164,14 +166,15 @@ export function computeFlags(input: JobFlagsInput): JobFlags {
   const balanceOk = input.customerBalance <= BALANCE_GATE;
   const hasConstraint = input.specialScheduling.trim().length > 0;
 
+  const excluded = input.pendingCancel || input.potentialCustomer;
   const autoRoutable =
-    input.inScope && relevant && balanceOk && !hasConstraint && !input.alreadyScheduled;
+    input.inScope && relevant && balanceOk && !hasConstraint && !input.alreadyScheduled && !excluded;
   const needsReview =
-    input.inScope && relevant && !input.alreadyScheduled && (hasConstraint || !balanceOk);
+    input.inScope && relevant && !input.alreadyScheduled && !excluded && (hasConstraint || !balanceOk);
   const overdueActionable =
-    input.inScope && pastDue30 && balanceOk && !hasConstraint && !input.alreadyScheduled;
+    input.inScope && pastDue30 && balanceOk && !hasConstraint && !input.alreadyScheduled && !excluded;
   const dueSoonActionable =
-    input.inScope && dueSoon && balanceOk && !hasConstraint && !input.alreadyScheduled;
+    input.inScope && dueSoon && balanceOk && !hasConstraint && !input.alreadyScheduled && !excluded;
 
   return {
     pastDue,

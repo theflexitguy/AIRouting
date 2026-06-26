@@ -930,6 +930,11 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const scheduledTech = appt ? appt.techName : "";
       const scheduledTechId = appt ? appt.techId : "";
 
+      const dateCancelled = toDateOnly(sub.dateCancelled);
+      const pendingCancel = Boolean(dateCancelled);
+      const custStatus = num(customer.status);
+      const potentialCustomer = custStatus < 0;
+
       const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency });
       const flags = computeFlags({
         inScope,
@@ -937,6 +942,8 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         customerBalance,
         specialScheduling,
         alreadyScheduled,
+        pendingCancel,
+        potentialCustomer,
         today,
       });
 
@@ -1019,6 +1026,8 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         // completed-after-due stop is neither (servicing rolled the date forward).
         overdueActionable: flags.overdueActionable && !serviceDueAlreadyCompleted,
         dueSoonActionable: flags.dueSoonActionable && !serviceDueAlreadyCompleted,
+        pendingCancel,
+        potentialCustomer,
         customerBalance,
         onHold: onHold === 1,
         scheduledFor,
@@ -1154,6 +1163,8 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
     const balanceOk = num(d.customerBalance) <= BALANCE_GATE;
     const hasConstraint = Boolean(d.hasConstraint);
     const alreadyScheduled = Boolean(d.alreadyScheduled);
+    const pendingCancel = Boolean(d.pendingCancel);
+    const potentialCustomer = Boolean(d.potentialCustomer);
 
     // Recompute the date-window flags fresh — pastDue30/dueSoon flip with the
     // passage of time, not a record edit, so they must be re-derived daily.
@@ -1163,6 +1174,8 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
       customerBalance: num(d.customerBalance),
       specialScheduling: hasConstraint ? "x" : "",
       alreadyScheduled,
+      pendingCancel,
+      potentialCustomer,
       today,
     });
     const { pastDue, pastDue30, dueSoon, autoRoutable, needsReview, overdueActionable, dueSoonActionable } = flags;
