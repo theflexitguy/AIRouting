@@ -1,9 +1,10 @@
 import { initializeApp, getApps, cert, App, ServiceAccount } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getFirestore, Firestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
 import { getAuth } from 'firebase-admin/auth';
 
 let adminApp: App;
+let firestoreInstance: Firestore | undefined;
 
 type ServiceAccountJson = ServiceAccount & {
   project_id?: string;
@@ -78,6 +79,15 @@ function getAdminApp(): App {
   return adminApp;
 }
 
-export const adminDb = () => getFirestore(getAdminApp());
+export const adminDb = () => {
+  if (!firestoreInstance) {
+    firestoreInstance = getFirestore(getAdminApp());
+    // Silently drop undefined fields on writes instead of throwing. A single
+    // undefined value (e.g. a missing field on a rehydrated sync-run object)
+    // would otherwise abort an entire batch mid-sync.
+    firestoreInstance.settings({ ignoreUndefinedProperties: true });
+  }
+  return firestoreInstance;
+};
 export const adminStorage = () => getStorage(getAdminApp());
 export const adminAuth = () => getAuth(getAdminApp());
