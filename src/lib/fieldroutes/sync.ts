@@ -923,13 +923,24 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         continue;
       }
 
-      // Customer-level active check: a subscription can be active:1 while the
-      // customer record itself is deactivated (common with test/demo accounts).
-      // FieldRoutes shows these with a pink background and excludes them from
-      // reports. Only delete when the field is explicitly 0 — if the field is
-      // missing/undefined we leave the doc alone (safe default).
-      const custActiveRaw = customer.active;
-      if (custActiveRaw !== undefined && custActiveRaw !== null && num(custActiveRaw) === 0) {
+      // Customer-level gate. A subscription can be active:1 while the CUSTOMER
+      // is one FieldRoutes excludes from "Customers Due For Service":
+      //   - status != 1  → Inactive / Lead / Potential (statusText "Inactive")
+      //   - officeID < 0 → test/system accounts (officeID "-1"), which can still
+      //     be marked status:1 Active, so the status check alone misses them.
+      // Drop the job doc in either case so these never reach routing or counts.
+      // Guard: only act when we actually have the customer record (and, for the
+      // status test, the field is present) so a missing customer can't trigger
+      // a spurious delete.
+      const haveCustomer = Boolean(str(customer.customerID));
+      const custStatusRaw = customer.status;
+      const custStatusPresent =
+        custStatusRaw !== undefined && custStatusRaw !== null && String(custStatusRaw).trim() !== "";
+      const custStatus = num(custStatusRaw);
+      const custOfficeId = num(customer.officeID);
+      const customerInactive = haveCustomer && custStatusPresent && custStatus !== 1;
+      const customerTestOffice = haveCustomer && custOfficeId < 0;
+      if (customerInactive || customerTestOffice) {
         const stale = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
         batch.delete(stale);
         subsProcessed++;
@@ -945,10 +956,12 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const scheduledTech = appt ? appt.techName : "";
       const scheduledTechId = appt ? appt.techId : "";
 
-      const dateCancelled = toDateOnly(sub.dateCancelled);
-      const pendingCancel = Boolean(dateCancelled);
-      const custStatus = num(customer.status);
-      const potentialCustomer = custStatus < 0;
+      // Pending cancel comes straight off the customer record (don't derive it
+      // from dateCancelled — that field is "0000-00-00 00:00:00" when unset and
+      // would parse as a truthy date). Survivors of the gate above are all
+      // status:1 Active, so potentialCustomer is moot here (kept false).
+      const pendingCancel = num(customer.pendingCancel) === 1;
+      const potentialCustomer = false;
 
       const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency });
       const flags = computeFlags({
@@ -1043,7 +1056,8 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         dueSoonActionable: flags.dueSoonActionable && !serviceDueAlreadyCompleted,
         pendingCancel,
         potentialCustomer,
-        customerActive: num(custActiveRaw),
+        customerStatus: custStatus,
+        customerOfficeId: custOfficeId,
         customerBalance,
         onHold: onHold === 1,
         scheduledFor,
@@ -1359,10 +1373,11 @@ export async function purgeNonRecurring(): Promise<{ companyId: string; scanned:
 }
 
 /**
- * Delete job docs whose CUSTOMER record is inactive in FieldRoutes (active !== 1).
- * Catches test/demo accounts that have active subscriptions but a deactivated
- * customer record — these show with a pink background in FieldRoutes and are
- * excluded from its reports. Costs 1 API read per 1000 unique customers.
+ * Delete job docs whose CUSTOMER is excluded from FieldRoutes' "Customers Due
+ * For Service" report: status != 1 (Inactive / Lead / Potential) OR officeID < 0
+ * (test/system accounts in office "-1", which can still be status:1 Active).
+ * Catches test/demo accounts that have active subscriptions but a customer
+ * record FieldRoutes hides. Costs 1 API read per 1000 unique customers.
  */
 export async function purgeInactiveCustomers(): Promise<{
   companyId: string;
@@ -1407,12 +1422,22 @@ export async function purgeInactiveCustomers(): Promise<{
   }
   await recordApiUsage(db, companyId, { reads: client.readCount });
 
+  // Match the sync-loop gate: a customer is "inactive" for our purposes when
+  // status != 1 (Inactive/Lead) OR officeID < 0 (test/system account in office
+  // -1, which can still be status:1 Active). Only flag customers FieldRoutes
+  // actually returned and whose status field is present, so a transient miss
+  // can't delete real docs.
   const inactiveCustomerIds = new Set<string>();
   for (const c of customers) {
     const cRec = rec(c);
     const cId = str(cRec.customerID);
-    const active = cRec.active;
-    if (active !== undefined && active !== null && num(active) === 0) {
+    if (!cId) continue;
+    const statusRaw = cRec.status;
+    const statusPresent =
+      statusRaw !== undefined && statusRaw !== null && String(statusRaw).trim() !== "";
+    const status = num(statusRaw);
+    const officeId = num(cRec.officeID);
+    if ((statusPresent && status !== 1) || officeId < 0) {
       inactiveCustomerIds.add(cId);
     }
   }
