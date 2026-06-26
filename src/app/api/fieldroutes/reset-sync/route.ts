@@ -8,11 +8,10 @@ import { adminDb } from "@/lib/firebase-admin";
 //  - clears the daily manual-sync counter (the 3/day rate limit)
 //  - clears any stuck in-progress run so a fresh sync can start
 //
-// Follows the same companyId-in-body shape as /api/reset-routing.
-export async function POST(request: NextRequest) {
-  const body = await request.json().catch(() => ({}));
-  const { companyId, clearRun = true } = body as { companyId?: string; clearRun?: boolean };
-
+// Supports both POST (companyId in JSON body) and GET (companyId in query
+// string) so it can be triggered straight from the browser address bar, e.g.
+//   /api/fieldroutes/reset-sync?companyId=company_xxx
+async function resetSync(companyId: string | undefined, clearRun: boolean) {
   if (!companyId) {
     return NextResponse.json({ success: false, error: "companyId is required" }, { status: 400 });
   }
@@ -47,4 +46,17 @@ export async function POST(request: NextRequest) {
   }
 
   return NextResponse.json({ success: !hasError, companyId, ...results }, { status: hasError ? 502 : 200 });
+}
+
+export async function POST(request: NextRequest) {
+  const body = await request.json().catch(() => ({}));
+  const { companyId, clearRun = true } = body as { companyId?: string; clearRun?: boolean };
+  return resetSync(companyId, clearRun);
+}
+
+export async function GET(request: NextRequest) {
+  const params = new URL(request.url).searchParams;
+  const companyId = params.get("companyId") || undefined;
+  const clearRun = params.get("clearRun") !== "false";
+  return resetSync(companyId, clearRun);
 }
