@@ -1122,6 +1122,10 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const serviceType = str(sub.serviceType);
       const serviceDue = toDateOnly(sub.nextService);
       const lastCompleted = toDateOnly(sub.lastCompleted);
+      // Real per-stop service time (minutes) from FieldRoutes — varies by service
+      // type. Drives route service-minutes and the dashboard's Stops/Hour, which
+      // was previously stuck because every stop used a hardcoded 25 min.
+      const serviceDuration = num(sub.duration) > 0 ? num(sub.duration) : 25;
       // Seasonality drives the monthly service target. FieldRoutes stores the
       // season window on the subscription (seasonalStart/End = "0000-00-00" when
       // not seasonal). Capture the start/end MONTH (1–12) so the dashboard can
@@ -1254,7 +1258,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         serviceTypeNormalized: normalizeServiceType(serviceType),
         subscriptionCategory: deriveCategory(serviceType),
         category: deriveCategory(serviceType),
-        duration: 25,
+        duration: serviceDuration,
         status,
         // Routing-relevant assignment fields:
         assignedTechId: alreadyScheduled ? scheduledTech : "",
