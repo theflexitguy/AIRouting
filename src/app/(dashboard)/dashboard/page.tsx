@@ -6,44 +6,41 @@ import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { formatTime, getConfidenceColor, getConfidenceLabel } from "@/lib/utils";
+import { formatTime } from "@/lib/utils";
 import { formatCurrency } from "@/lib/production-value";
 import {
   stopsPerRoute,
   stopsPerHour,
   avgDriveTime,
-  stopVariance,
-  completionRate,
-  paceFor,
+  monthlyServiceTarget,
+  monthlyServiced,
+  monthlyPace,
+  MONTH_WORKING_DAYS,
   meetsTarget,
   STOPS_PER_ROUTE_TARGET,
   STOPS_PER_HOUR_TARGET,
   DRIVE_TIME_TARGET,
-  STOP_VARIANCE_TARGET,
-  COMPLETION_RATE_TARGET,
   type RouteLike,
   type JobLike,
-  type Pace,
+  type MonthlyPace,
 } from "@/lib/metrics/operational";
 import { canonicalRouteGroup } from "@/lib/route-groups";
 import {
   Route,
   Briefcase,
   Clock,
-  Brain,
-  CheckCircle2,
-  RefreshCw,
   AlertTriangle,
   Target,
   Gauge,
   DollarSign,
   TrendingUp,
+  Activity,
+  CalendarDays,
 } from "lucide-react";
 import {
   BarChart,
@@ -53,8 +50,6 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  Area,
-  AreaChart,
 } from "recharts";
 import {
   format,
@@ -71,8 +66,6 @@ interface WeekKpis {
   stopsPerRoute: number | null;
   stopsPerHour: number | null;
   avgDriveTime: number | null;
-  stopVariance: number | null;
-  completionRate: number | null;
   routeCount: number;
 }
 
@@ -81,52 +74,29 @@ interface TrendRow {
   routeCount: number;
   stopsPerRoute: number | null;
   avgDriveTime: number | null;
-  stopVariance: number | null;
   stopsPerHour: number | null;
 }
 
 interface DashboardStats {
   todayRoutes: number;
   totalStops: number;
-  overdueStops: number;
   estimatedDriveTime: number;
-  avgConfidence: number;
   totalRouteValue: number;
   avgRouteValue: number;
+  todayStopsPerHour: number | null;
+  overdueStops: number;
   weekKpis: WeekKpis;
-  monthlyPace: Pace;
-  weeklyPace: Pace;
+  monthlyTarget: number;
+  weeklyTarget: number;
+  dailyTarget: number;
+  pace: MonthlyPace;
   trend: TrendRow[];
   jobsDueThisWeek: Array<{ date: string; count: number }>;
-  confidenceTrend: Array<{ date: string; confidence: number }>;
-  recentActivity: Array<{
-    id: string;
-    type: "route_generated" | "route_approved" | "route_modified" | "sync_complete";
-    message: string;
-    time: string;
-    confidence?: number;
-  }>;
 }
-
-const activityIcons = {
-  route_generated: Brain,
-  route_approved: CheckCircle2,
-  route_modified: RefreshCw,
-  sync_complete: Briefcase,
-};
-
-const activityColors = {
-  route_generated: "text-blue-400",
-  route_approved: "text-emerald-400",
-  route_modified: "text-yellow-400",
-  sync_complete: "text-purple-400",
-};
 
 // Raw doc shapes the dashboard fetches once, then filters/derives client-side.
 interface RouteRec extends RouteLike {
   date: string;
-  confidence?: number;
-  generatedBy?: string;
   techId?: string;
   techName?: string;
   routeGroupTitle?: string;
@@ -135,9 +105,6 @@ interface RouteRec extends RouteLike {
 interface JobRec extends JobLike {
   status?: string;
   overdueActionable?: boolean;
-  fieldRoutesServicedById?: string;
-  fieldRoutesServicedBy?: string;
-  assignedTechId?: string;
 }
 interface TechOption {
   id: string;
@@ -184,6 +151,7 @@ export default function DashboardPage() {
       weekEnd: format(endOfWeek(d, { weekStartsOn: 1 }), "yyyy-MM-dd"),
       monthStart: format(startOfMonth(d), "yyyy-MM-dd"),
       monthEnd: format(endOfMonth(d), "yyyy-MM-dd"),
+      monthIndex: Number(today.slice(5, 7)),
       trendStart: format(startOfWeek(subWeeks(d, 7), { weekStartsOn: 1 }), "yyyy-MM-dd"),
     };
   }, [today]);
@@ -197,7 +165,7 @@ export default function DashboardPage() {
   async function loadDashboardData(companyId: string) {
     try {
       // One routes read covering the 8-week trend through end of this week (which
-      // includes today + this week); one inScope jobs read for overdue + pace.
+      // includes today + this week); one inScope jobs read for overdue + targets.
       const routesSnap = await getDocs(
         query(
           collection(db, `companies/${companyId}/routes`),
@@ -280,8 +248,8 @@ export default function DashboardPage() {
   }, [filterGroup, techKeys]);
 
   const stats: DashboardStats = useMemo(() => {
-    // Route set for the "Today" cards + KPIs: the custom range when the date
-    // filter is on, otherwise today's routes (cards) / this week's (KPIs).
+    // Route set for the "Today" cards: the custom range when the date filter is
+    // on, otherwise today's routes. KPIs use this week's routes (or the range).
     const todaySet = filterRoutes(
       dateFilterEnabled ? (rangeRoutes ?? []) : rawRoutes.filter(r => r.date === today)
     );
@@ -293,24 +261,23 @@ export default function DashboardPage() {
     const estimatedDriveTime = todaySet.reduce((s, r) => s + (r.totalDriveTimeMinutes || 0), 0);
     const totalRouteValue = todaySet.reduce((s, r) => s + (Number(r.routeValue) || 0), 0);
     const avgRouteValue = todaySet.length > 0 ? totalRouteValue / todaySet.length : 0;
-    const avgConfidence = todaySet.length > 0
-      ? todaySet.reduce((s, r) => s + (r.confidence || 0), 0) / todaySet.length
-      : 0;
 
-    // Overdue + pace stay company-wide (subscriptions aren't tied to a route
+    // Overdue + targets stay company-wide (subscriptions aren't tied to a route
     // group, and overdue subs are typically unassigned).
     const overdueStops = new Set(
       rawJobs.filter(j => j.overdueActionable).map(j => String(j.customerId))
     ).size;
-    const monthlyPace = paceFor(rawJobs, bounds.monthStart, bounds.monthEnd, today);
-    const weeklyPace = paceFor(rawJobs, bounds.weekStart, bounds.weekEnd, today);
+
+    const monthlyTarget = monthlyServiceTarget(rawJobs, bounds.monthIndex);
+    const monthlyDone = monthlyServiced(rawJobs, bounds.monthStart, today);
+    const pace = monthlyPace(monthlyTarget, monthlyDone, today);
+    const weeklyTarget = Math.round(monthlyTarget / 4);
+    const dailyTarget = Math.round(monthlyTarget / MONTH_WORKING_DAYS);
 
     const weekKpis: WeekKpis = {
       stopsPerRoute: stopsPerRoute(kpiSet),
       stopsPerHour: stopsPerHour(kpiSet),
       avgDriveTime: avgDriveTime(kpiSet),
-      stopVariance: stopVariance(kpiSet),
-      completionRate: completionRate(weeklyPace.done, weeklyPace.target),
       routeCount: kpiSet.length,
     };
 
@@ -329,7 +296,6 @@ export default function DashboardPage() {
         routeCount: wk.length,
         stopsPerRoute: stopsPerRoute(wk),
         avgDriveTime: avgDriveTime(wk),
-        stopVariance: stopVariance(wk),
         stopsPerHour: stopsPerHour(wk),
       });
     }
@@ -343,72 +309,56 @@ export default function DashboardPage() {
       return { date: format(addDays(parseISO(today), i), "EEE"), count };
     });
 
-    const confidenceTrend = [...trendSet]
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .slice(-14)
-      .map(r => ({ date: r.date, confidence: Math.round((r.confidence || 0) * 100) }));
-
-    const recentActivity: DashboardStats["recentActivity"] = todaySet.slice(0, 5).map((r, i) => ({
-      id: `route-${i}`,
-      type: r.generatedBy === "ai" ? "route_generated" : "route_modified",
-      message: r.generatedBy === "ai"
-        ? `AI generated route for ${r.totalStops} stops`
-        : `Route updated (${r.totalStops} stops)`,
-      time: "Today",
-      confidence: r.confidence,
-    }));
-
     return {
       todayRoutes: todaySet.length,
       totalStops,
-      overdueStops,
       estimatedDriveTime,
-      avgConfidence,
       totalRouteValue,
       avgRouteValue,
+      todayStopsPerHour: stopsPerHour(todaySet),
+      overdueStops,
       weekKpis,
-      monthlyPace,
-      weeklyPace,
+      monthlyTarget,
+      weeklyTarget,
+      dailyTarget,
+      pace,
       trend,
       jobsDueThisWeek,
-      confidenceTrend,
-      recentActivity,
     };
   }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, filterRoutes, bounds, today]);
 
   const routeWindowLabel = dateFilterEnabled ? "Selected range" : "Today";
   const kpiWindowLabel = dateFilterEnabled ? "Selected range" : "This Week";
+  const fmt1 = (v: number | null) => (v === null ? "—" : v.toFixed(1));
 
-  const statCards = [
-    { title: "Routes", value: stats.todayRoutes, subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
-    { title: "Overdue Stops", value: stats.overdueStops, subtitle: filtersActive ? "Past due 30+ days · company-wide" : "Past due 30+ days", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
-    { title: "Total Stops", value: stats.totalStops, subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
+  // TODAY cards (route-derived; respect the filters).
+  const todayCards = [
+    { title: "Routes", value: String(stats.todayRoutes), subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
+    { title: "Total Stops", value: String(stats.totalStops), subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
     { title: "Avg Route Value", value: formatCurrency(stats.avgRouteValue), subtitle: `${routeWindowLabel} · per route`, icon: TrendingUp, color: "text-teal-400", bgColor: "bg-teal-500/10" },
-    { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },
+    { title: "Stops / Hour", value: fmt1(stats.todayStopsPerHour), subtitle: `${routeWindowLabel} · per working hour`, icon: Activity, color: "text-yellow-400", bgColor: "bg-yellow-500/10" },
   ];
 
-  // THIS WEEK KPI cards. Each shows the value vs its target; green when on target,
-  // red when missing it, and a muted "—" when there's no route data yet.
-  const fmt1 = (v: number | null) => (v === null ? "—" : v.toFixed(1));
-  const kpiCards = [
+  // THIS WEEK efficiency KPIs vs targets.
+  const weekCards = [
     { title: "Stops / Route", value: fmt1(stats.weekKpis.stopsPerRoute), target: `≥ ${STOPS_PER_ROUTE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopsPerRoute, STOPS_PER_ROUTE_TARGET) },
     { title: "Stops / Hour", value: fmt1(stats.weekKpis.stopsPerHour), target: `≥ ${STOPS_PER_HOUR_TARGET.toFixed(1)}`, ok: meetsTarget(stats.weekKpis.stopsPerHour, STOPS_PER_HOUR_TARGET) },
     { title: "Avg Drive Time", value: stats.weekKpis.avgDriveTime === null ? "—" : `${Math.round(stats.weekKpis.avgDriveTime)}m`, target: `< ${DRIVE_TIME_TARGET}m`, ok: meetsTarget(stats.weekKpis.avgDriveTime, DRIVE_TIME_TARGET, true) },
-    { title: "Stop Variance", value: stats.weekKpis.stopVariance === null ? "—" : String(stats.weekKpis.stopVariance), target: `≤ ${STOP_VARIANCE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopVariance, STOP_VARIANCE_TARGET, true) },
-    { title: "Completion Rate", value: stats.weekKpis.completionRate === null ? "—" : `${Math.round(stats.weekKpis.completionRate * 100)}%`, target: `≥ ${Math.round(COMPLETION_RATE_TARGET * 100)}%`, ok: meetsTarget(stats.weekKpis.completionRate, COMPLETION_RATE_TARGET) },
   ];
+
+  const monthDonePct = Math.round(stats.pace.donePct * 100);
+  const monthProgressPct = Math.round(stats.pace.monthProgressPct * 100);
 
   return (
     <div className="flex flex-col h-full">
       <TopBar title="Dashboard" />
       <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6">
         {loading ? (
-          /* Skeleton loading state — matches real layout exactly */
           <div className="space-y-6">
-            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-              {Array.from({ length: 5 }).map((_, i) => (
+            <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
+              {Array.from({ length: 6 }).map((_, i) => (
                 <SkeletonCard key={i} className={`animate-fade-in stagger-${i + 1}`} />
               ))}
             </div>
@@ -417,7 +367,7 @@ export default function DashboardPage() {
               <SkeletonChart className="animate-fade-in stagger-6" />
             </div>
           </div>
-        ) : stats ? (
+        ) : (
           <>
             {/* Filter bar — date range / technician / route group */}
             <div className="flex flex-col gap-2.5 rounded-lg border border-border/40 bg-card/40 p-3">
@@ -459,15 +409,15 @@ export default function DashboardPage() {
               </div>
               {groupOptions.length === 0 && (
                 <p className="text-xs text-muted-foreground/50">
-                  Tip: pull and select your route groups in Settings to filter KPIs by GPC / Specialty / Wildlife / Lawn.
+                  Tip: pull and select your route groups in Settings to filter by GPC / Specialty / Wildlife / Lawn.
                 </p>
               )}
             </div>
 
-            {/* TODAY — operational snapshot */}
+            {/* TODAY — operational snapshot (route-derived; respects filters) */}
             <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{routeWindowLabel}</p>
-            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-              {statCards.map((stat, i) => {
+            <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
+              {todayCards.map((stat, i) => {
                 const Icon = stat.icon;
                 return (
                   <Card key={stat.title} className={`border-border/40 animate-fade-in stagger-${i + 1}`}>
@@ -488,13 +438,29 @@ export default function DashboardPage() {
               })}
             </div>
 
-            {/* THIS WEEK — efficiency KPIs vs targets (auto-computed) */}
+            {/* OVERDUE STOPS — its own thing (company-wide) */}
+            <Card className="border-red-500/30 bg-red-500/[0.04] animate-fade-in">
+              <CardContent className="p-5 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 rounded-lg bg-red-500/10 text-red-400">
+                    <AlertTriangle className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <p className="text-[13px] text-muted-foreground font-medium">Overdue Stops</p>
+                    <p className="text-xs text-muted-foreground/70">Customers past due 30+ days · company-wide</p>
+                  </div>
+                </div>
+                <p className="text-4xl font-bold text-red-400 tracking-tight">{stats.overdueStops}</p>
+              </CardContent>
+            </Card>
+
+            {/* THIS WEEK — efficiency KPIs vs targets */}
             <div className="flex items-center justify-between pt-2">
               <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{kpiWindowLabel}</p>
               <p className="text-xs text-muted-foreground/50">{stats.weekKpis.routeCount} routes</p>
             </div>
-            <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-              {kpiCards.map((kpi) => {
+            <div className="grid grid-cols-3 gap-4">
+              {weekCards.map((kpi) => {
                 const color = kpi.ok === null ? "text-muted-foreground/50" : kpi.ok ? "text-emerald-400" : "text-red-400";
                 return (
                   <Card key={kpi.title} className="border-border/40 animate-fade-in">
@@ -508,92 +474,84 @@ export default function DashboardPage() {
               })}
             </div>
 
-            {/* PACE — progress toward the auto-derived service target */}
-            {filtersActive && (
-              <p className="text-xs text-muted-foreground/50">Overdue & pace are company-wide (all groups & techs).</p>
-            )}
-            <div className="grid lg:grid-cols-2 gap-4">
-              {[
-                { label: "Monthly Target", sub: "Services due this month", pace: stats.monthlyPace, icon: Target, color: "text-blue-400", bg: "bg-blue-500/10" },
-                { label: "Weekly Target", sub: "Services due this week", pace: stats.weeklyPace, icon: Gauge, color: "text-purple-400", bg: "bg-purple-500/10" },
-              ].map((p) => {
-                const Icon = p.icon;
-                const pctRounded = Math.min(100, Math.round(p.pace.pct * 100));
-                return (
-                  <Card key={p.label} className="border-border/40 animate-fade-in">
-                    <CardContent className="p-5 space-y-3">
-                      <div className="flex items-start justify-between">
-                        <div>
-                          <p className="text-[13px] text-muted-foreground font-medium">{p.label}</p>
-                          <p className="text-3xl font-bold text-foreground tracking-tight">{p.pace.remaining} <span className="text-base font-medium text-muted-foreground/70">left</span></p>
-                          <p className="text-xs text-muted-foreground/70">{p.pace.done} done · {p.pace.target} target</p>
-                        </div>
-                        <div className={`p-2 rounded-lg ${p.bg} ${p.color}`}>
-                          <Icon className="w-4 h-4" />
-                        </div>
-                      </div>
-                      <div className="space-y-1">
-                        <Progress value={pctRounded} className="h-2" />
-                        <p className="text-xs text-muted-foreground/60">{pctRounded}% complete · {p.sub}</p>
-                      </div>
-                    </CardContent>
-                  </Card>
-                );
-              })}
+            {/* TARGETS — seasonality-aware service targets + pace (company-wide) */}
+            <div className="flex items-center justify-between pt-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Service Targets</p>
+              <p className="text-xs text-muted-foreground/50">{format(parseISO(today), "MMMM")} · company-wide</p>
             </div>
-
-            {/* Charts row */}
-            <div className="grid lg:grid-cols-2 gap-4">
-              <Card className="border-border/40 animate-fade-in stagger-5">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm font-semibold">Jobs Due This Week</CardTitle>
-                  <CardDescription className="text-xs">Scheduled jobs per day</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <ResponsiveContainer width="100%" height={200}>
-                    <BarChart data={stats.jobsDueThisWeek} barSize={20}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
-                      <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
-                      <YAxis tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} width={30} />
-                      <Tooltip
-                        contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))", fontSize: "13px" }}
-                        cursor={{ fill: "hsl(var(--accent) / 0.3)" }}
-                      />
-                      <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              {/* Monthly target with done + pace */}
+              <Card className="border-border/40 animate-fade-in lg:col-span-1">
+                <CardContent className="p-5 space-y-3">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <p className="text-[13px] text-muted-foreground font-medium">Monthly Target</p>
+                      <p className="text-3xl font-bold text-foreground tracking-tight">{stats.monthlyTarget.toLocaleString()}</p>
+                      <p className="text-xs text-muted-foreground/70">{stats.pace.done.toLocaleString()} done · {stats.pace.remaining.toLocaleString()} left</p>
+                    </div>
+                    <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400"><Target className="w-4 h-4" /></div>
+                  </div>
+                  <div className="space-y-1">
+                    <Progress value={Math.min(100, monthDonePct)} className="h-2" />
+                    <p className={`text-xs ${stats.pace.ahead ? "text-emerald-400" : "text-red-400"}`}>
+                      {monthDonePct}% of target · {monthProgressPct}% through month · {stats.pace.ahead ? "on/ahead of pace" : "behind pace"}
+                    </p>
+                  </div>
                 </CardContent>
               </Card>
 
-              <Card className="border-border/40 animate-fade-in stagger-6">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm font-semibold">AI Confidence Trend</CardTitle>
-                  <CardDescription className="text-xs">Route confidence over time</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <ResponsiveContainer width="100%" height={200}>
-                    <AreaChart data={stats.confidenceTrend}>
-                      <defs>
-                        <linearGradient id="confidenceGrad" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.25} />
-                          <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
-                      <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
-                      <YAxis domain={[0, 100]} tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} width={35} unit="%" />
-                      <Tooltip
-                        contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))", fontSize: "13px" }}
-                        formatter={(val) => [`${val}%`, "Confidence"]}
-                      />
-                      <Area type="monotone" dataKey="confidence" stroke="#3b82f6" strokeWidth={2} fill="url(#confidenceGrad)" dot={{ fill: "#3b82f6", strokeWidth: 0, r: 3 }} activeDot={{ r: 5, strokeWidth: 2, stroke: "#3b82f6", fill: "hsl(var(--background))" }} />
-                    </AreaChart>
-                  </ResponsiveContainer>
+              {/* Weekly target */}
+              <Card className="border-border/40 animate-fade-in">
+                <CardContent className="p-5">
+                  <div className="flex items-start justify-between">
+                    <div className="space-y-1">
+                      <p className="text-[13px] text-muted-foreground font-medium">Weekly Target</p>
+                      <p className="text-3xl font-bold text-foreground tracking-tight">{stats.weeklyTarget.toLocaleString()}</p>
+                      <p className="text-xs text-muted-foreground/70">Monthly ÷ 4 weeks</p>
+                    </div>
+                    <div className="p-2 rounded-lg bg-purple-500/10 text-purple-400"><Gauge className="w-4 h-4" /></div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* Daily target */}
+              <Card className="border-border/40 animate-fade-in">
+                <CardContent className="p-5">
+                  <div className="flex items-start justify-between">
+                    <div className="space-y-1">
+                      <p className="text-[13px] text-muted-foreground font-medium">Daily Target</p>
+                      <p className="text-3xl font-bold text-foreground tracking-tight">{stats.dailyTarget.toLocaleString()}</p>
+                      <p className="text-xs text-muted-foreground/70">Monthly ÷ {MONTH_WORKING_DAYS} working days</p>
+                    </div>
+                    <div className="p-2 rounded-lg bg-teal-500/10 text-teal-400"><CalendarDays className="w-4 h-4" /></div>
+                  </div>
                 </CardContent>
               </Card>
             </div>
 
-            {/* 8-week trend — efficiency over the last 8 weeks (auto-derived) */}
+            {/* Jobs Due This Week chart */}
+            <Card className="border-border/40 animate-fade-in">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-semibold">Jobs Due This Week</CardTitle>
+                <CardDescription className="text-xs">Scheduled jobs per day (next 7 days)</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={stats.jobsDueThisWeek} barSize={28}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" vertical={false} />
+                    <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} />
+                    <YAxis tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }} axisLine={false} tickLine={false} width={30} />
+                    <Tooltip
+                      contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: "8px", color: "hsl(var(--foreground))", fontSize: "13px" }}
+                      cursor={{ fill: "hsl(var(--accent) / 0.3)" }}
+                    />
+                    <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
+
+            {/* 8-week trend — efficiency over the last 8 weeks */}
             <Card className="border-border/40 animate-fade-in">
               <CardHeader className="pb-2">
                 <CardTitle className="text-sm font-semibold">8-Week Trend</CardTitle>
@@ -607,7 +565,6 @@ export default function DashboardPage() {
                       <th className="py-2 pr-4 font-medium text-right">Routes</th>
                       <th className="py-2 pr-4 font-medium text-right">Stops/Route</th>
                       <th className="py-2 pr-4 font-medium text-right">Avg Drive</th>
-                      <th className="py-2 pr-4 font-medium text-right">Variance</th>
                       <th className="py-2 font-medium text-right">Stops/Hr</th>
                     </tr>
                   </thead>
@@ -618,7 +575,6 @@ export default function DashboardPage() {
                         <td className="py-2 pr-4 text-right text-muted-foreground">{row.routeCount}</td>
                         <td className="py-2 pr-4 text-right text-muted-foreground">{row.stopsPerRoute === null ? "—" : row.stopsPerRoute.toFixed(1)}</td>
                         <td className="py-2 pr-4 text-right text-muted-foreground">{row.avgDriveTime === null ? "—" : `${Math.round(row.avgDriveTime)}m`}</td>
-                        <td className="py-2 pr-4 text-right text-muted-foreground">{row.stopVariance === null ? "—" : row.stopVariance}</td>
                         <td className="py-2 text-right text-muted-foreground">{row.stopsPerHour === null ? "—" : row.stopsPerHour.toFixed(1)}</td>
                       </tr>
                     ))}
@@ -626,50 +582,8 @@ export default function DashboardPage() {
                 </table>
               </CardContent>
             </Card>
-
-            {/* Activity feed */}
-            <Card className="border-border/40 animate-fade-in stagger-5">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm font-semibold">Recent Activity</CardTitle>
-                <CardDescription className="text-xs">Latest routing events</CardDescription>
-              </CardHeader>
-              <CardContent>
-                {stats.recentActivity.length === 0 ? (
-                  <div className="text-center py-10">
-                    <Route className="w-8 h-8 text-muted-foreground/30 mx-auto mb-3" />
-                    <p className="text-muted-foreground text-sm">No recent activity</p>
-                    <p className="text-muted-foreground/60 text-xs mt-1">Generate your first routes to get started.</p>
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    {stats.recentActivity.map((item, i) => {
-                      const Icon = activityIcons[item.type];
-                      const color = activityColors[item.type];
-                      return (
-                        <div key={item.id} className={`flex items-center gap-3 py-2.5 px-2 -mx-2 rounded-lg hover:bg-accent/30 transition-colors animate-fade-in stagger-${i + 1}`}>
-                          <div className={`shrink-0 ${color}`}>
-                            <Icon className="w-4 h-4" />
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm text-foreground">{item.message}</p>
-                          </div>
-                          <div className="flex items-center gap-2 shrink-0">
-                            {item.confidence !== undefined && (
-                              <Badge variant={item.confidence >= 0.85 ? "success" : item.confidence >= 0.6 ? "warning" : "destructive"} className="text-[11px]">
-                                {Math.round(item.confidence * 100)}%
-                              </Badge>
-                            )}
-                            <span className="text-xs text-muted-foreground/60 whitespace-nowrap">{item.time}</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
           </>
-        ) : null}
+        )}
       </div>
     </div>
   );

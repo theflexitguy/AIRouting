@@ -62,6 +62,9 @@ export interface Job {
   subscriptionLastServiced?: string;
   subscriptionLastCompletedDate?: string;
   serviceDueAlreadyCompleted?: boolean;
+  seasonalStartMonth?: number | null; // 1–12, null when not seasonal
+  seasonalEndMonth?: number | null;
+  isSeasonal?: boolean;
   serviceDueCompletionCheck?: string;
   pendingCancel?: boolean;
   potentialCustomer?: boolean;
