@@ -13,8 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { SkeletonRow } from "@/components/ui/skeleton";
 import { formatDate } from "@/lib/utils";
-import { calculateStopProductionValue, formatCurrency } from "@/lib/production-value";
-import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw } from "lucide-react";
+import { calculateStopProductionValue, formatCurrency, parseMoney } from "@/lib/production-value";
+import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw, ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import { toast } from "sonner";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
@@ -134,6 +134,13 @@ export default function JobsPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkLoading, setBulkLoading] = useState(false);
   const [pageSize, setPageSize] = useState(50);
+  // Column sort: click a header to sort A→Z, click again to flip to Z→A.
+  const [sortKey, setSortKey] = useState<string | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const toggleSort = (key: string) => {
+    if (sortKey === key) setSortDir(d => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(key); setSortDir("asc"); }
+  };
   const [currentPage, setCurrentPage] = useState(1);
   const syncAbortRef = useRef<AbortController | null>(null);
 
@@ -382,15 +389,44 @@ export default function JobsPage() {
     techs,
   ]);
 
+  // Column sort applied after filtering. Numeric columns sort numerically;
+  // everything else compares as lowercased strings.
+  const sortedJobs = useMemo(() => {
+    if (!sortKey) return filteredJobs;
+    const accessors: Record<string, (j: JobRow) => string | number> = {
+      customer: j => normalizeText(j.customerName),
+      address: j => normalizeText(j.address),
+      dueDate: j => String(j.scheduledDate || ""),
+      service: j => normalizeText(j.serviceType),
+      tech: j => normalizeText(j.fieldRoutesServicedBy || j.assignedTechId || j.fieldRoutesServicedById),
+      billing: j => normalizeText(j.billingFrequency),
+      serviceFreq: j => Number((j as JobRow & { frequency?: number }).frequency) || 0,
+      recurringPrice: j => parseMoney(j.recurringPrice) ?? 0,
+      stopValue: j => calculateStopProductionValue(j).value ?? 0,
+      subStatus: j => normalizeText(j.subscriptionStatus),
+      status: j => jobBucket(j),
+    };
+    const acc = accessors[sortKey];
+    if (!acc) return filteredJobs;
+    return [...filteredJobs].sort((a, b) => {
+      const av = acc(a);
+      const bv = acc(b);
+      const cmp = typeof av === "number" && typeof bv === "number"
+        ? av - bv
+        : String(av).localeCompare(String(bv));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [filteredJobs, sortKey, sortDir]);
+
   const serviceOptions = useMemo(() => uniqueOptions(jobs.map(j => j.serviceType)), [jobs]);
   const subscriptionStatusOptions = useMemo(() => uniqueOptions(jobs.map(j => j.subscriptionStatus)), [jobs]);
   const billingFrequencyOptions = useMemo(() => uniqueOptions(jobs.map(j => j.billingFrequency)), [jobs]);
   const serviceFrequencyOptions = useMemo(() => uniqueOptions(jobs.map(j => j.recurringFrequency)), [jobs]);
-  const totalPages = Math.max(1, Math.ceil(filteredJobs.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(sortedJobs.length / pageSize));
   const safeCurrentPage = Math.min(currentPage, totalPages);
-  const pageStartIndex = filteredJobs.length === 0 ? 0 : (safeCurrentPage - 1) * pageSize;
-  const pageEndIndex = Math.min(pageStartIndex + pageSize, filteredJobs.length);
-  const paginatedJobs = filteredJobs.slice(pageStartIndex, pageEndIndex);
+  const pageStartIndex = sortedJobs.length === 0 ? 0 : (safeCurrentPage - 1) * pageSize;
+  const pageEndIndex = Math.min(pageStartIndex + pageSize, sortedJobs.length);
+  const paginatedJobs = sortedJobs.slice(pageStartIndex, pageEndIndex);
 
   useEffect(() => {
     setCurrentPage(1);
@@ -800,17 +836,32 @@ export default function JobsPage() {
                           className="rounded border-border/60 bg-transparent cursor-pointer accent-blue-500"
                         />
                       </th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Customer</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Address</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Due Date</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Service</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Tech</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Billing Freq</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Service Freq</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Recurring Price</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Stop Value</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Sub Status</th>
-                      <th className="text-left p-4 font-medium text-xs uppercase tracking-wider">Status</th>
+                      {[
+                        { key: "customer", label: "Customer" },
+                        { key: "address", label: "Address" },
+                        { key: "dueDate", label: "Due Date" },
+                        { key: "service", label: "Service" },
+                        { key: "tech", label: "Tech" },
+                        { key: "billing", label: "Billing Freq" },
+                        { key: "serviceFreq", label: "Service Freq" },
+                        { key: "recurringPrice", label: "Recurring Price" },
+                        { key: "stopValue", label: "Stop Value" },
+                        { key: "subStatus", label: "Sub Status" },
+                        { key: "status", label: "Status" },
+                      ].map(col => (
+                        <th key={col.key} className="text-left p-4 font-medium text-xs uppercase tracking-wider">
+                          <button
+                            type="button"
+                            onClick={() => toggleSort(col.key)}
+                            className="inline-flex items-center gap-1 hover:text-foreground transition-colors uppercase tracking-wider"
+                          >
+                            {col.label}
+                            {sortKey === col.key
+                              ? (sortDir === "asc" ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />)
+                              : <ChevronsUpDown className="w-3 h-3 opacity-30" />}
+                          </button>
+                        </th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody>
