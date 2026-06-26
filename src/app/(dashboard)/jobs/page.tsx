@@ -327,6 +327,10 @@ export default function JobsPage() {
     }
     if (filterStatus !== "all") {
       filtered = filtered.filter(j => jobBucket(j) === filterStatus);
+    } else {
+      // Hide the Inactive bucket by default (active-but->1yr-stale subs and
+      // far-future stops). Still reachable by selecting "Inactive / Future".
+      filtered = filtered.filter(j => jobBucket(j) !== "inactive");
     }
     if (filterTech !== "all") {
       const selectedTech = techs.find((tech) => tech.id === filterTech);
