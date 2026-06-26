@@ -969,10 +969,12 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
 
       const appt = apptMap[subscriptionId];
       const alreadyScheduled = Boolean(appt);
-      const scheduledFor = appt ? appt.date : "";
-      const scheduledRouteId = appt ? appt.routeId : "";
-      const scheduledTech = appt ? appt.techName : "";
-      const scheduledTechId = appt ? appt.techId : "";
+      // Coerce with str() so a missing field on a rehydrated appt entry (Firestore
+      // strips undefined on persist) can never propagate undefined into the doc write.
+      const scheduledFor = appt ? str(appt.date) : "";
+      const scheduledRouteId = appt ? str(appt.routeId) : "";
+      const scheduledTech = appt ? str(appt.techName) : "";
+      const scheduledTechId = appt ? str(appt.techId) : "";
 
       // Pending cancel comes straight off the customer record (don't derive it
       // from dateCancelled — that field is "0000-00-00 00:00:00" when unset and
