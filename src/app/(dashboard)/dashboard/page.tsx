@@ -20,6 +20,7 @@ import {
   monthlyServiceTarget,
   monthlyServiced,
   monthlyPace,
+  weeklyPace,
   MONTH_WORKING_DAYS,
   meetsTarget,
   STOPS_PER_ROUTE_TARGET,
@@ -90,6 +91,7 @@ interface DashboardStats {
   weeklyTarget: number;
   dailyTarget: number;
   pace: MonthlyPace;
+  weekPace: MonthlyPace;
   trend: TrendRow[];
   jobsDueThisWeek: Array<{ date: string; count: number }>;
 }
@@ -273,6 +275,8 @@ export default function DashboardPage() {
     const pace = monthlyPace(monthlyTarget, monthlyDone, today);
     const weeklyTarget = Math.round(monthlyTarget / 4);
     const dailyTarget = Math.round(monthlyTarget / MONTH_WORKING_DAYS);
+    const weeklyDone = monthlyServiced(rawJobs, bounds.weekStart, today);
+    const weekPace = weeklyPace(weeklyTarget, weeklyDone, bounds.weekStart, today);
 
     const weekKpis: WeekKpis = {
       stopsPerRoute: stopsPerRoute(kpiSet),
@@ -322,6 +326,7 @@ export default function DashboardPage() {
       weeklyTarget,
       dailyTarget,
       pace,
+      weekPace,
       trend,
       jobsDueThisWeek,
     };
@@ -349,7 +354,9 @@ export default function DashboardPage() {
   ];
 
   const monthDonePct = Math.round(stats.pace.donePct * 100);
-  const monthProgressPct = Math.round(stats.pace.monthProgressPct * 100);
+  const monthProgressPct = Math.round(stats.pace.progressPct * 100);
+  const weekDonePct = Math.round(stats.weekPace.donePct * 100);
+  const weekProgressPct = Math.round(stats.weekPace.progressPct * 100);
 
   return (
     <div className="flex flex-col h-full">
@@ -500,16 +507,22 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
 
-              {/* Weekly target */}
+              {/* Weekly target — with the same %-of-target pace as Monthly */}
               <Card className="border-border/40 animate-fade-in">
-                <CardContent className="p-5">
+                <CardContent className="p-5 space-y-3">
                   <div className="flex items-start justify-between">
-                    <div className="space-y-1">
+                    <div>
                       <p className="text-[13px] text-muted-foreground font-medium">Weekly Target</p>
                       <p className="text-3xl font-bold text-foreground tracking-tight">{stats.weeklyTarget.toLocaleString()}</p>
-                      <p className="text-xs text-muted-foreground/70">Monthly ÷ 4 weeks</p>
+                      <p className="text-xs text-muted-foreground/70">{stats.weekPace.done.toLocaleString()} done · {stats.weekPace.remaining.toLocaleString()} left</p>
                     </div>
                     <div className="p-2 rounded-lg bg-purple-500/10 text-purple-400"><Gauge className="w-4 h-4" /></div>
+                  </div>
+                  <div className="space-y-1">
+                    <Progress value={Math.min(100, weekDonePct)} className="h-2" />
+                    <p className={`text-xs ${stats.weekPace.ahead ? "text-emerald-400" : "text-red-400"}`}>
+                      {weekDonePct}% of target · {weekProgressPct}% through week · {stats.weekPace.ahead ? "on/ahead of pace" : "behind pace"}
+                    </p>
                   </div>
                 </CardContent>
               </Card>
