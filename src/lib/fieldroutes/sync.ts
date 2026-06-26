@@ -653,13 +653,16 @@ async function buildRunSetup(
     return empNames[key] || key;
   };
 
-  // Pending future appointments across the account, indexed by subscription_id.
-  const pendingApptIds = await client.searchIds("appointment", {
-    status: 0, // 0 = Pending
+  // ALL appointments for today or later — not just status 0 (Pending). Once a
+  // tech starts or completes a stop in FieldRoutes, the appointment status
+  // changes (1 = In Progress, 2 = Completed, etc.), but the route should still
+  // appear on the dashboard and the subscription should still be marked as
+  // scheduled so routing doesn't double-book it.
+  const allApptIds = await client.searchIds("appointment", {
     date: { operator: ">=", value: today },
   });
-  const pendingAppts = pendingApptIds.length
-    ? await client.getEntities("appointment", pendingApptIds)
+  const allAppts = allApptIds.length
+    ? await client.getEntities("appointment", allApptIds)
     : [];
 
   // The field technician is NOT on the appointment. Confirmed against live data:
@@ -672,7 +675,7 @@ async function buildRunSetup(
   // unassigned in FieldRoutes — we leave their appointments tech-less rather than
   // inventing a phantom technician.
   const routeIdSet = new Set<string>();
-  for (const a of pendingAppts) {
+  for (const a of allAppts) {
     const routeId = str(rec(a).routeID);
     if (routeId && routeId !== "0") routeIdSet.add(routeId);
   }
@@ -687,25 +690,20 @@ async function buildRunSetup(
   }
 
   const apptMap: Record<string, ApptInfo> = {};
-  for (const a of pendingAppts) {
+  for (const a of allAppts) {
     const ar = rec(a);
     const subId = str(ar.subscriptionID);
     if (!subId) continue;
     const date = toDateOnly(ar.date);
     if (!date || date < today) continue;
     const existing = apptMap[subId];
-    // Resolve the tech from the route, not the appointment's employeeID.
     const routeId = str(ar.routeID);
     const techEmpId = routeTechMap.get(routeId) || "";
-    // Keep the earliest upcoming appointment.
     if (!existing || date < existing.date) {
       apptMap[subId] = {
         date,
         techId: techEmpId,
         techName: resolveEmpName(techEmpId),
-        // Keep the FieldRoutes route this appointment sits on so unassigned
-        // appointments (no tech) stay on their own separate route in the UI
-        // instead of being merged together.
         routeId: routeId && routeId !== "0" ? routeId : "",
       };
     }
