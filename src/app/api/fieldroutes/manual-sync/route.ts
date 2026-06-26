@@ -4,7 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb, adminAuth } from "@/lib/firebase-admin";
-import { runSync, recomputePastDue, purgeNonRecurring, reconcileActiveSubscriptions } from "@/lib/fieldroutes/sync";
+import { runSync, recomputePastDue, purgeNonRecurring, reconcileActiveSubscriptions, purgeInactiveCustomers } from "@/lib/fieldroutes/sync";
 
 const MAX_MANUAL_SYNCS_PER_DAY = 3;
 
@@ -90,13 +90,26 @@ export async function POST(request: NextRequest) {
       } catch (reconcileErr) {
         console.error("[fieldroutes/manual-sync] active-subscription reconcile failed:", reconcileErr);
       }
-      // 2) Purge any one-time/as-needed docs (keeps the app recurring-only).
+      // 2) Purge docs for inactive customers (test/demo accounts whose
+      //    subscriptions are still active but the customer record is deactivated).
+      try {
+        const purgedCustomers = await purgeInactiveCustomers();
+        if (purgedCustomers.deleted > 0) {
+          console.log(
+            `[fieldroutes/manual-sync] purged ${purgedCustomers.deleted} docs for inactive customers` +
+              ` (${purgedCustomers.customersChecked} customers checked)`,
+          );
+        }
+      } catch (purgeCustomerErr) {
+        console.error("[fieldroutes/manual-sync] purge inactive customers failed:", purgeCustomerErr);
+      }
+      // 3) Purge any one-time/as-needed docs (keeps the app recurring-only).
       try {
         await purgeNonRecurring();
       } catch (purgeErr) {
         console.error("[fieldroutes/manual-sync] purge non-recurring after sync failed:", purgeErr);
       }
-      // 3) Refresh derived date-window flags on the surviving recurring docs.
+      // 4) Refresh derived date-window flags on the surviving recurring docs.
       try {
         await recomputePastDue();
       } catch (recomputeErr) {

@@ -923,6 +923,21 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         continue;
       }
 
+      // Customer-level active check: a subscription can be active:1 while the
+      // customer record itself is deactivated (common with test/demo accounts).
+      // FieldRoutes shows these with a pink background and excludes them from
+      // reports. Only delete when the field is explicitly 0 — if the field is
+      // missing/undefined we leave the doc alone (safe default).
+      const custActiveRaw = customer.active;
+      if (custActiveRaw !== undefined && custActiveRaw !== null && num(custActiveRaw) === 0) {
+        const stale = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
+        batch.delete(stale);
+        subsProcessed++;
+        ops++;
+        if (ops >= 450) await flush();
+        continue;
+      }
+
       const appt = apptMap[subscriptionId];
       const alreadyScheduled = Boolean(appt);
       const scheduledFor = appt ? appt.date : "";
@@ -1028,6 +1043,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         dueSoonActionable: flags.dueSoonActionable && !serviceDueAlreadyCompleted,
         pendingCancel,
         potentialCustomer,
+        customerActive: num(custActiveRaw),
         customerBalance,
         onHold: onHold === 1,
         scheduledFor,
@@ -1340,4 +1356,87 @@ export async function purgeNonRecurring(): Promise<{ companyId: string; scanned:
   if (ops > 0) await batch.commit();
 
   return { companyId, scanned: snap.size, deleted };
+}
+
+/**
+ * Delete job docs whose CUSTOMER record is inactive in FieldRoutes (active !== 1).
+ * Catches test/demo accounts that have active subscriptions but a deactivated
+ * customer record — these show with a pink background in FieldRoutes and are
+ * excluded from its reports. Costs 1 API read per 1000 unique customers.
+ */
+export async function purgeInactiveCustomers(): Promise<{
+  companyId: string;
+  scanned: number;
+  deleted: number;
+  customersChecked: number;
+  skipped: boolean;
+  reason?: string;
+}> {
+  const companyId = targetCompanyId();
+  const db = adminDb();
+
+  const snap = await db.collection(`companies/${companyId}/jobs`).where("source", "==", "api").get();
+  if (snap.empty) {
+    return { companyId, scanned: 0, deleted: 0, customersChecked: 0, skipped: false };
+  }
+
+  const customerIdSet = new Set<string>();
+  for (const doc of snap.docs) {
+    const cid = str(doc.data().customerId);
+    if (cid) customerIdSet.add(cid);
+  }
+  const uniqueCustomerIds = Array.from(customerIdSet);
+
+  const client = new FieldRoutesClient();
+  const budget = await loadBudget(db, companyId);
+  client.setMaxReads(budget.remaining);
+  if (budget.remaining <= 0) {
+    return { companyId, scanned: snap.size, deleted: 0, customersChecked: 0, skipped: true, reason: "api cap reached" };
+  }
+
+  let customers: Record<string, unknown>[];
+  try {
+    customers = await client.getEntities("customer", uniqueCustomerIds);
+  } catch (err) {
+    await recordApiUsage(db, companyId, { reads: client.readCount });
+    if (err instanceof FieldRoutesBudgetError) {
+      return { companyId, scanned: snap.size, deleted: 0, customersChecked: 0, skipped: true, reason: "api cap reached" };
+    }
+    console.warn("[fieldroutes/purgeInactiveCustomers] customer fetch failed; skipping:", String(err));
+    return { companyId, scanned: snap.size, deleted: 0, customersChecked: 0, skipped: true, reason: "fetch failed" };
+  }
+  await recordApiUsage(db, companyId, { reads: client.readCount });
+
+  const inactiveCustomerIds = new Set<string>();
+  for (const c of customers) {
+    const cRec = rec(c);
+    const cId = str(cRec.customerID);
+    const active = cRec.active;
+    if (active !== undefined && active !== null && num(active) === 0) {
+      inactiveCustomerIds.add(cId);
+    }
+  }
+
+  if (inactiveCustomerIds.size === 0) {
+    return { companyId, scanned: snap.size, deleted: 0, customersChecked: uniqueCustomerIds.length, skipped: false };
+  }
+
+  let batch = db.batch();
+  let ops = 0;
+  let deleted = 0;
+  for (const doc of snap.docs) {
+    const cid = str(doc.data().customerId);
+    if (!cid || !inactiveCustomerIds.has(cid)) continue;
+    batch.delete(doc.ref);
+    deleted++;
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+
+  return { companyId, scanned: snap.size, deleted, customersChecked: uniqueCustomerIds.length, skipped: false };
 }

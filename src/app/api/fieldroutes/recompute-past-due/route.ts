@@ -3,7 +3,7 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
-import { recomputePastDue, purgeNonRecurring, reconcileActiveSubscriptions } from "@/lib/fieldroutes/sync";
+import { recomputePastDue, purgeNonRecurring, reconcileActiveSubscriptions, purgeInactiveCustomers } from "@/lib/fieldroutes/sync";
 
 function authorized(request: NextRequest): boolean {
   const secret = (process.env.CRON_SECRET || "").trim();
@@ -28,6 +28,12 @@ async function handle(request: NextRequest) {
     } catch (reconcileErr) {
       console.error("[fieldroutes/recompute-past-due] active-subscription reconcile failed:", reconcileErr);
     }
+    let purgedInactive: Awaited<ReturnType<typeof purgeInactiveCustomers>> | null = null;
+    try {
+      purgedInactive = await purgeInactiveCustomers();
+    } catch (purgeInactiveErr) {
+      console.error("[fieldroutes/recompute-past-due] purge inactive customers failed:", purgeInactiveErr);
+    }
     let purged: Awaited<ReturnType<typeof purgeNonRecurring>> | null = null;
     try {
       purged = await purgeNonRecurring();
@@ -35,7 +41,7 @@ async function handle(request: NextRequest) {
       console.error("[fieldroutes/recompute-past-due] purge non-recurring failed:", purgeErr);
     }
     const result = await recomputePastDue();
-    return NextResponse.json({ success: true, ...result, reconciled, purged });
+    return NextResponse.json({ success: true, ...result, reconciled, purgedInactive, purged });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[fieldroutes/recompute-past-due] failed:", message);
