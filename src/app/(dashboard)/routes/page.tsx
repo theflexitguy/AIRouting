@@ -906,6 +906,11 @@ export default function RoutesPage() {
   const mapMarkersRef = useRef<google.maps.Marker[]>([]);
   const mapPolylinesRef = useRef<google.maps.Polyline[]>([]);
   const roadSnapWarningsRef = useRef<Set<string>>(new Set());
+  // Self-heal for stops missing map coordinates: track which jobs we've already
+  // tried to geocode (so a genuinely unresolvable address can't loop) and whether
+  // a heal pass is currently in flight.
+  const autoGeocodeAttemptedRef = useRef<Set<string>>(new Set());
+  const autoGeocodeInFlightRef = useRef(false);
 
   useEffect(() => {
     if (jobPoolFilterTouched) return;
@@ -1873,6 +1878,51 @@ export default function RoutesPage() {
 
     return () => unsubscribe();
   }, [endDate, loadJobsForRange, loadRouteStopJobs, startDate, userProfile]);
+
+  // Self-heal missing stop coordinates. A routed / FieldRoutes-scheduled stop that
+  // has an address but no lat/lng breaks the road-path drawing ("…route has stops
+  // missing coordinates…"). Whenever such stops appear, automatically geocode them
+  // via /api/geocode-jobs and reload, so the path fixes itself. Each job is tried
+  // at most once per session (attempted-set) and runs are serialized (in-flight
+  // ref) so an unresolvable address can never loop.
+  useEffect(() => {
+    const companyId = userProfile?.companyId;
+    if (!companyId || autoGeocodeInFlightRef.current) return;
+
+    const needIds = new Set<string>();
+    const consider = (job?: Job) => {
+      if (!job) return;
+      const hasCoord = typeof job.lat === "number" && typeof job.lng === "number";
+      const address = String(job.address || (job as { addressRaw?: string }).addressRaw || "").trim();
+      if (!hasCoord && address && !autoGeocodeAttemptedRef.current.has(job.id)) needIds.add(job.id);
+    };
+    displayRoutes.forEach((tr) => (tr.route.stopSequence || []).forEach((id) => consider(allJobs[id])));
+    hiddenScheduledStops.forEach(({ job }) => consider(job));
+    if (needIds.size === 0) return;
+
+    const ids = Array.from(needIds);
+    ids.forEach((id) => autoGeocodeAttemptedRef.current.add(id));
+    autoGeocodeInFlightRef.current = true;
+    (async () => {
+      try {
+        const res = await fetch("/api/geocode-jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ companyId, jobIds: ids }),
+        });
+        const result = await res.json().catch(() => ({}));
+        if (res.ok && result.success && result.geocoded > 0) {
+          toast.success(`Recovered coordinates for ${result.geocoded} stop${result.geocoded === 1 ? "" : "s"}`);
+          await loadJobsForRange(companyId);
+        }
+      } catch {
+        // Leave the ids attempted-marked so we don't loop; the manual
+        // "geocode hidden stops" button remains as a fallback.
+      } finally {
+        autoGeocodeInFlightRef.current = false;
+      }
+    })();
+  }, [userProfile, displayRoutes, hiddenScheduledStops, allJobs, loadJobsForRange]);
 
   useEffect(() => {
     if (!userProfile?.companyId || !showJobPoolLayer) return;
