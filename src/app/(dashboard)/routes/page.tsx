@@ -20,6 +20,7 @@ import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
+import { canonicalRouteGroup } from "@/lib/route-groups";
 import { getSubscriptionLastServiced, routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Input } from "@/components/ui/input";
@@ -863,6 +864,8 @@ export default function RoutesPage() {
   const [selectedDates, setSelectedDates] = useState<string[]>([]); // which days to show (multi-select)
   const [techs, setTechs] = useState<Technician[]>([]);
   const [selectedTechIds, setSelectedTechIds] = useState<string[]>([]);
+  const [selectedRouteGroups, setSelectedRouteGroups] = useState<string[]>([]);
+  const [routeGroupOptions, setRouteGroupOptions] = useState<string[]>([]);
   const [allRoutes, setAllRoutes] = useState<TechRoute[]>([]); // all routes in date range
   const [allJobs, setAllJobs] = useState<{ [jobId: string]: Job }>({});
   const [generating, setGenerating] = useState(false);
@@ -1009,6 +1012,7 @@ export default function RoutesPage() {
             date: group.date,
             techId: group.tech.id,
             stopSequence,
+            routeGroupTitle: jobs.find((j) => j.fieldRoutesRouteGroup)?.fieldRoutesRouteGroup || "",
             totalDriveTimeMinutes: metrics.totalDriveTimeMinutes,
             totalServiceMinutes: getRouteServiceMinutes(stopSequence, allJobs),
             totalWorkMinutes: metrics.totalWorkMinutes,
@@ -1071,6 +1075,9 @@ export default function RoutesPage() {
   // Technicians dropdown filters the map and the route list down to those techs.
   const techFilterActive = selectedTechIds.length > 0 && selectedTechIds.length < techs.length;
   const selectedTechIdSet = new Set(selectedTechIds);
+  const groupFilterActive =
+    selectedRouteGroups.length > 0 && selectedRouteGroups.length < routeGroupOptions.length;
+  const selectedGroupSet = new Set(selectedRouteGroups);
   const visibleRoutes = displayRoutes.filter((tr) => {
     const unassigned = isUnassignedRoute(tr);
     if (unassigned && !showUnassigned) return false;
@@ -1078,6 +1085,11 @@ export default function RoutesPage() {
     // The technician filter never applies to unassigned routes — they belong to
     // no tech, so the dedicated toggle controls their visibility instead.
     if (techFilterActive && !unassigned && !selectedTechIdSet.has(tr.tech.id)) return false;
+    // Route-group filter: match on the canonical bucket so every FieldRoutes
+    // spelling variant of a group is included under one selection.
+    if (groupFilterActive && !selectedGroupSet.has(canonicalRouteGroup(String(tr.route.routeGroupTitle || "")))) {
+      return false;
+    }
     return true;
   });
   // Unassigned FieldRoutes routes within the selected dates, for the toggle badge.
@@ -1823,7 +1835,13 @@ export default function RoutesPage() {
     getDoc(doc(db, "companies", userProfile.companyId))
       .then((snap) => {
         if (cancelled || !snap.exists()) return;
-        setAllowCrossTechRouteEdits(snap.data().allowCrossTechRouteEdits !== false);
+        const data = snap.data();
+        setAllowCrossTechRouteEdits(data.allowCrossTechRouteEdits !== false);
+        setRouteGroupOptions(
+          Array.isArray(data.fieldRoutesRouteGroups)
+            ? data.fieldRoutesRouteGroups.map((t: unknown) => String(t)).filter(Boolean)
+            : [],
+        );
       })
       .catch(() => {
         if (!cancelled) setAllowCrossTechRouteEdits(true);
@@ -2914,6 +2932,15 @@ export default function RoutesPage() {
             onChange={setSelectedTechIds}
             allLabel={`All (${techs.length})`}
           />
+          {routeGroupOptions.length > 0 && (
+            <MultiSelectDropdown
+              label="Route Groups"
+              options={routeGroupOptions.map(g => ({ id: g, label: g }))}
+              selectedIds={selectedRouteGroups}
+              onChange={setSelectedRouteGroups}
+              allLabel={`All (${routeGroupOptions.length})`}
+            />
+          )}
           <Button
             variant={showUnassigned ? "default" : "outline"}
             onClick={() => setShowUnassigned(prev => !prev)}

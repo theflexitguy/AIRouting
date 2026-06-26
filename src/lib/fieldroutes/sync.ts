@@ -21,6 +21,7 @@
 
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
+import { calculateStopProductionValue } from "@/lib/production-value";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
 import {
@@ -306,13 +307,20 @@ async function syncTechnicians(
  * scheduled job doc, not only the ones in this pass's change set. recomputePastDue
  * (run afterwards) stays consistent because we also set alreadyScheduled + clear
  * the actionable flags here.
+ *
+ * It also DE-SCHEDULES the inverse case: a job doc still flagged scheduled for a
+ * future date whose subscription is no longer in apptMap (its appointment was
+ * cancelled / rescheduled / removed in FieldRoutes). Without this, those stops
+ * linger as phantom route stops the dispatcher never put there. apptMap is the
+ * authoritative current set of forward appointments, so absence = de-schedule.
  */
 async function refreshScheduledAssignments(
   db: FirebaseFirestore.Firestore,
   companyId: string,
   apptMap: Record<string, ApptInfo>,
+  today: string,
   now: string,
-): Promise<{ updated: number; scanned: number }> {
+): Promise<{ updated: number; scanned: number; descheduled: number }> {
   const subIds = Object.keys(apptMap).filter((id) => id && id !== "-1" && id !== "0");
   let updated = 0;
   let scanned = 0;
@@ -383,8 +391,70 @@ async function refreshScheduledAssignments(
       }
     }
   }
+
+  // Pass B — de-schedule phantom stops: job docs still flagged scheduled for a
+  // future date whose subscription is NOT in the current appointment set. Their
+  // FieldRoutes appointment was cancelled / rescheduled / removed, so reset them
+  // to their computed (unscheduled) status. recomputePastDue would also do this
+  // eventually, but we do it here so the route reconciliation in the SAME run
+  // already excludes them.
+  let descheduled = 0;
+  const scheduledSnap = await db
+    .collection(`companies/${companyId}/jobs`)
+    .where("fieldRoutesScheduled", "==", true)
+    .get();
+  for (const doc of scheduledSnap.docs) {
+    const d = doc.data();
+    const subId = str(d.subscriptionId);
+    if (subId && apptMap[subId]) continue; // still has a live appointment — keep
+    const schedDate = str(d.fieldRoutesScheduledDate) || str(d.scheduledDate);
+    if (schedDate && schedDate < today) continue; // past stop — leave for normal flow
+    if (str(d.status) === "completed" || Boolean(d.serviceDueAlreadyCompleted)) continue;
+
+    // Recompute the unscheduled status/flags from stored data (alreadyScheduled
+    // now false), mirroring recomputePastDue.
+    const flags = computeFlags({
+      inScope: Boolean(d.inScope),
+      serviceDue: str(d.scheduledDate),
+      customerBalance: num(d.customerBalance),
+      specialScheduling: Boolean(d.hasConstraint) ? "x" : "",
+      alreadyScheduled: false,
+      pendingCancel: Boolean(d.pendingCancel),
+      potentialCustomer: Boolean(d.potentialCustomer),
+      today,
+    });
+    const status = flags.autoRoutable ? "pending" : flags.needsReview ? "review" : "inactive";
+    batch.update(doc.ref, {
+      fieldRoutesScheduled: false,
+      alreadyScheduled: false,
+      fieldRoutesServicedBy: "",
+      fieldRoutesServicedById: "",
+      fieldRoutesRouteId: "",
+      fieldRoutesRouteGroup: "",
+      fieldRoutesScheduleSource: "",
+      assignedTechId: "",
+      scheduledTech: "",
+      status,
+      autoRoutable: flags.autoRoutable,
+      needsReview: flags.needsReview,
+      overdueActionable: flags.overdueActionable,
+      dueSoonActionable: flags.dueSoonActionable,
+      pastDue: flags.pastDue,
+      pastDue30: flags.pastDue30,
+      dueSoon: flags.dueSoon,
+      updatedAt: now,
+    });
+    descheduled++;
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+
   if (ops > 0) await batch.commit();
-  return { updated, scanned };
+  return { updated, scanned, descheduled };
 }
 
 /**
@@ -410,6 +480,7 @@ async function reconcileScheduledRoutes(
     techEmpId: string;
     techName: string;
     routeGroup: string;
+    value: number;
     lat?: number;
     lng?: number;
     duration: number;
@@ -434,6 +505,14 @@ async function reconcileScheduledRoutes(
       techEmpId,
       techName,
       routeGroup: str(d.fieldRoutesRouteGroup),
+      value: calculateStopProductionValue({
+        recurringPrice: d.recurringPrice,
+        billingPrice: d.billingPrice,
+        recurringFrequency: d.recurringFrequency,
+        billingFrequency: d.billingFrequency,
+        revenue: d.revenue,
+        productionValue: d.productionValue,
+      }).value || 0,
       lat: typeof d.lat === "number" ? d.lat : undefined,
       lng: typeof d.lng === "number" ? d.lng : undefined,
       duration: Number(d.duration) || 25,
@@ -511,6 +590,7 @@ async function reconcileScheduledRoutes(
     // A (date,tech) slot's stops share one FieldRoutes route → one group. Take
     // the first non-empty group label so the dashboard can filter by route group.
     const routeGroupTitle = orderedJobs.find((j) => j.routeGroup)?.routeGroup || "";
+    const routeValue = orderedJobs.reduce((sum, j) => sum + (Number(j.value) || 0), 0);
     const existing = existingBySlot.get(key);
 
     if (existing) {
@@ -536,6 +616,7 @@ async function reconcileScheduledRoutes(
           fieldRoutesStopIds: frStopIds,
           hasFieldRoutesStops: true,
           routeGroupTitle,
+          routeValue,
           ...metrics,
           // A pure-FieldRoutes slot is locked. A slot that also holds generated
           // stops keeps its existing approval so we don't surprise-lock an AI
@@ -558,6 +639,7 @@ async function reconcileScheduledRoutes(
         fieldRoutesStopIds: frStopIds,
         hasFieldRoutesStops: true,
         routeGroupTitle,
+        routeValue,
         ...metrics,
         confidence: 1,
         approved: true,
@@ -806,6 +888,13 @@ async function buildRunSetup(
     const ar = rec(a);
     const subId = str(ar.subscriptionID);
     if (!subId) continue;
+    // Drop Cancelled (-1) and Rescheduled (-2) appointments — they still exist in
+    // the appointment table (and would otherwise be treated as live scheduled
+    // stops), but FieldRoutes no longer has the customer on that route. Pending
+    // (0), Completed (1) and No-Show (2) are kept so an in-progress/finished route
+    // still shows. This prevents phantom "scheduled" stops in the Route Builder.
+    const apptStatus = num(ar.status);
+    if (apptStatus === -1 || apptStatus === -2) continue;
     const date = toDateOnly(ar.date);
     if (!date || date < today) continue;
     const existing = apptMap[subId];
@@ -1224,9 +1313,10 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   // stops. Zero API cost (apptMap is already in memory).
   if (done) {
     try {
-      const refreshed = await refreshScheduledAssignments(db, companyId, apptMap, now);
+      const refreshed = await refreshScheduledAssignments(db, companyId, apptMap, today, now);
       console.log(
-        `[fieldroutes/sync] refreshed scheduled assignments: ${refreshed.updated} updated of ${refreshed.scanned} scanned`,
+        `[fieldroutes/sync] refreshed scheduled assignments: ${refreshed.updated} updated of ` +
+          `${refreshed.scanned} scanned, ${refreshed.descheduled} de-scheduled (phantom stops cleared)`,
       );
     } catch (err) {
       console.error("[fieldroutes/sync] scheduled-assignment refresh failed:", String(err));

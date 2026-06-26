@@ -93,6 +93,7 @@ export interface Route {
   totalServiceMinutes?: number;
   totalStops: number;
   routeGroupTitle?: string; // FieldRoutes route.groupTitle (dashboard filter)
+  routeValue?: number; // sum of stop production values on the route
   driveTimeSource?: string;
   polylineSource?: string;
   encodedPolyline?: string;

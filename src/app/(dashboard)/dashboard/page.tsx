@@ -13,6 +13,7 @@ import { Switch } from "@/components/ui/switch";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatTime, getConfidenceColor, getConfidenceLabel } from "@/lib/utils";
+import { formatCurrency } from "@/lib/production-value";
 import {
   stopsPerRoute,
   stopsPerHour,
@@ -41,6 +42,8 @@ import {
   AlertTriangle,
   Target,
   Gauge,
+  DollarSign,
+  TrendingUp,
 } from "lucide-react";
 import {
   BarChart,
@@ -88,6 +91,8 @@ interface DashboardStats {
   overdueStops: number;
   estimatedDriveTime: number;
   avgConfidence: number;
+  totalRouteValue: number;
+  avgRouteValue: number;
   weekKpis: WeekKpis;
   monthlyPace: Pace;
   weeklyPace: Pace;
@@ -125,6 +130,7 @@ interface RouteRec extends RouteLike {
   techId?: string;
   techName?: string;
   routeGroupTitle?: string;
+  routeValue?: number;
 }
 interface JobRec extends JobLike {
   status?: string;
@@ -285,6 +291,8 @@ export default function DashboardPage() {
 
     const totalStops = todaySet.reduce((s, r) => s + (r.totalStops || 0), 0);
     const estimatedDriveTime = todaySet.reduce((s, r) => s + (r.totalDriveTimeMinutes || 0), 0);
+    const totalRouteValue = todaySet.reduce((s, r) => s + (Number(r.routeValue) || 0), 0);
+    const avgRouteValue = todaySet.length > 0 ? totalRouteValue / todaySet.length : 0;
     const avgConfidence = todaySet.length > 0
       ? todaySet.reduce((s, r) => s + (r.confidence || 0), 0) / todaySet.length
       : 0;
@@ -356,6 +364,8 @@ export default function DashboardPage() {
       overdueStops,
       estimatedDriveTime,
       avgConfidence,
+      totalRouteValue,
+      avgRouteValue,
       weekKpis,
       monthlyPace,
       weeklyPace,
@@ -374,6 +384,8 @@ export default function DashboardPage() {
     { title: "Overdue Stops", value: stats.overdueStops, subtitle: filtersActive ? "Past due 30+ days · company-wide" : "Past due 30+ days", icon: AlertTriangle, color: "text-red-400", bgColor: "bg-red-500/10" },
     { title: "Total Stops", value: stats.totalStops, subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
+    { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
+    { title: "Avg Route Value", value: formatCurrency(stats.avgRouteValue), subtitle: `${routeWindowLabel} · per route`, icon: TrendingUp, color: "text-teal-400", bgColor: "bg-teal-500/10" },
     { title: "AI Confidence", value: `${Math.round(stats.avgConfidence * 100)}%`, subtitle: getConfidenceLabel(stats.avgConfidence) + " confidence", icon: Brain, color: getConfidenceColor(stats.avgConfidence), bgColor: "bg-emerald-500/10" },
   ];
 
