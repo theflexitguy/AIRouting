@@ -2,6 +2,8 @@
 // (no Firestore imports) so the dashboard math is testable and reusable. All KPIs
 // are AUTO-COMPUTED from data we already pull — there is no manual weekly logging.
 
+import { parseFrequencyDays } from "@/lib/production-value";
+
 /** Minimal shape of a route doc this module needs. */
 export interface RouteLike {
   totalStops?: number;
@@ -16,7 +18,18 @@ export interface JobLike {
   scheduledDate?: string; // next service date (YYYY-MM-DD)
   subscriptionLastCompletedDate?: string; // last completed date (YYYY-MM-DD)
   customerId?: string;
+  inScope?: boolean;
+  pendingCancel?: boolean;
+  frequency?: number; // raw service interval in days
+  recurringFrequency?: string; // label fallback, e.g. "Every 90 Days"
+  isSeasonal?: boolean;
+  seasonalStartMonth?: number | null; // 1–12
+  seasonalEndMonth?: number | null;
 }
+
+// Assume 20 working days in a service month (owner's standard).
+export const MONTH_WORKING_DAYS = 20;
+const AVG_DAYS_PER_MONTH = 30.4;
 
 // KPI targets, sourced from the owner's reference dashboard. Hardcoded for now;
 // a later pass can move these into Settings.
@@ -124,4 +137,93 @@ export function meetsTarget(
 ): boolean | null {
   if (value === null) return null;
   return lowerIsBetter ? value <= target : value >= target;
+}
+
+/** Service interval in days for a subscription (raw frequency, or parsed label). */
+function jobFrequencyDays(j: JobLike): number {
+  const raw = Number(j.frequency);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  const parsed = parseFrequencyDays(j.recurringFrequency);
+  return parsed && parsed > 0 ? parsed : 0;
+}
+
+/** Is this subscription serviced in the given calendar month (1–12)? */
+function activeInMonth(j: JobLike, month: number): boolean {
+  if (!j.isSeasonal) return true; // year-round
+  const start = Number(j.seasonalStartMonth);
+  const end = Number(j.seasonalEndMonth);
+  if (!start || !end) return true;
+  // Normal season (Apr–Sep) start<=end; wrap-around season (e.g. Nov–Feb) start>end.
+  return start <= end ? month >= start && month <= end : month >= start || month <= end;
+}
+
+/**
+ * Auto-derived monthly service target for `month` (1–12): the number of services
+ * that should be completed this month across the active book of business.
+ *   per-sub contribution = activeThisMonth ? (avgDaysPerMonth / frequencyDays) : 0
+ * → quarterly (90d) ≈ total/3, annual (365d) ≈ total/12, monthly (30d) ≈ total
+ * (only counted in a seasonal sub's active months). Counts active in-scope,
+ * non-pending-cancel subscriptions only.
+ */
+export function monthlyServiceTarget(jobs: JobLike[], month: number): number {
+  let total = 0;
+  for (const j of jobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    if (!activeInMonth(j, month)) continue;
+    const days = jobFrequencyDays(j);
+    if (days <= 0) continue;
+    total += AVG_DAYS_PER_MONTH / days;
+  }
+  return Math.round(total);
+}
+
+/** Distinct customers serviced (last-completed) within [monthStart, today]. */
+export function monthlyServiced(jobs: JobLike[], monthStart: string, today: string): number {
+  const done = new Set<string>();
+  for (const j of jobs) {
+    const cid = String(j.customerId ?? "");
+    if (cid && inRange(j.subscriptionLastCompletedDate, monthStart, today)) done.add(cid);
+  }
+  return done.size;
+}
+
+/** Count Mon–Fri working days from the 1st of `today`'s month through `today` (inclusive). */
+export function workingDaysElapsed(today: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(today);
+  if (!m) return 0;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  let count = 0;
+  for (let d = 1; d <= day; d++) {
+    const dow = new Date(Date.UTC(year, month - 1, d)).getUTCDay();
+    if (dow !== 0 && dow !== 6) count++;
+  }
+  return count;
+}
+
+export interface MonthlyPace {
+  target: number;
+  done: number;
+  remaining: number;
+  donePct: number; // done / target (0..1+)
+  monthProgressPct: number; // workingDaysElapsed / 20 (0..1)
+  ahead: boolean; // on or ahead of pace
+}
+
+/**
+ * Pace toward the monthly target: how far through the target are we vs how far
+ * through the month (20 working days). Replaces the old "completion rate".
+ */
+export function monthlyPace(target: number, done: number, today: string): MonthlyPace {
+  const donePct = target > 0 ? done / target : 0;
+  const monthProgressPct = Math.min(1, workingDaysElapsed(today) / MONTH_WORKING_DAYS);
+  return {
+    target,
+    done,
+    remaining: Math.max(0, target - done),
+    donePct,
+    monthProgressPct,
+    ahead: donePct >= monthProgressPct,
+  };
 }

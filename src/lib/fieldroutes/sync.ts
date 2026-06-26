@@ -1122,6 +1122,20 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const serviceType = str(sub.serviceType);
       const serviceDue = toDateOnly(sub.nextService);
       const lastCompleted = toDateOnly(sub.lastCompleted);
+      // Seasonality drives the monthly service target. FieldRoutes stores the
+      // season window on the subscription (seasonalStart/End = "0000-00-00" when
+      // not seasonal). Capture the start/end MONTH (1–12) so the dashboard can
+      // count a seasonal sub only in its active months.
+      const seasonalStartDate = toDateOnly(sub.seasonalStart);
+      const seasonalEndDate = toDateOnly(sub.seasonalEnd);
+      const monthOf = (iso: string): number | null => {
+        const m = /^\d{4}-(\d{2})-\d{2}$/.exec(iso);
+        const n = m ? Number(m[1]) : 0;
+        return n >= 1 && n <= 12 ? n : null;
+      };
+      const seasonalStartMonth = monthOf(seasonalStartDate);
+      const seasonalEndMonth = monthOf(seasonalEndDate);
+      const isSeasonal = seasonalStartMonth !== null && seasonalEndMonth !== null;
       const customerBalance = num(customer.balance);
       const specialScheduling = str(customer.specialScheduling);
       const onHold = num(sub.onHold);
@@ -1263,6 +1277,9 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         subscriptionLastServiced: lastCompleted,
         subscriptionLastCompletedDate: lastCompleted,
         serviceDueAlreadyCompleted,
+        seasonalStartMonth,
+        seasonalEndMonth,
+        isSeasonal,
         preferredTech,
         // Computed flags (also stored as columns for review feeds / debugging):
         inScope,
