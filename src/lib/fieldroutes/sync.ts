@@ -1036,20 +1036,20 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   const done = offset >= total;
   const finishedAt = new Date().toISOString();
 
-  if (done) {
-    // Link technicians and materialize FieldRoutes-scheduled routes so they show
-    // up everywhere and the generator schedules around them. Runs only when the
-    // whole sync completes; derived from current Firestore state (no API cost).
-    try {
-      const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now);
-      console.log(
-        `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
-          `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
-      );
-    } catch (err) {
-      console.error("[fieldroutes/sync] route reconciliation failed:", String(err));
-    }
+  // Reconcile scheduled routes after every sync pass (incremental or full) so
+  // Today's Routes on the dashboard always reflects the current FieldRoutes state.
+  // Derived from current Firestore job state — zero API cost.
+  try {
+    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now);
+    console.log(
+      `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
+        `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
+    );
+  } catch (err) {
+    console.error("[fieldroutes/sync] route reconciliation failed:", String(err));
+  }
 
+  if (done) {
     // Advance the top-level cursor only when the whole run completes, so an
     // interrupted incremental run re-resolves the same change set next time.
     if (!cursor) cursor = now;
