@@ -4,12 +4,12 @@
 //  - "Today" is America/Chicago, DST-safe. Never use a UTC server date.
 //  - in_scope        = onHold == 0 && recurringCharge > 0
 //  - past_due        = service_due < today(Central)
-//  - balance_ok      = customer_balance <= 150
+//  - balance_ok      = customer_balance <= 149
 //  - has_constraint  = special_scheduling is non-empty
 //  - already_scheduled = a pending future appointment exists for THIS subscription_id
 //  - auto_routable   = in_scope && past_due && balance_ok && !has_constraint && !already_scheduled
 
-export const BALANCE_GATE = 150;
+export const BALANCE_GATE = 149;
 
 /** Today's date as YYYY-MM-DD in America/Chicago, regardless of server TZ. */
 export function centralTodayISO(now: Date = new Date()): string {
@@ -76,11 +76,25 @@ export function deriveCategory(serviceType: unknown): string {
 export interface ScopeInput {
   onHold: unknown; // subscription.onHold (0/1)
   recurringCharge: unknown; // subscription.recurringCharge
+  frequency: unknown; // subscription.frequency (days; -1 One-Time, 0 As Needed, >0 recurring)
 }
 
-/** Default scope predicate — kept as a single named function so it's easy to adjust. */
+/**
+ * Default scope predicate — kept as a single named function so it's easy to adjust.
+ * "Recurring" is part of scope: frequency > 0 excludes One-Time (-1) and As Needed (0),
+ * so they never reach the overdue metric or routing.
+ */
 export function isInScope(input: ScopeInput): boolean {
-  return num(input.onHold) === 0 && num(input.recurringCharge) > 0;
+  return (
+    num(input.onHold) === 0 &&
+    num(input.recurringCharge) > 0 &&
+    num(input.frequency) > 0
+  );
+}
+
+/** True only for genuinely recurring subscriptions (frequency in days, > 0). */
+export function isRecurringFrequency(frequency: unknown): boolean {
+  return num(frequency) > 0;
 }
 
 export interface JobFlagsInput {
@@ -98,6 +112,7 @@ export interface JobFlags {
   hasConstraint: boolean;
   autoRoutable: boolean;
   needsReview: boolean;
+  overdueActionable: boolean;
 }
 
 export function computeFlags(input: JobFlagsInput): JobFlags {
@@ -108,5 +123,7 @@ export function computeFlags(input: JobFlagsInput): JobFlags {
     input.inScope && pastDue && balanceOk && !hasConstraint && !input.alreadyScheduled;
   const needsReview =
     input.inScope && pastDue && !input.alreadyScheduled && (hasConstraint || !balanceOk);
-  return { pastDue, balanceOk, hasConstraint, autoRoutable, needsReview };
+  const overdueActionable =
+    input.inScope && pastDue && balanceOk && !input.alreadyScheduled;
+  return { pastDue, balanceOk, hasConstraint, autoRoutable, needsReview, overdueActionable };
 }
