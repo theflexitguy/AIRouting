@@ -75,6 +75,7 @@ interface ApptInfo {
   techId: string;
   techName: string;
   routeId: string;
+  routeGroup: string; // FieldRoutes route.groupTitle (e.g. "GPC", "Specialty")
 }
 
 interface RunProgress {
@@ -310,6 +311,7 @@ async function reconcileScheduledRoutes(
     date: string;
     techEmpId: string;
     techName: string;
+    routeGroup: string;
     lat?: number;
     lng?: number;
     duration: number;
@@ -333,6 +335,7 @@ async function reconcileScheduledRoutes(
       date,
       techEmpId,
       techName,
+      routeGroup: str(d.fieldRoutesRouteGroup),
       lat: typeof d.lat === "number" ? d.lat : undefined,
       lng: typeof d.lng === "number" ? d.lng : undefined,
       duration: Number(d.duration) || 25,
@@ -407,6 +410,9 @@ async function reconcileScheduledRoutes(
       );
     const frStopIds = orderedJobs.map((j) => j.id);
     const metrics = haversineRouteMetrics(orderedJobs);
+    // A (date,tech) slot's stops share one FieldRoutes route → one group. Take
+    // the first non-empty group label so the dashboard can filter by route group.
+    const routeGroupTitle = orderedJobs.find((j) => j.routeGroup)?.routeGroup || "";
     const existing = existingBySlot.get(key);
 
     if (existing) {
@@ -431,6 +437,7 @@ async function reconcileScheduledRoutes(
           totalStops: newSeq.length,
           fieldRoutesStopIds: frStopIds,
           hasFieldRoutesStops: true,
+          routeGroupTitle,
           ...metrics,
           // A pure-FieldRoutes slot is locked. A slot that also holds generated
           // stops keeps its existing approval so we don't surprise-lock an AI
@@ -452,6 +459,7 @@ async function reconcileScheduledRoutes(
         totalStops: frStopIds.length,
         fieldRoutesStopIds: frStopIds,
         hasFieldRoutesStops: true,
+        routeGroupTitle,
         ...metrics,
         confidence: 1,
         approved: true,
@@ -682,11 +690,17 @@ async function buildRunSetup(
   const routeIds = Array.from(routeIdSet);
   const routes = routeIds.length ? await client.getEntities("route", routeIds) : [];
   const routeTechMap = new Map<string, string>();
+  // route.groupTitle is the stable route-group label ("GPC"/"Specialty"/etc.).
+  // Captured here from routes we already fetch, so the dashboard can filter
+  // route-derived KPIs by group with zero extra API calls.
+  const routeGroupMap = new Map<string, string>();
   for (const r of routes) {
     const rr = rec(r);
     const rid = str(rr.routeID);
     const techEmpId = str(rr.assignedTech);
     if (rid && techEmpId && techEmpId !== "0") routeTechMap.set(rid, techEmpId);
+    const groupTitle = str(rr.groupTitle);
+    if (rid && groupTitle) routeGroupMap.set(rid, groupTitle);
   }
 
   const apptMap: Record<string, ApptInfo> = {};
@@ -705,6 +719,7 @@ async function buildRunSetup(
         techId: techEmpId,
         techName: resolveEmpName(techEmpId),
         routeId: routeId && routeId !== "0" ? routeId : "",
+        routeGroup: routeGroupMap.get(routeId) || "",
       };
     }
   }
@@ -975,6 +990,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const scheduledRouteId = appt ? str(appt.routeId) : "";
       const scheduledTech = appt ? str(appt.techName) : "";
       const scheduledTechId = appt ? str(appt.techId) : "";
+      const scheduledRouteGroup = appt ? str(appt.routeGroup) : "";
 
       // Pending cancel comes straight off the customer record (don't derive it
       // from dateCancelled — that field is "0000-00-00 00:00:00" when unset and
@@ -1046,6 +1062,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         fieldRoutesServicedBy: alreadyScheduled ? scheduledTech : "",
         fieldRoutesServicedById: alreadyScheduled ? scheduledTechId : "",
         fieldRoutesRouteId: alreadyScheduled ? scheduledRouteId : "",
+        fieldRoutesRouteGroup: scheduledRouteGroup,
         fieldRoutesScheduleSource: alreadyScheduled ? "api_appointment" : "",
         schedulingRequest: specialScheduling,
         // Subscription / billing detail (labels match the FieldRoutes report):
