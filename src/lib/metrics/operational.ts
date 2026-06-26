@@ -187,43 +187,68 @@ export function monthlyServiced(jobs: JobLike[], monthStart: string, today: stri
   return done.size;
 }
 
-/** Count Mon–Fri working days from the 1st of `today`'s month through `today` (inclusive). */
-export function workingDaysElapsed(today: string): number {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(today);
-  if (!m) return 0;
-  const year = Number(m[1]);
-  const month = Number(m[2]);
-  const day = Number(m[3]);
+// Working days per service week (Mon–Fri).
+export const WEEK_WORKING_DAYS = 5;
+
+/** Count Mon–Fri working days in [start, end] inclusive (YYYY-MM-DD). */
+export function workingDaysInRange(start: string, end: string): number {
+  const s = /^(\d{4})-(\d{2})-(\d{2})$/.exec(start);
+  const e = /^(\d{4})-(\d{2})-(\d{2})$/.exec(end);
+  if (!s || !e) return 0;
+  let cursor = Date.UTC(Number(s[1]), Number(s[2]) - 1, Number(s[3]));
+  const endMs = Date.UTC(Number(e[1]), Number(e[2]) - 1, Number(e[3]));
   let count = 0;
-  for (let d = 1; d <= day; d++) {
-    const dow = new Date(Date.UTC(year, month - 1, d)).getUTCDay();
+  while (cursor <= endMs) {
+    const dow = new Date(cursor).getUTCDay();
     if (dow !== 0 && dow !== 6) count++;
+    cursor += 86400000;
   }
   return count;
 }
 
-export interface MonthlyPace {
+/** Count Mon–Fri working days from the 1st of `today`'s month through `today` (inclusive). */
+export function workingDaysElapsed(today: string): number {
+  const m = /^(\d{4})-(\d{2})-\d{2}$/.exec(today);
+  if (!m) return 0;
+  return workingDaysInRange(`${m[1]}-${m[2]}-01`, today);
+}
+
+export interface PaceResult {
   target: number;
   done: number;
   remaining: number;
   donePct: number; // done / target (0..1+)
-  monthProgressPct: number; // workingDaysElapsed / 20 (0..1)
+  progressPct: number; // elapsed / total working days (0..1)
   ahead: boolean; // on or ahead of pace
 }
+// Kept for back-compat with existing imports.
+export type MonthlyPace = PaceResult;
 
-/**
- * Pace toward the monthly target: how far through the target are we vs how far
- * through the month (20 working days). Replaces the old "completion rate".
- */
-export function monthlyPace(target: number, done: number, today: string): MonthlyPace {
+/** Generic pace: target progress vs time progress (elapsed/total working days). */
+export function paceOf(
+  target: number,
+  done: number,
+  elapsedWorkingDays: number,
+  totalWorkingDays: number,
+): PaceResult {
   const donePct = target > 0 ? done / target : 0;
-  const monthProgressPct = Math.min(1, workingDaysElapsed(today) / MONTH_WORKING_DAYS);
+  const progressPct = totalWorkingDays > 0 ? Math.min(1, elapsedWorkingDays / totalWorkingDays) : 0;
   return {
     target,
     done,
     remaining: Math.max(0, target - done),
     donePct,
-    monthProgressPct,
-    ahead: donePct >= monthProgressPct,
+    progressPct,
+    ahead: donePct >= progressPct,
   };
+}
+
+/** Pace toward the monthly target vs % through the month (20 working days). */
+export function monthlyPace(target: number, done: number, today: string): PaceResult {
+  return paceOf(target, done, workingDaysElapsed(today), MONTH_WORKING_DAYS);
+}
+
+/** Pace toward the weekly target vs % through the work-week (5 working days). */
+export function weeklyPace(target: number, done: number, weekStart: string, today: string): PaceResult {
+  return paceOf(target, done, workingDaysInRange(weekStart, today), WEEK_WORKING_DAYS);
 }
