@@ -723,11 +723,29 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   const stateRef = db.doc(`companies/${companyId}/fieldRoutesState/sync`);
   const stateSnap = await stateRef.get();
   const state = stateSnap.exists ? (stateSnap.data() as Record<string, unknown>) : {};
-  const priorCursor = str(state.cursor);
+  let priorCursor = str(state.cursor);
 
   // Resume an in-progress run of the SAME mode; otherwise start a fresh run.
   const prior = state.run as RunProgress | undefined;
   const resuming = Boolean(prior?.active) && prior?.mode === mode && Array.isArray(prior?.ids);
+
+  // Auto-detect empty DB after a reset: if the job collection is empty but we
+  // still have a stored cursor, an incremental sync would only pick up recently
+  // changed subscriptions and miss the bulk of the data. Clear the cursor so
+  // resolveSubscriptionIds falls through to a full pull automatically.
+  if (mode === "incremental" && priorCursor && !resuming) {
+    const sample = await db
+      .collection(`companies/${companyId}/jobs`)
+      .where("source", "==", "api")
+      .limit(1)
+      .get();
+    if (sample.empty) {
+      console.log(
+        "[fieldroutes/sync] Job collection empty with existing cursor — switching to full pull",
+      );
+      priorCursor = "";
+    }
+  }
 
   // Enforce the daily API cap. Reads are metered against the company's combined
   // reads+writes budget so RouteIQ never consumes the whole FieldRoutes account
