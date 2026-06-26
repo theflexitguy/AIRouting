@@ -198,6 +198,7 @@ export default function JobsPage() {
 
       const jobsQuery = query(
         collection(db, `companies/${companyId}/jobs`),
+        where("inScope", "==", true),
         where("scheduledDate", ">=", dateFrom),
         where("scheduledDate", "<=", dateTo),
         orderBy("scheduledDate", "asc")
