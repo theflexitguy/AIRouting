@@ -4,7 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb, adminAuth } from "@/lib/firebase-admin";
-import { runSync, recomputePastDue } from "@/lib/fieldroutes/sync";
+import { runSync, recomputePastDue, purgeNonRecurring } from "@/lib/fieldroutes/sync";
 
 const MAX_MANUAL_SYNCS_PER_DAY = 3;
 
@@ -77,6 +77,13 @@ export async function POST(request: NextRequest) {
     // recompute them across ALL jobs — pure Firestore, zero FieldRoutes reads —
     // so dashboard counts stay accurate without spending API quota.
     if (result.done) {
+      // Purge any one-time/as-needed docs first (keeps the app recurring-only),
+      // then refresh derived flags on the surviving recurring docs.
+      try {
+        await purgeNonRecurring();
+      } catch (purgeErr) {
+        console.error("[fieldroutes/manual-sync] purge non-recurring after sync failed:", purgeErr);
+      }
       try {
         await recomputePastDue();
       } catch (recomputeErr) {

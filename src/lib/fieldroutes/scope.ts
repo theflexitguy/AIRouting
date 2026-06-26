@@ -76,11 +76,25 @@ export function deriveCategory(serviceType: unknown): string {
 export interface ScopeInput {
   onHold: unknown; // subscription.onHold (0/1)
   recurringCharge: unknown; // subscription.recurringCharge
+  frequency: unknown; // subscription.frequency (days; -1 One-Time, 0 As Needed, >0 recurring)
 }
 
-/** Default scope predicate — kept as a single named function so it's easy to adjust. */
+/**
+ * Default scope predicate — kept as a single named function so it's easy to adjust.
+ * "Recurring" is part of scope: frequency > 0 excludes One-Time (-1) and As Needed (0),
+ * so they never reach the overdue metric or routing.
+ */
 export function isInScope(input: ScopeInput): boolean {
-  return num(input.onHold) === 0 && num(input.recurringCharge) > 0;
+  return (
+    num(input.onHold) === 0 &&
+    num(input.recurringCharge) > 0 &&
+    num(input.frequency) > 0
+  );
+}
+
+/** True only for genuinely recurring subscriptions (frequency in days, > 0). */
+export function isRecurringFrequency(frequency: unknown): boolean {
+  return num(frequency) > 0;
 }
 
 export interface JobFlagsInput {

@@ -30,6 +30,7 @@ import {
   computeFlags,
   deriveCategory,
   isInScope,
+  isRecurringFrequency,
   num,
   recurringFrequencyLabel,
   toDateOnly,
@@ -523,7 +524,22 @@ async function resolveSubscriptionIds(
 ): Promise<string[]> {
   if (mode === "full" || !cursor) {
     // No cursor yet on an incremental run falls back to a full pull so we don't miss anything.
-    return client.searchIds("subscription", { active: 1 });
+    // Prefer a server-side frequency filter so we never even fetch One-Time/As Needed
+    // subs (saves API reads). If FieldRoutes rejects/ignores the filter, fall back to
+    // pulling all active subs — the main loop still drops non-recurring ones.
+    try {
+      return await client.searchIds("subscription", {
+        active: 1,
+        frequency: { operator: ">", value: 0 },
+      });
+    } catch (err) {
+      if (err instanceof FieldRoutesBudgetError) throw err;
+      console.warn(
+        "[fieldroutes/sync] subscription frequency filter unsupported; falling back to active-only:",
+        String(err),
+      );
+      return client.searchIds("subscription", { active: 1 });
+    }
   }
 
   const changedSubs = await client.searchIds("subscription", {
@@ -891,6 +907,19 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const customerBalance = num(customer.balance);
       const specialScheduling = str(customer.specialScheduling);
       const onHold = num(sub.onHold);
+      const frequency = num(sub.frequency);
+
+      // One-Time (-1) and As Needed (0) subscriptions are out of scope entirely.
+      // Never write a doc for them, and delete any previously-written one so the
+      // Jobs tab and overdue metric stay recurring-only. (Pure Firestore op.)
+      if (!isRecurringFrequency(frequency)) {
+        const stale = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
+        batch.delete(stale);
+        subsProcessed++;
+        ops++;
+        if (ops >= 450) await flush();
+        continue;
+      }
 
       const appt = apptMap[subscriptionId];
       const alreadyScheduled = Boolean(appt);
@@ -899,7 +928,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const scheduledTech = appt ? appt.techName : "";
       const scheduledTechId = appt ? appt.techId : "";
 
-      const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge });
+      const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency });
       const flags = computeFlags({
         inScope,
         serviceDue,
@@ -964,6 +993,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         schedulingRequest: specialScheduling,
         // Subscription / billing detail (labels match the FieldRoutes report):
         recurringFrequency: recurringFrequencyLabel(sub.frequency),
+        frequency,
         billingFrequency: billingFrequencyLabel(sub.billingFrequency),
         recurringPrice: str(sub.recurringCharge),
         subscriptionStatus: str(sub.active),
@@ -1150,4 +1180,42 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
   if (ops > 0) await batch.commit();
 
   return { companyId, scanned: snap.size, updated };
+}
+
+/**
+ * Delete one-time / as-needed job docs so the app stays recurring-only. Detects
+ * non-recurring docs by the stored raw `frequency` (<= 0) when present, falling
+ * back to the human label ("One-Time" / "As Needed") for legacy docs synced
+ * before `frequency` was persisted. Pure Firestore — zero FieldRoutes reads.
+ */
+export async function purgeNonRecurring(): Promise<{ companyId: string; scanned: number; deleted: number }> {
+  const companyId = targetCompanyId();
+  const db = adminDb();
+
+  const snap = await db.collection(`companies/${companyId}/jobs`).where("source", "==", "api").get();
+  let batch = db.batch();
+  let ops = 0;
+  let deleted = 0;
+
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const hasRawFrequency = typeof d.frequency === "number";
+    const label = str(d.recurringFrequency);
+    const nonRecurring = hasRawFrequency
+      ? num(d.frequency) <= 0
+      : label === "One-Time" || label === "As Needed";
+    if (!nonRecurring) continue;
+
+    batch.delete(doc.ref);
+    deleted++;
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+
+  return { companyId, scanned: snap.size, deleted };
 }
