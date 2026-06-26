@@ -11,7 +11,7 @@ import { adminDb } from "@/lib/firebase-admin";
 // Supports both POST (companyId in JSON body) and GET (companyId in query
 // string) so it can be triggered straight from the browser address bar, e.g.
 //   /api/fieldroutes/reset-sync?companyId=company_xxx
-async function resetSync(companyId: string | undefined, clearRun: boolean) {
+async function resetSync(companyId: string | undefined, clearRun: boolean, clearCursor: boolean = false) {
   if (!companyId) {
     return NextResponse.json({ success: false, error: "companyId is required" }, { status: 400 });
   }
@@ -38,6 +38,14 @@ async function resetSync(companyId: string | undefined, clearRun: boolean) {
         results.run = "no active run";
       }
     }
+
+    // Clear the sync cursor so the next sync does a full pull from scratch
+    // instead of an incremental one. Needed after reset-jobs to rebuild all data.
+    if (clearCursor) {
+      const syncRef = db.doc(`companies/${companyId}/fieldRoutesState/sync`);
+      await syncRef.set({ cursor: "" }, { merge: true });
+      (results as Record<string, string>).cursor = "cleared";
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown error";
     console.error(`[fieldroutes/reset-sync] failed:`, err);
@@ -50,13 +58,18 @@ async function resetSync(companyId: string | undefined, clearRun: boolean) {
 
 export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
-  const { companyId, clearRun = true } = body as { companyId?: string; clearRun?: boolean };
-  return resetSync(companyId, clearRun);
+  const { companyId, clearRun = true, clearCursor = false } = body as {
+    companyId?: string;
+    clearRun?: boolean;
+    clearCursor?: boolean;
+  };
+  return resetSync(companyId, clearRun, clearCursor);
 }
 
 export async function GET(request: NextRequest) {
   const params = new URL(request.url).searchParams;
   const companyId = params.get("companyId") || undefined;
   const clearRun = params.get("clearRun") !== "false";
-  return resetSync(companyId, clearRun);
+  const clearCursor = params.get("clearCursor") === "true";
+  return resetSync(companyId, clearRun, clearCursor);
 }
