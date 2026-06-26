@@ -290,6 +290,104 @@ async function syncTechnicians(
 }
 
 /**
+ * Refresh the scheduled-appointment fields on EXISTING job docs from the freshly
+ * built apptMap, regardless of incremental scope.
+ *
+ * Why: an incremental sync only re-writes subscriptions whose own dateUpdated (or
+ * their customer/appointment) changed. When FieldRoutes assigns/changes the TECH
+ * on a route, the route's dateUpdated changes but the subscription's doesn't, so
+ * the incremental loop never re-pulls those subs and their job docs keep a stale
+ * (often empty) tech — surfacing as phantom "Unassigned" stops in the Route
+ * Builder even though FieldRoutes has them on an assigned tech's route.
+ *
+ * apptMap is rebuilt every run from ALL forward appointments (date >= today) and
+ * already carries the current tech/route/group per subscription, so this refresh
+ * costs ZERO extra API reads — it just fans that fresh state out to every
+ * scheduled job doc, not only the ones in this pass's change set. recomputePastDue
+ * (run afterwards) stays consistent because we also set alreadyScheduled + clear
+ * the actionable flags here.
+ */
+async function refreshScheduledAssignments(
+  db: FirebaseFirestore.Firestore,
+  companyId: string,
+  apptMap: Record<string, ApptInfo>,
+  now: string,
+): Promise<{ updated: number; scanned: number }> {
+  const subIds = Object.keys(apptMap).filter((id) => id && id !== "-1" && id !== "0");
+  let updated = 0;
+  let scanned = 0;
+  let batch = db.batch();
+  let ops = 0;
+  for (let i = 0; i < subIds.length; i += 300) {
+    const refs = subIds
+      .slice(i, i + 300)
+      .map((id) => db.doc(`companies/${companyId}/jobs/sub_${id}`));
+    const snaps = await db.getAll(...refs);
+    for (const snap of snaps) {
+      if (!snap.exists) continue;
+      scanned++;
+      const d = snap.data() || {};
+      const appt = apptMap[str(d.subscriptionId)];
+      if (!appt) continue;
+      const techId = str(appt.techId);
+      const techName = str(appt.techName);
+      const routeId = str(appt.routeId);
+      const routeGroup = str(appt.routeGroup);
+      const date = str(appt.date) || str(d.scheduledDate);
+      // Never override a stop FieldRoutes already marked complete for this cycle.
+      const completed = str(d.status) === "completed" || Boolean(d.serviceDueAlreadyCompleted);
+      const desiredStatus = completed ? str(d.status) : "scheduled";
+
+      const same =
+        Boolean(d.fieldRoutesScheduled) === true &&
+        Boolean(d.alreadyScheduled) === true &&
+        str(d.fieldRoutesScheduledDate) === date &&
+        str(d.fieldRoutesServicedById) === techId &&
+        str(d.fieldRoutesServicedBy) === techName &&
+        str(d.assignedTechId) === techName &&
+        str(d.fieldRoutesRouteId) === routeId &&
+        str(d.fieldRoutesRouteGroup) === routeGroup &&
+        str(d.status) === desiredStatus;
+      if (same) continue;
+
+      const update: Record<string, unknown> = {
+        fieldRoutesScheduled: true,
+        alreadyScheduled: true,
+        fieldRoutesScheduledDate: date,
+        fieldRoutesServicedById: techId,
+        fieldRoutesServicedBy: techName,
+        assignedTechId: techName,
+        fieldRoutesRouteId: routeId,
+        fieldRoutesRouteGroup: routeGroup,
+        fieldRoutesScheduleSource: "api_appointment",
+        scheduledFor: date,
+        scheduledTech: techName,
+        updatedAt: now,
+      };
+      // A scheduled stop is excluded from the routable / review counts — mirror
+      // what computeFlags produces for an already-scheduled subscription.
+      if (!completed) {
+        update.status = "scheduled";
+        update.autoRoutable = false;
+        update.needsReview = false;
+        update.overdueActionable = false;
+        update.dueSoonActionable = false;
+      }
+      batch.update(snap.ref, update);
+      updated++;
+      ops++;
+      if (ops >= 450) {
+        await batch.commit();
+        batch = db.batch();
+        ops = 0;
+      }
+    }
+  }
+  if (ops > 0) await batch.commit();
+  return { updated, scanned };
+}
+
+/**
  * Materialize FieldRoutes-scheduled appointments as real, locked route docs so
  * they appear everywhere (dashboard counts, every map, routes page) and the
  * generator treats them as immovable. Derived entirely from current Firestore
@@ -1118,6 +1216,22 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
 
   const done = offset >= total;
   const finishedAt = new Date().toISOString();
+
+  // On the final pass, fan the fresh apptMap (current tech/route/group per
+  // scheduled subscription) out to ALL scheduled job docs — not just the ones in
+  // this run's change set — so tech reassignments made in FieldRoutes (which an
+  // incremental sync wouldn't otherwise re-pull) can't leave stale "Unassigned"
+  // stops. Zero API cost (apptMap is already in memory).
+  if (done) {
+    try {
+      const refreshed = await refreshScheduledAssignments(db, companyId, apptMap, now);
+      console.log(
+        `[fieldroutes/sync] refreshed scheduled assignments: ${refreshed.updated} updated of ${refreshed.scanned} scanned`,
+      );
+    } catch (err) {
+      console.error("[fieldroutes/sync] scheduled-assignment refresh failed:", String(err));
+    }
+  }
 
   // Reconcile scheduled routes after every sync pass (incremental or full) so
   // Today's Routes on the dashboard always reflects the current FieldRoutes state.
