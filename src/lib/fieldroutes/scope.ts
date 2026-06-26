@@ -2,14 +2,40 @@
 //
 // Non-negotiable rules (see build brief §3–4):
 //  - "Today" is America/Chicago, DST-safe. Never use a UTC server date.
-//  - in_scope        = onHold == 0 && recurringCharge > 0
-//  - past_due        = service_due < today(Central)
+//  - in_scope        = onHold == 0 && recurringCharge > 0 && frequency > 0 (recurring only)
 //  - balance_ok      = customer_balance <= 149
 //  - has_constraint  = special_scheduling is non-empty
-//  - already_scheduled = a pending future appointment exists for THIS subscription_id
-//  - auto_routable   = in_scope && past_due && balance_ok && !has_constraint && !already_scheduled
+//  - already_scheduled = a future appointment exists for THIS subscription_id
+//
+// Date-window model (per owner spec):
+//  - due_soon (a.k.a. "Pending") = service_due within ±30 days of today(Central).
+//    These are the appointments available for route generation.
+//  - past_due_30 (a.k.a. "Past Due") = service_due more than 30 days before today.
+//    These are the highest-priority backlog for route generation.
+//  - A subscription serviced (lastCompleted) on/after its service_due is NOT past
+//    due — that completion rolls the next due date forward (handled in sync via
+//    serviceDueAlreadyCompleted).
+//  - The $149 balance cap (and special-scheduling constraint) excludes a stop from
+//    the Pending / Past Due *counts* and from routing, but the stop still appears
+//    in the Jobs tab (status "review") so it can be audited and addressed.
 
 export const BALANCE_GATE = 149;
+
+/** Half-width of the "due soon / Pending" window, in days, on either side of today. */
+export const WINDOW_DAYS = 30;
+
+/**
+ * Shift a YYYY-MM-DD calendar date by a number of days. Pure calendar math via
+ * UTC (no time component, no DST drift) — the inputs are already Central-day
+ * strings from centralTodayISO/toDateOnly, so this just moves the calendar day.
+ */
+export function shiftISODate(iso: string, days: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso ?? ""));
+  if (!m) return "";
+  const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
 
 /** Today's date as YYYY-MM-DD in America/Chicago, regardless of server TZ. */
 export function centralTodayISO(now: Date = new Date()): string {
@@ -107,23 +133,55 @@ export interface JobFlagsInput {
 }
 
 export interface JobFlags {
-  pastDue: boolean;
+  pastDue: boolean; // service_due < today (any amount) — kept for debugging/back-compat
+  pastDue30: boolean; // service_due more than 30 days before today ("Past Due")
+  dueSoon: boolean; // service_due within ±30 days of today ("Pending")
   balanceOk: boolean;
   hasConstraint: boolean;
-  autoRoutable: boolean;
-  needsReview: boolean;
-  overdueActionable: boolean;
+  autoRoutable: boolean; // enters the routing pool (due soon OR past due, balance-ok, no constraint)
+  needsReview: boolean; // relevant now but blocked by balance/constraint (shown, not routed)
+  overdueActionable: boolean; // "Past Due" count: past_due_30 && balance-ok && no constraint && not scheduled
+  dueSoonActionable: boolean; // "Pending" count: due_soon && balance-ok && no constraint && not scheduled
 }
 
 export function computeFlags(input: JobFlagsInput): JobFlags {
-  const pastDue = Boolean(input.serviceDue) && input.serviceDue < input.today;
+  const today = input.today;
+  const windowStart = shiftISODate(today, -WINDOW_DAYS); // today − 30 days
+  const windowEnd = shiftISODate(today, WINDOW_DAYS); // today + 30 days
+  const sd = input.serviceDue;
+  const hasDate = Boolean(sd);
+
+  const pastDue = hasDate && sd < today;
+  // "Past Due" = strictly more than 30 days overdue (service_due < today − 30).
+  const pastDue30 = hasDate && sd < windowStart;
+  // "Pending" / due soon = within ±30 days of today (inclusive). A date exactly
+  // 30 days ago is Pending, not Past Due; 31+ days ago is Past Due.
+  const dueSoon = hasDate && sd >= windowStart && sd <= windowEnd;
+  // "Relevant now" = anything due now or overdue (the routable consideration set).
+  // Dates more than 30 days in the FUTURE are not yet relevant.
+  const relevant = pastDue30 || dueSoon;
+
   const balanceOk = input.customerBalance <= BALANCE_GATE;
   const hasConstraint = input.specialScheduling.trim().length > 0;
+
   const autoRoutable =
-    input.inScope && pastDue && balanceOk && !hasConstraint && !input.alreadyScheduled;
+    input.inScope && relevant && balanceOk && !hasConstraint && !input.alreadyScheduled;
   const needsReview =
-    input.inScope && pastDue && !input.alreadyScheduled && (hasConstraint || !balanceOk);
+    input.inScope && relevant && !input.alreadyScheduled && (hasConstraint || !balanceOk);
   const overdueActionable =
-    input.inScope && pastDue && balanceOk && !input.alreadyScheduled;
-  return { pastDue, balanceOk, hasConstraint, autoRoutable, needsReview, overdueActionable };
+    input.inScope && pastDue30 && balanceOk && !hasConstraint && !input.alreadyScheduled;
+  const dueSoonActionable =
+    input.inScope && dueSoon && balanceOk && !hasConstraint && !input.alreadyScheduled;
+
+  return {
+    pastDue,
+    pastDue30,
+    dueSoon,
+    balanceOk,
+    hasConstraint,
+    autoRoutable,
+    needsReview,
+    overdueActionable,
+    dueSoonActionable,
+  };
 }
