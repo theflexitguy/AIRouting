@@ -52,6 +52,15 @@ const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
 // Synthetic tech id prefix for unassigned FieldRoutes appointments (no real tech).
 const UNASSIGNED_TECH_PREFIX = "__unassigned__";
 
+// Default Job Pool window: the last 30 days (today − 30 → today). Surfaces all
+// current past-dues plus stops about to tip into past-due. Overdue stops are
+// always included regardless of this range; it only bounds the pending stops.
+function defaultJobPoolRange(): { start: string; end: string } {
+  const end = new Date().toLocaleDateString("en-CA", { timeZone: "America/Chicago" });
+  const start = format(addDays(new Date(end + "T00:00:00"), -30), "yyyy-MM-dd");
+  return { start, end };
+}
+
 function isUnassignedRoute(tr: { tech: { id?: string } }) {
   return String(tr.tech?.id || "").startsWith(UNASSIGNED_TECH_PREFIX);
 }
@@ -880,8 +889,8 @@ export default function RoutesPage() {
   const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
   const [showJobPoolLayer, setShowJobPoolLayer] = useState(false);
   const [showUnassigned, setShowUnassigned] = useState(true);
-  const [jobPoolDueStart, setJobPoolDueStart] = useState(startDate);
-  const [jobPoolDueEnd, setJobPoolDueEnd] = useState(endDate);
+  const [jobPoolDueStart, setJobPoolDueStart] = useState(() => defaultJobPoolRange().start);
+  const [jobPoolDueEnd, setJobPoolDueEnd] = useState(() => defaultJobPoolRange().end);
   const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
@@ -916,10 +925,14 @@ export default function RoutesPage() {
   const autoGeocodeInFlightRef = useRef(false);
 
   useEffect(() => {
+    // Keep the Job Pool window at "last 30 days" until the user edits it; it no
+    // longer tracks the routing date filter, so it stays focused on past-dues
+    // and soon-to-be-past-due stops.
     if (jobPoolFilterTouched) return;
-    setJobPoolDueStart(startDate);
-    setJobPoolDueEnd(endDate);
-  }, [endDate, jobPoolFilterTouched, startDate]);
+    const { start, end } = defaultJobPoolRange();
+    setJobPoolDueStart(start);
+    setJobPoolDueEnd(end);
+  }, [jobPoolFilterTouched]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
