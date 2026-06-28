@@ -1114,6 +1114,10 @@ export default function RoutesPage() {
         // completed so the pool isn't flooded with everything in the range.
         if (String(job.status || "").toLowerCase() !== "pending") return false;
         if (job.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(job)) return false;
+        const flags = job as Job & { overdueActionable?: boolean; dueSoonActionable?: boolean };
+        // Overdue stops (past due as of TODAY) are always pulled — the date range
+        // doesn't apply to them. Pending stops are scoped to the pool date range.
+        if (flags.overdueActionable === true) return true;
         const dueDate = String(job.scheduledDate || "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
         if (jobPoolDueStart && dueDate < jobPoolDueStart) return false;
