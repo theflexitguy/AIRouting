@@ -1109,8 +1109,10 @@ export default function RoutesPage() {
         if (!selectedJobPoolTechs.some((tech) => jobAssignedToTech(job, tech))) return false;
         if (routedJobIds.has(job.id)) return false;
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return false;
-        const status = String(job.status || "pending").toLowerCase();
-        if (status === "completed" || status === "cancelled") return false;
+        // Only the routable pool: pending or overdue (both bucket to status
+        // "pending" — autoRoutable). Excludes scheduled / review / inactive /
+        // completed so the pool isn't flooded with everything in the range.
+        if (String(job.status || "").toLowerCase() !== "pending") return false;
         if (job.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(job)) return false;
         const dueDate = String(job.scheduledDate || "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return false;
@@ -1811,10 +1813,13 @@ export default function RoutesPage() {
   const loadJobPoolJobs = useCallback(async (companyId: string, dueStart: string, dueEnd: string) => {
     if (!dueStart || !dueEnd) return;
     try {
+      // Only load the routable pool (pending + overdue both bucket to status
+      // "pending"), not every job in the range — otherwise a wide window pulls
+      // thousands of future/inactive stops and crashes the page. Single-field
+      // equality (no composite index needed); the date range filters client-side.
       const snap = await getDocs(query(
         collection(db, `companies/${companyId}/jobs`),
-        where("scheduledDate", ">=", dueStart),
-        where("scheduledDate", "<=", dueEnd),
+        where("status", "==", "pending"),
       ));
       const jobMap: { [id: string]: Job } = {};
       snap.docs.forEach(d => { jobMap[d.id] = { id: d.id, ...d.data() } as Job; });
