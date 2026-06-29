@@ -922,6 +922,11 @@ export default function RoutesPage() {
   const openMapInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const mapMarkersRef = useRef<google.maps.Marker[]>([]);
   const jobPoolClustererRef = useRef<MarkerClusterer | null>(null);
+  const jobPoolMarkersRef = useRef<google.maps.Marker[]>([]);
+  const mapBoundsRef = useRef<google.maps.LatLngBounds | null>(null);
+  // Bumped on every map 'idle' (pan/zoom settle) so the Job Pool layer can
+  // re-render only the stops in the current viewport.
+  const [viewportTick, setViewportTick] = useState(0);
   const mapPolylinesRef = useRef<google.maps.Polyline[]>([]);
   const roadSnapWarningsRef = useRef<Set<string>>(new Set());
   // Self-heal for stops missing map coordinates: track which jobs we've already
@@ -2024,6 +2029,12 @@ export default function RoutesPage() {
       ],
     });
     hasFittedBounds.current = false;
+
+    // Track the visible area so the Job Pool only renders stops in view.
+    mapInstanceRef.current.addListener("idle", () => {
+      mapBoundsRef.current = mapInstanceRef.current?.getBounds() || null;
+      setViewportTick((t) => (t + 1) % 1_000_000);
+    });
   }, [mapLoaded]);
 
   const markerOriginalColors = useRef<Map<string, string>>(new Map());
@@ -2115,12 +2126,9 @@ export default function RoutesPage() {
     if (!map || !window.google) return;
     let cancelled = false;
 
-    // Clear old overlays
+    // Clear old route overlays (pool markers are managed in their own effect).
     mapMarkersRef.current.forEach(m => m.setMap(null));
     mapPolylinesRef.current.forEach(p => p.setMap(null));
-    jobPoolClustererRef.current?.clearMarkers();
-    jobPoolClustererRef.current?.setMap(null);
-    jobPoolClustererRef.current = null;
     openMapInfoWindowRef.current?.close();
     openMapInfoWindowRef.current = null;
     mapMarkersRef.current = [];
@@ -2362,67 +2370,8 @@ export default function RoutesPage() {
       }
     });
 
-    if (showJobPoolLayer) {
-      const hasEditableRoute = visibleRoutes.some((tr) => !isFieldRoutesScheduledRoute(tr.route));
-      // Cluster the whole pool — nearby stops collapse into one bubble and only
-      // de-cluster as you zoom in, so thousands of stops stay smooth. Markers are
-      // created WITHOUT a map and handed to the clusterer (it manages rendering);
-      // info windows are built lazily on click.
-      const poolMarkers: google.maps.Marker[] = [];
-      jobPoolJobs.forEach((job) => {
-        if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
-        const pos = new window.google.maps.LatLng(job.lat, job.lng);
-        bounds.extend(pos);
-        hasCoords = true;
-
-        const marker = new window.google.maps.Marker({
-          position: pos,
-          draggable: hasEditableRoute && !clickReorderRouteId,
-          icon: {
-            path: window.google.maps.SymbolPath.CIRCLE,
-            fillColor: "#22d3ee",
-            fillOpacity: 0.95,
-            strokeColor: "#e0f2fe",
-            strokeWeight: 2,
-            scale: 9,
-          },
-          zIndex: 5,
-        });
-
-        marker.addListener("click", () => {
-          const infoWindow = new window.google.maps.InfoWindow({
-            content: poolJobHtml(job),
-            disableAutoPan: true,
-          });
-          openMapInfoWindowRef.current?.close();
-          openMapInfoWindowRef.current = infoWindow;
-          infoWindow.open({ map, anchor: marker, shouldFocus: false });
-        });
-        marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
-          marker.setPosition(pos);
-          if (!event.latLng) return;
-          const target = findNearestRouteDropTarget(
-            { lat: event.latLng.lat(), lng: event.latLng.lng() },
-            "",
-            job.id,
-          );
-          if (!target) {
-            toast.info("Drop the pool job onto a route stop to add it.");
-            return;
-          }
-          await handleAddPoolJobToRoute(job.id, target.routeId, target.jobId);
-        });
-
-        poolMarkers.push(marker);
-      });
-      // Smaller cluster radius than the 60px default so stops break apart into
-      // individual dots at a much lower zoom level (less zooming to see them).
-      jobPoolClustererRef.current = new MarkerClusterer({
-        map,
-        markers: poolMarkers,
-        algorithm: new SuperClusterAlgorithm({ radius: 22, maxZoom: 17 }),
-      });
-    }
+    // Job Pool markers are rendered in a separate, viewport-aware effect below
+    // so panning/zooming only draws the stops currently in view.
 
     // Only fit bounds on FIRST data load — don't jump around after that
     if (hasCoords && !hasFittedBounds.current) {
@@ -2433,6 +2382,79 @@ export default function RoutesPage() {
       cancelled = true;
     };
   }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
+
+  // Job Pool markers — viewport-aware. Re-renders on pan/zoom (viewportTick) and
+  // draws ONLY the stops in the current map bounds, so working a zoomed-in area
+  // isn't bogged down by thousands of off-screen stops (and they de-cluster into
+  // individual dots much sooner). Clustering keeps a wide view smooth.
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !window.google) return;
+
+    jobPoolClustererRef.current?.clearMarkers();
+    jobPoolClustererRef.current?.setMap(null);
+    jobPoolClustererRef.current = null;
+    jobPoolMarkersRef.current.forEach((m) => m.setMap(null));
+    jobPoolMarkersRef.current = [];
+
+    if (!showJobPoolLayer) return;
+
+    const viewBounds = mapBoundsRef.current;
+    const hasEditableRoute = visibleRoutes.some((tr) => !isFieldRoutesScheduledRoute(tr.route));
+    const markers: google.maps.Marker[] = [];
+
+    for (const job of jobPoolJobs) {
+      if (typeof job.lat !== "number" || typeof job.lng !== "number") continue;
+      const pos = new window.google.maps.LatLng(job.lat, job.lng);
+      // Only render what's in view (once we know the viewport).
+      if (viewBounds && !viewBounds.contains(pos)) continue;
+
+      const marker = new window.google.maps.Marker({
+        position: pos,
+        draggable: hasEditableRoute && !clickReorderRouteId,
+        icon: {
+          path: window.google.maps.SymbolPath.CIRCLE,
+          fillColor: "#22d3ee",
+          fillOpacity: 0.95,
+          strokeColor: "#e0f2fe",
+          strokeWeight: 2,
+          scale: 9,
+        },
+        zIndex: 5,
+      });
+      marker.addListener("click", () => {
+        const infoWindow = new window.google.maps.InfoWindow({
+          content: poolJobHtml(job),
+          disableAutoPan: true,
+        });
+        openMapInfoWindowRef.current?.close();
+        openMapInfoWindowRef.current = infoWindow;
+        infoWindow.open({ map, anchor: marker, shouldFocus: false });
+      });
+      marker.addListener("dragend", async (event: google.maps.MapMouseEvent) => {
+        marker.setPosition(pos);
+        if (!event.latLng) return;
+        const target = findNearestRouteDropTarget(
+          { lat: event.latLng.lat(), lng: event.latLng.lng() },
+          "",
+          job.id,
+        );
+        if (!target) {
+          toast.info("Drop the pool job onto a route stop to add it.");
+          return;
+        }
+        await handleAddPoolJobToRoute(job.id, target.routeId, target.jobId);
+      });
+      markers.push(marker);
+    }
+
+    jobPoolMarkersRef.current = markers;
+    jobPoolClustererRef.current = new MarkerClusterer({
+      map,
+      markers,
+      algorithm: new SuperClusterAlgorithm({ radius: 14, maxZoom: 18 }),
+    });
+  }, [showJobPoolLayer, jobPoolJobs, viewportTick, visibleRoutes, clickReorderRouteId, findNearestRouteDropTarget, handleAddPoolJobToRoute]);
 
   async function loadTechs(companyId: string) {
     try {
@@ -3095,7 +3117,7 @@ export default function RoutesPage() {
               Past due only
             </Button>
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
-              {jobPoolJobs.length} jobs shown
+              {jobPoolJobs.length} in pool · zoom in to work an area
             </span>
           </div>
         )}
