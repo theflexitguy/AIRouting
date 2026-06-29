@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { collection, getDoc, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
 import { db } from "@/lib/firebase";
+import { MarkerClusterer } from "@googlemaps/markerclusterer";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Button } from "@/components/ui/button";
@@ -52,11 +53,6 @@ const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
 // Synthetic tech id prefix for unassigned FieldRoutes appointments (no real tech).
 const UNASSIGNED_TECH_PREFIX = "__unassigned__";
 
-// Cap on how many Job Pool markers are drawn at once. Rendering thousands of
-// Google Maps markers (with per-marker info windows) freezes/crashes the page,
-// so we draw the highest-priority slice (overdue first, then soonest due — the
-// pool is pre-sorted that way) and tell the dispatcher to narrow if there's more.
-const JOB_POOL_MARKER_CAP = 400;
 
 // Default Job Pool window: the last 30 days (today − 30 → today). Surfaces all
 // current past-dues plus stops about to tip into past-due. Overdue stops are
@@ -925,6 +921,7 @@ export default function RoutesPage() {
   const mapInstanceRef = useRef<google.maps.Map | null>(null);
   const openMapInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const mapMarkersRef = useRef<google.maps.Marker[]>([]);
+  const jobPoolClustererRef = useRef<MarkerClusterer | null>(null);
   const mapPolylinesRef = useRef<google.maps.Polyline[]>([]);
   const roadSnapWarningsRef = useRef<Set<string>>(new Set());
   // Self-heal for stops missing map coordinates: track which jobs we've already
@@ -2121,6 +2118,9 @@ export default function RoutesPage() {
     // Clear old overlays
     mapMarkersRef.current.forEach(m => m.setMap(null));
     mapPolylinesRef.current.forEach(p => p.setMap(null));
+    jobPoolClustererRef.current?.clearMarkers();
+    jobPoolClustererRef.current?.setMap(null);
+    jobPoolClustererRef.current = null;
     openMapInfoWindowRef.current?.close();
     openMapInfoWindowRef.current = null;
     mapMarkersRef.current = [];
@@ -2364,10 +2364,12 @@ export default function RoutesPage() {
 
     if (showJobPoolLayer) {
       const hasEditableRoute = visibleRoutes.some((tr) => !isFieldRoutesScheduledRoute(tr.route));
-      // Only draw up to the cap — the pool is pre-sorted (overdue first, then
-      // soonest due), so the most important stops render. Info windows are built
-      // lazily on click (not 2,000+ up front) to keep the map responsive.
-      jobPoolJobs.slice(0, JOB_POOL_MARKER_CAP).forEach((job) => {
+      // Cluster the whole pool — nearby stops collapse into one bubble and only
+      // de-cluster as you zoom in, so thousands of stops stay smooth. Markers are
+      // created WITHOUT a map and handed to the clusterer (it manages rendering);
+      // info windows are built lazily on click.
+      const poolMarkers: google.maps.Marker[] = [];
+      jobPoolJobs.forEach((job) => {
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
         const pos = new window.google.maps.LatLng(job.lat, job.lng);
         bounds.extend(pos);
@@ -2375,7 +2377,6 @@ export default function RoutesPage() {
 
         const marker = new window.google.maps.Marker({
           position: pos,
-          map,
           draggable: hasEditableRoute && !clickReorderRouteId,
           icon: {
             path: window.google.maps.SymbolPath.CIRCLE,
@@ -2412,8 +2413,9 @@ export default function RoutesPage() {
           await handleAddPoolJobToRoute(job.id, target.routeId, target.jobId);
         });
 
-        mapMarkersRef.current.push(marker);
+        poolMarkers.push(marker);
       });
+      jobPoolClustererRef.current = new MarkerClusterer({ map, markers: poolMarkers });
     }
 
     // Only fit bounds on FIRST data load — don't jump around after that
@@ -3087,9 +3089,7 @@ export default function RoutesPage() {
               Past due only
             </Button>
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
-              {jobPoolJobs.length > JOB_POOL_MARKER_CAP
-                ? `Showing ${JOB_POOL_MARKER_CAP} of ${jobPoolJobs.length} — narrow the range, filter by technician, or use Past due only`
-                : `${jobPoolJobs.length} jobs shown`}
+              {jobPoolJobs.length} jobs shown
             </span>
           </div>
         )}
