@@ -847,7 +847,8 @@ function DroppableStopList({ routeId, enabled, children }: {
 export default function RoutesPage() {
   const { userProfile } = useAuth();
   const [startDate, setStartDate] = useState(format(new Date(), "yyyy-MM-dd"));
-  const [endDate, setEndDate] = useState(format(addDays(new Date(), 6), "yyyy-MM-dd"));
+  // Default the Route Builder to today only; widen the range manually as needed.
+  const [endDate, setEndDate] = useState(format(new Date(), "yyyy-MM-dd"));
   const [maxStops, setMaxStops] = useState<number>(16);
   const [maxDriveTime, setMaxDriveTime] = useState<number>(240);
 
@@ -899,8 +900,8 @@ export default function RoutesPage() {
   const [jobPoolDueEnd, setJobPoolDueEnd] = useState(() => defaultJobPoolRange().end);
   const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
   // When on, the pool shows ONLY past-due stops — a lighter set when the pool
-  // is large (and the dispatcher wants to clear the backlog first).
-  const [jobPoolPastDueOnly, setJobPoolPastDueOnly] = useState(false);
+  // is large (and the dispatcher wants to clear the backlog first). Defaults on.
+  const [jobPoolPastDueOnly, setJobPoolPastDueOnly] = useState(true);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
   const [leftPanelRouteId, setLeftPanelRouteId] = useState<string | null>(null);
