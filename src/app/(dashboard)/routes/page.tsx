@@ -52,6 +52,12 @@ const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
 // Synthetic tech id prefix for unassigned FieldRoutes appointments (no real tech).
 const UNASSIGNED_TECH_PREFIX = "__unassigned__";
 
+// Cap on how many Job Pool markers are drawn at once. Rendering thousands of
+// Google Maps markers (with per-marker info windows) freezes/crashes the page,
+// so we draw the highest-priority slice (overdue first, then soonest due — the
+// pool is pre-sorted that way) and tell the dispatcher to narrow if there's more.
+const JOB_POOL_MARKER_CAP = 400;
+
 // Default Job Pool window: the last 30 days (today − 30 → today). Surfaces all
 // current past-dues plus stops about to tip into past-due. Overdue stops are
 // always included regardless of this range; it only bounds the pending stops.
@@ -2352,7 +2358,10 @@ export default function RoutesPage() {
 
     if (showJobPoolLayer) {
       const hasEditableRoute = visibleRoutes.some((tr) => !isFieldRoutesScheduledRoute(tr.route));
-      jobPoolJobs.forEach((job) => {
+      // Only draw up to the cap — the pool is pre-sorted (overdue first, then
+      // soonest due), so the most important stops render. Info windows are built
+      // lazily on click (not 2,000+ up front) to keep the map responsive.
+      jobPoolJobs.slice(0, JOB_POOL_MARKER_CAP).forEach((job) => {
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return;
         const pos = new window.google.maps.LatLng(job.lat, job.lng);
         bounds.extend(pos);
@@ -2372,12 +2381,12 @@ export default function RoutesPage() {
           },
           zIndex: 5,
         });
-        const infoWindow = new window.google.maps.InfoWindow({
-          content: poolJobHtml(job),
-          disableAutoPan: true,
-        });
 
         marker.addListener("click", () => {
+          const infoWindow = new window.google.maps.InfoWindow({
+            content: poolJobHtml(job),
+            disableAutoPan: true,
+          });
           openMapInfoWindowRef.current?.close();
           openMapInfoWindowRef.current = infoWindow;
           infoWindow.open({ map, anchor: marker, shouldFocus: false });
@@ -3055,7 +3064,9 @@ export default function RoutesPage() {
               Reset
             </Button>
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
-              {jobPoolJobs.length} jobs shown
+              {jobPoolJobs.length > JOB_POOL_MARKER_CAP
+                ? `Showing ${JOB_POOL_MARKER_CAP} of ${jobPoolJobs.length} — narrow the date range or filter by technician to see more`
+                : `${jobPoolJobs.length} jobs shown`}
             </span>
           </div>
         )}
