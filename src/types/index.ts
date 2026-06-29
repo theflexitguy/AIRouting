@@ -14,6 +14,8 @@ export interface Company {
   fieldRoutesServiceIdMap?: Record<string, number>;
   fieldRoutesRouteGroups?: string[]; // route-group titles used as dashboard filters
   allowCrossTechRouteEdits?: boolean;
+  routingBalanceGate?: number; // customer balance ($) at/above which a stop is not scheduled (default 420)
+  routingBalanceAgeDays?: number; // max balance age (days) allowed before blocking; 0 = unenforced
   createdAt: string;
   active: boolean;
 }
@@ -65,6 +67,14 @@ export interface Job {
   seasonalStartMonth?: number | null; // 1–12, null when not seasonal
   seasonalEndMonth?: number | null;
   isSeasonal?: boolean;
+  // Service-line segregation + interval-deadline model (Sensei v2 Router rules).
+  serviceLine?: string; // general | gr | termite | lawn | mosquito | commercial | wildlife
+  serviceIntervalDays?: number; // effective service interval in days
+  serviceDeadline?: string; // YYYY-MM-DD hard deadline (last completed + interval)
+  daysUntilDeadline?: number | null; // deadline − today (negative = past)
+  pastDeadline?: boolean; // today is past the service deadline
+  deadlineFlagZone?: boolean; // within the line's flag-lead window of the deadline
+  grEscalation?: boolean; // German Roach past its 14-day deadline (always urgent)
   serviceDueCompletionCheck?: string;
   pendingCancel?: boolean;
   potentialCustomer?: boolean;

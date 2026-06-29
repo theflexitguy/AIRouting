@@ -22,6 +22,8 @@
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
 import { calculateStopProductionValue } from "@/lib/production-value";
+import { deriveServiceLine } from "@/lib/routing/service-line";
+import { computeDeadlineFlags } from "@/lib/routing/intervals";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
 import {
@@ -36,6 +38,34 @@ import {
   recurringFrequencyLabel,
   toDateOnly,
 } from "./scope";
+
+/** Per-company routing config (balance gate + balance-age limit). */
+interface RoutingConfig {
+  balanceGate: number;
+  balanceAgeGate: number;
+}
+
+/**
+ * Load the configurable routing gates from the company doc. Falls back to the
+ * module defaults (BALANCE_GATE; age unenforced) when unset or unreadable.
+ */
+async function loadRoutingConfig(
+  db: FirebaseFirestore.Firestore,
+  companyId: string,
+): Promise<RoutingConfig> {
+  try {
+    const snap = await db.doc(`companies/${companyId}`).get();
+    const d = (snap.exists ? snap.data() : {}) || {};
+    const gate = num(d.routingBalanceGate);
+    const ageGate = num(d.routingBalanceAgeDays);
+    return {
+      balanceGate: gate > 0 ? gate : BALANCE_GATE,
+      balanceAgeGate: ageGate > 0 ? ageGate : 0,
+    };
+  } catch {
+    return { balanceGate: BALANCE_GATE, balanceAgeGate: 0 };
+  }
+}
 
 export type SyncMode = "full" | "incremental";
 
@@ -983,6 +1013,9 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     };
   }
 
+  // Configurable balance gate / age limit (Routing Settings). Cheap Firestore read.
+  const routingConfig = await loadRoutingConfig(db, companyId);
+
   let ids: string[];
   let apptMap: Record<string, ApptInfo>;
   let empNames: Record<string, string>;
@@ -1214,7 +1247,24 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         pendingCancel,
         potentialCustomer,
         today,
+        balanceGate: routingConfig.balanceGate,
+        balanceAgeGate: routingConfig.balanceAgeGate,
+        customerBalanceAgeDays: num(customer.balanceAge),
       });
+
+      // Service line (general / GR / termite / lawn / mosquito / commercial /
+      // wildlife) + the interval deadline counted from last completed service.
+      const serviceLine = deriveServiceLine(serviceType, scheduledRouteGroup);
+      const deadlineFlags = computeDeadlineFlags(
+        {
+          serviceLine,
+          frequency,
+          recurringFrequency: recurringFrequencyLabel(sub.frequency),
+          lastCompleted,
+          scheduledDate: serviceDue,
+        },
+        today,
+      );
 
       const serviceDueAlreadyCompleted =
         Boolean(lastCompleted) && Boolean(serviceDue) && lastCompleted >= serviceDue;
@@ -1284,6 +1334,14 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         seasonalStartMonth,
         seasonalEndMonth,
         isSeasonal,
+        // Service-line segregation + interval-deadline urgency (Sensei v2 Router model).
+        serviceLine,
+        serviceIntervalDays: deadlineFlags.intervalDays,
+        serviceDeadline: deadlineFlags.deadline,
+        daysUntilDeadline: deadlineFlags.daysUntilDeadline,
+        pastDeadline: deadlineFlags.pastDeadline && !serviceDueAlreadyCompleted,
+        deadlineFlagZone: deadlineFlags.flagZone && !serviceDueAlreadyCompleted,
+        grEscalation: deadlineFlags.grEscalation && !serviceDueAlreadyCompleted,
         preferredTech,
         // Computed flags (also stored as columns for review feeds / debugging):
         inScope,
@@ -1439,6 +1497,7 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
   const today = centralTodayISO();
   const db = adminDb();
 
+  const routingConfig = await loadRoutingConfig(db, companyId);
   const snap = await db.collection(`companies/${companyId}/jobs`).where("source", "==", "api").get();
   const now = new Date().toISOString();
   let batch = db.batch();
@@ -1450,9 +1509,6 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
     if (d.serviceDueAlreadyCompleted) continue;
     const serviceDue = str(d.scheduledDate);
     const inScope = Boolean(d.inScope);
-    // Recompute balanceOk from the stored balance so the current BALANCE_GATE
-    // is honored even on docs synced before the gate changed (no API read).
-    const balanceOk = num(d.customerBalance) <= BALANCE_GATE;
     const hasConstraint = Boolean(d.hasConstraint);
     const alreadyScheduled = Boolean(d.alreadyScheduled);
     const pendingCancel = Boolean(d.pendingCancel);
@@ -1469,8 +1525,24 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
       pendingCancel,
       potentialCustomer,
       today,
+      balanceGate: routingConfig.balanceGate,
+      balanceAgeGate: routingConfig.balanceAgeGate,
+      customerBalanceAgeDays: num(d.customerBalanceAge),
     });
-    const { pastDue, pastDue30, dueSoon, autoRoutable, needsReview, overdueActionable, dueSoonActionable } = flags;
+    const { pastDue, pastDue30, dueSoon, balanceOk, autoRoutable, needsReview, overdueActionable, dueSoonActionable } = flags;
+
+    // The interval deadline also shifts daily (today moves toward/past it).
+    const serviceLine = deriveServiceLine(d.serviceType, d.fieldRoutesRouteGroup);
+    const deadlineFlags = computeDeadlineFlags(
+      {
+        serviceLine,
+        frequency: d.frequency,
+        recurringFrequency: d.recurringFrequency,
+        lastCompleted: str(d.subscriptionLastCompletedDate),
+        scheduledDate: serviceDue,
+      },
+      today,
+    );
 
     let status: string;
     if (alreadyScheduled) status = "scheduled";
@@ -1487,7 +1559,12 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
       needsReview !== Boolean(d.needsReview) ||
       overdueActionable !== Boolean(d.overdueActionable) ||
       dueSoonActionable !== Boolean(d.dueSoonActionable) ||
-      status !== str(d.status)
+      status !== str(d.status) ||
+      serviceLine !== str(d.serviceLine) ||
+      deadlineFlags.deadline !== str(d.serviceDeadline) ||
+      deadlineFlags.pastDeadline !== Boolean(d.pastDeadline) ||
+      deadlineFlags.flagZone !== Boolean(d.deadlineFlagZone) ||
+      deadlineFlags.grEscalation !== Boolean(d.grEscalation)
     ) {
       batch.update(doc.ref, {
         pastDue,
@@ -1499,6 +1576,13 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
         overdueActionable,
         dueSoonActionable,
         status,
+        serviceLine,
+        serviceIntervalDays: deadlineFlags.intervalDays,
+        serviceDeadline: deadlineFlags.deadline,
+        daysUntilDeadline: deadlineFlags.daysUntilDeadline,
+        pastDeadline: deadlineFlags.pastDeadline,
+        deadlineFlagZone: deadlineFlags.flagZone,
+        grEscalation: deadlineFlags.grEscalation,
         updatedAt: now,
       });
       updated++;
