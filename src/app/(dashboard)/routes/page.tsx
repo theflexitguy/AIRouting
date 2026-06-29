@@ -3,7 +3,6 @@
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { collection, getDoc, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { MarkerClusterer, SuperClusterAlgorithm } from "@googlemaps/markerclusterer";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Button } from "@/components/ui/button";
@@ -52,6 +51,11 @@ const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06
 const UNASSIGNED_ROUTE_COLOR = "#94a3b8";
 // Synthetic tech id prefix for unassigned FieldRoutes appointments (no real tech).
 const UNASSIGNED_TECH_PREFIX = "__unassigned__";
+
+// Max Job Pool dots drawn in the current viewport. Bounds rendering when zoomed
+// out over a dense area; when zoomed in to work a spot, the in-view count is well
+// under this so every stop shows individually.
+const JOB_POOL_VIEWPORT_CAP = 600;
 
 
 // Default Job Pool window: the last 30 days (today − 30 → today). Surfaces all
@@ -921,7 +925,6 @@ export default function RoutesPage() {
   const mapInstanceRef = useRef<google.maps.Map | null>(null);
   const openMapInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const mapMarkersRef = useRef<google.maps.Marker[]>([]);
-  const jobPoolClustererRef = useRef<MarkerClusterer | null>(null);
   const jobPoolMarkersRef = useRef<google.maps.Marker[]>([]);
   const mapBoundsRef = useRef<google.maps.LatLngBounds | null>(null);
   // Bumped on every map 'idle' (pan/zoom settle) so the Job Pool layer can
@@ -2383,20 +2386,17 @@ export default function RoutesPage() {
     };
   }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
 
-  // Job Pool markers — viewport-aware. Re-renders on pan/zoom (viewportTick) and
-  // draws ONLY the stops in the current map bounds, so working a zoomed-in area
-  // isn't bogged down by thousands of off-screen stops (and they de-cluster into
-  // individual dots much sooner). Clustering keeps a wide view smooth.
+  // Job Pool markers — viewport-aware, NOT clustered. Re-renders on pan/zoom
+  // (viewportTick) and draws ONLY the stops in the current map bounds as small,
+  // semi-transparent dots that sit UNDER the routes. No clustering, so every stop
+  // is individually clickable/draggable (no "2" blobs) and the routes stay
+  // visible. Capped so a wide zoom-out can't flood the map.
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map || !window.google) return;
 
-    jobPoolClustererRef.current?.clearMarkers();
-    jobPoolClustererRef.current?.setMap(null);
-    jobPoolClustererRef.current = null;
     jobPoolMarkersRef.current.forEach((m) => m.setMap(null));
     jobPoolMarkersRef.current = [];
-
     if (!showJobPoolLayer) return;
 
     const viewBounds = mapBoundsRef.current;
@@ -2404,6 +2404,7 @@ export default function RoutesPage() {
     const markers: google.maps.Marker[] = [];
 
     for (const job of jobPoolJobs) {
+      if (markers.length >= JOB_POOL_VIEWPORT_CAP) break;
       if (typeof job.lat !== "number" || typeof job.lng !== "number") continue;
       const pos = new window.google.maps.LatLng(job.lat, job.lng);
       // Only render what's in view (once we know the viewport).
@@ -2411,16 +2412,17 @@ export default function RoutesPage() {
 
       const marker = new window.google.maps.Marker({
         position: pos,
+        map,
         draggable: hasEditableRoute && !clickReorderRouteId,
         icon: {
           path: window.google.maps.SymbolPath.CIRCLE,
           fillColor: "#22d3ee",
-          fillOpacity: 0.95,
-          strokeColor: "#e0f2fe",
-          strokeWeight: 2,
-          scale: 9,
+          fillOpacity: 0.55,
+          strokeColor: "#155e75",
+          strokeWeight: 0.5,
+          scale: 5.5,
         },
-        zIndex: 5,
+        zIndex: 1, // below route stops/lines so routes stay readable
       });
       marker.addListener("click", () => {
         const infoWindow = new window.google.maps.InfoWindow({
@@ -2445,15 +2447,12 @@ export default function RoutesPage() {
         }
         await handleAddPoolJobToRoute(job.id, target.routeId, target.jobId);
       });
+      marker.addListener("mouseover", () => marker.setZIndex(50));
+      marker.addListener("mouseout", () => marker.setZIndex(1));
       markers.push(marker);
     }
 
     jobPoolMarkersRef.current = markers;
-    jobPoolClustererRef.current = new MarkerClusterer({
-      map,
-      markers,
-      algorithm: new SuperClusterAlgorithm({ radius: 14, maxZoom: 18 }),
-    });
   }, [showJobPoolLayer, jobPoolJobs, viewportTick, visibleRoutes, clickReorderRouteId, findNearestRouteDropTarget, handleAddPoolJobToRoute]);
 
   async function loadTechs(companyId: string) {
