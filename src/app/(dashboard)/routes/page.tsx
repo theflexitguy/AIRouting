@@ -898,6 +898,9 @@ export default function RoutesPage() {
   const [jobPoolDueStart, setJobPoolDueStart] = useState(() => defaultJobPoolRange().start);
   const [jobPoolDueEnd, setJobPoolDueEnd] = useState(() => defaultJobPoolRange().end);
   const [jobPoolFilterTouched, setJobPoolFilterTouched] = useState(false);
+  // When on, the pool shows ONLY past-due stops — a lighter set when the pool
+  // is large (and the dispatcher wants to clear the backlog first).
+  const [jobPoolPastDueOnly, setJobPoolPastDueOnly] = useState(false);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
   const [leftPanelRouteId, setLeftPanelRouteId] = useState<string | null>(null);
@@ -1134,6 +1137,9 @@ export default function RoutesPage() {
         if (String(job.status || "").toLowerCase() !== "pending") return false;
         if (job.serviceDueAlreadyCompleted || serviceDueAlreadyCompleted(job)) return false;
         const flags = job as Job & { overdueActionable?: boolean; dueSoonActionable?: boolean };
+        // "Past due only" toggle: restrict the pool to overdue stops (ignores the
+        // pending date range) — a lighter set for clearing the backlog.
+        if (jobPoolPastDueOnly) return flags.overdueActionable === true;
         // Overdue stops (past due as of TODAY) are always pulled — the date range
         // doesn't apply to them. Pending stops are scoped to the pool date range.
         if (flags.overdueActionable === true) return true;
@@ -1148,7 +1154,7 @@ export default function RoutesPage() {
         if (dateDiff !== 0) return dateDiff;
         return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
       });
-  }, [allJobs, jobPoolDueEnd, jobPoolDueStart, routedJobIds, selectedJobPoolTechs]);
+  }, [allJobs, jobPoolDueEnd, jobPoolDueStart, jobPoolPastDueOnly, routedJobIds, selectedJobPoolTechs]);
 
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
     return (tr.route.stopSequence || []).map(id => allJobs[id]).filter(Boolean) as Job[];
@@ -3057,15 +3063,32 @@ export default function RoutesPage() {
               className="h-8 px-2 text-xs text-cyan-200 hover:text-cyan-100 hover:bg-cyan-500/10"
               onClick={() => {
                 setJobPoolFilterTouched(false);
-                setJobPoolDueStart(startDate);
-                setJobPoolDueEnd(endDate);
+                const { start, end } = defaultJobPoolRange();
+                setJobPoolDueStart(start);
+                setJobPoolDueEnd(end);
               }}
             >
               Reset
             </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={jobPoolPastDueOnly ? "default" : "outline"}
+              onClick={() => setJobPoolPastDueOnly((v) => !v)}
+              className={cn(
+                "h-8 px-2.5 text-xs",
+                jobPoolPastDueOnly
+                  ? "bg-red-500 hover:bg-red-600 text-white"
+                  : "text-muted-foreground",
+              )}
+              title="Show only past-due stops in the pool (lighter when the pool is large)"
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              Past due only
+            </Button>
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
               {jobPoolJobs.length > JOB_POOL_MARKER_CAP
-                ? `Showing ${JOB_POOL_MARKER_CAP} of ${jobPoolJobs.length} — narrow the date range or filter by technician to see more`
+                ? `Showing ${JOB_POOL_MARKER_CAP} of ${jobPoolJobs.length} — narrow the range, filter by technician, or use Past due only`
                 : `${jobPoolJobs.length} jobs shown`}
             </span>
           </div>
