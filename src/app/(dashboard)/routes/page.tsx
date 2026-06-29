@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { collection, getDoc, getDocs, query, where, doc, updateDoc, deleteDoc, writeBatch, setDoc, onSnapshot, documentId } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { MarkerClusterer } from "@googlemaps/markerclusterer";
+import { MarkerClusterer, SuperClusterAlgorithm } from "@googlemaps/markerclusterer";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Button } from "@/components/ui/button";
@@ -2415,7 +2415,13 @@ export default function RoutesPage() {
 
         poolMarkers.push(marker);
       });
-      jobPoolClustererRef.current = new MarkerClusterer({ map, markers: poolMarkers });
+      // Smaller cluster radius than the 60px default so stops break apart into
+      // individual dots at a much lower zoom level (less zooming to see them).
+      jobPoolClustererRef.current = new MarkerClusterer({
+        map,
+        markers: poolMarkers,
+        algorithm: new SuperClusterAlgorithm({ radius: 22, maxZoom: 17 }),
+      });
     }
 
     // Only fit bounds on FIRST data load — don't jump around after that
