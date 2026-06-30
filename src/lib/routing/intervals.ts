@@ -33,6 +33,9 @@ const isISODate = (v: string | undefined): v is string => /^\d{4}-\d{2}-\d{2}$/.
 export function serviceIntervalDays(input: IntervalInput): number {
   const raw = toNum(input.frequency);
   if (raw > 0) return raw;
+  // A negative frequency is a FieldRoutes placeholder (e.g. -4 for plan-scheduled
+  // lawn rounds) — don't parse the bogus "Every -4 Days" label; use the line default.
+  if (raw < 0) return serviceLineMeta(input.serviceLine).defaultIntervalDays;
   const parsed = parseFrequencyDays(input.recurringFrequency);
   if (parsed && parsed > 0) return parsed;
   return serviceLineMeta(input.serviceLine).defaultIntervalDays;

@@ -38,7 +38,9 @@ export const SERVICE_LINE_META: Record<ServiceLine, ServiceLineMeta> = {
   general:    { requiresOwnRoute: false, defaultIntervalDays: 30,  flagLeadDays: 14, seasonal: false },
   gr:         { requiresOwnRoute: true,  defaultIntervalDays: 14,  flagLeadDays: 3,  seasonal: false },
   termite:    { requiresOwnRoute: true,  defaultIntervalDays: 365, flagLeadDays: 60, seasonal: false },
-  lawn:       { requiresOwnRoute: true,  defaultIntervalDays: 42,  flagLeadDays: 7,  seasonal: false },
+  // Lawn is sold as a 7-round annual program — each "Round" is a separate
+  // subscription that runs ~once per year, so the per-round interval is annual.
+  lawn:       { requiresOwnRoute: true,  defaultIntervalDays: 365, flagLeadDays: 14, seasonal: false },
   mosquito:   { requiresOwnRoute: false, defaultIntervalDays: 30,  flagLeadDays: 5,  seasonal: true  },
   commercial: { requiresOwnRoute: false, defaultIntervalDays: 90,  flagLeadDays: 14, seasonal: false },
   wildlife:   { requiresOwnRoute: true,  defaultIntervalDays: 30,  flagLeadDays: 14, seasonal: false },
@@ -49,7 +51,9 @@ export const SERVICE_LINE_META: Record<ServiceLine, ServiceLineMeta> = {
 const RULES: Array<{ line: ServiceLine; test: (n: string) => boolean }> = [
   { line: "termite",    test: (n) => n.includes("termit") },
   { line: "gr",         test: (n) => n.includes("germanroach") || n === "gr" || n.startsWith("grroach") },
-  { line: "lawn",       test: (n) => n.includes("lawn") },
+  // Lawn program: "Lawn Care" plus the 7 "Round N - ..." service types
+  // (Pre/Post-Emergent, Fertilization, Weed Control, Winterization, etc.).
+  { line: "lawn",       test: (n) => n.includes("lawn") || /^round\d/.test(n) || n.includes("emergent") || n.includes("fertiliz") || n.includes("broadleaf") || n.includes("weedcontrol") || n.includes("winteriz") || n.includes("rootstrength") || n.includes("growthcontrol") || n.includes("stressmanagement") },
   { line: "mosquito",   test: (n) => n.includes("mosquit") || n.includes("boatdock") || n.includes("outdoorpackage") || n.includes("odp") || n.includes("outdoor") },
   { line: "wildlife",   test: (n) => n.includes("wild") },
   { line: "commercial", test: (n) => n.includes("commercial") || n.includes("gpc") || n.startsWith("comm") || n === "wei" },

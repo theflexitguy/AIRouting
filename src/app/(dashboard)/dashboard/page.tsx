@@ -13,6 +13,8 @@ import { DatePicker } from "@/components/ui/date-picker";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatTime } from "@/lib/utils";
 import { formatCurrency } from "@/lib/production-value";
+import { deriveServiceLine } from "@/lib/routing/service-line";
+import type { MonthlyDone } from "@/lib/fieldroutes/monthly-done";
 import {
   stopsPerRoute,
   stopsPerHour,
@@ -109,6 +111,8 @@ interface RouteRec extends RouteLike {
 interface JobRec extends JobLike {
   status?: string;
   overdueActionable?: boolean;
+  serviceType?: string;
+  fieldRoutesRouteGroup?: string;
 }
 interface TechOption {
   id: string;
@@ -119,6 +123,14 @@ interface TechOption {
 }
 
 const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+
+// Lines shown in the Initials breakdown (new-signup first services).
+const INITIAL_LINE_LABELS: Array<{ key: string; label: string }> = [
+  { key: "general", label: "GP" },
+  { key: "mosquito", label: "Mosq" },
+  { key: "termite", label: "Term" },
+  { key: "commercial", label: "Comm" },
+];
 
 // Does a route belong to the selected technician? Routes carry techId/techName;
 // match against any of the tech's known identifiers.
@@ -138,6 +150,7 @@ export default function DashboardPage() {
   const [rawJobs, setRawJobs] = useState<JobRec[]>([]); // inScope subscriptions
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [groupOptions, setGroupOptions] = useState<string[]>([]);
+  const [monthlyDone, setMonthlyDone] = useState<MonthlyDone | null>(null);
 
   // Filters
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
@@ -182,7 +195,19 @@ export default function DashboardPage() {
       const jobsSnap = await getDocs(
         query(collection(db, `companies/${companyId}/jobs`), where("inScope", "==", true))
       );
-      setRawJobs(jobsSnap.docs.map(d => d.data() as JobRec));
+      // Derive serviceLine on the fly when a doc predates the Phase-1 stamping, so
+      // the per-line targets populate without waiting on a full re-sync.
+      setRawJobs(jobsSnap.docs.map(d => {
+        const data = d.data() as JobRec;
+        if (!data.serviceLine) {
+          data.serviceLine = deriveServiceLine(data.serviceType, data.fieldRoutesRouteGroup);
+        }
+        return data;
+      }));
+
+      // Cached completed-this-month aggregate (Initials / Specialty / Wildlife).
+      const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
+      setMonthlyDone(mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
       setTechs(techSnap.docs.map(d => {
@@ -556,6 +581,73 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
             </div>
+
+            {/* COMPLETED THIS MONTH — Initials / Specialty / Wildlife (from completed appointments) */}
+            <div className="flex items-center justify-between pt-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Completed This Month</p>
+              <p className="text-xs text-muted-foreground/50">
+                {monthlyDone
+                  ? `${monthlyDone.completedAppointments.toLocaleString()} appts · updated ${format(parseISO(monthlyDone.computedAt), "MMM d")}`
+                  : "not yet computed"}
+              </p>
+            </div>
+            {monthlyDone ? (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                {/* Initials with per-line breakdown */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5 space-y-2">
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <p className="text-[13px] text-muted-foreground font-medium">Initials</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.initialsTotal ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">new-signup first services</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-400"><TrendingUp className="w-4 h-4" /></div>
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground/70">
+                      {INITIAL_LINE_LABELS.map(({ key, label }) => (
+                        <span key={key}>{label} <span className="text-foreground font-medium tabular-nums">{monthlyDone.initialsByLine?.[key] ?? 0}</span></span>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Specialty (GR + one-time / flea / misc) */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[13px] text-muted-foreground font-medium">Specialty</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.specialtyDone ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">German Roach · flea · one-time · misc</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-amber-500/10 text-amber-400"><Activity className="w-4 h-4" /></div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Wildlife */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[13px] text-muted-foreground font-medium">Wildlife</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.wildlifeDone ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">exclusion &amp; wildlife work</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-rose-500/10 text-rose-400"><Briefcase className="w-4 h-4" /></div>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            ) : (
+              <Card className="border-border/40">
+                <CardContent className="p-4 text-xs text-muted-foreground/70">
+                  Initials, Specialty, and Wildlife counts come from completed appointments. Run the monthly aggregate
+                  (POST <span className="font-mono">/api/fieldroutes/monthly-done</span>) to populate this section.
+                </CardContent>
+              </Card>
+            )}
 
             {/* Jobs Due This Week chart */}
             <Card className="border-border/40 animate-fade-in">

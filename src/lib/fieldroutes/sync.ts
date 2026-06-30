@@ -1178,6 +1178,12 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const onHold = num(sub.onHold);
       const frequency = num(sub.frequency);
       const active = num(sub.active);
+      // Classify early — lawn rounds (a 7-round annual plan) carry a placeholder
+      // frequency (e.g. -4) that fails the recurring test below, so we exempt the
+      // lawn line from the non-recurring deletion while still dropping it when
+      // cancelled (active != 1). serviceType alone is enough to spot the rounds.
+      const serviceLine = deriveServiceLine(serviceType);
+      const isLawnPlan = serviceLine === "lawn";
 
       // The app is recurring + ACTIVE only. Drop a subscription doc when it is no
       // longer active (cancelled/frozen → active != 1) or not genuinely recurring
@@ -1185,7 +1191,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       // FieldRoutes stops showing stale past-dues: the incremental sync re-pulls
       // it via dateUpdated, sees active != 1, and deletes the doc. (Pure Firestore
       // op; the full-set sweep in reconcileActiveSubscriptions catches the rest.)
-      if (active !== 1 || !isRecurringFrequency(frequency)) {
+      if (active !== 1 || (!isRecurringFrequency(frequency) && !isLawnPlan)) {
         const stale = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
         batch.delete(stale);
         subsProcessed++;
@@ -1237,7 +1243,11 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const pendingCancel = num(customer.pendingCancel) === 1;
       const potentialCustomer = false;
 
-      const inScope = isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency });
+      // Lawn rounds are recurring revenue even though FieldRoutes gives them a
+      // placeholder frequency, so treat an active, charged lawn round as in-scope.
+      const inScope =
+        isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency }) ||
+        (isLawnPlan && num(onHold) === 0 && num(sub.recurringCharge) > 0 && active === 1);
       const flags = computeFlags({
         inScope,
         serviceDue,
@@ -1252,9 +1262,8 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         customerBalanceAgeDays: num(customer.balanceAge),
       });
 
-      // Service line (general / GR / termite / lawn / mosquito / commercial /
-      // wildlife) + the interval deadline counted from last completed service.
-      const serviceLine = deriveServiceLine(serviceType, scheduledRouteGroup);
+      // serviceLine is derived above (from serviceType). Interval deadline is
+      // counted from the last completed service.
       const deadlineFlags = computeDeadlineFlags(
         {
           serviceLine,
@@ -1664,8 +1673,13 @@ export async function reconcileActiveSubscriptions(): Promise<{
   let ops = 0;
   let deleted = 0;
   for (const doc of snap.docs) {
-    const subId = str(doc.data().subscriptionId);
+    const d = doc.data();
+    const subId = str(d.subscriptionId);
     if (subId && activeSet.has(subId)) continue; // still active + recurring — keep
+    // Lawn rounds use a placeholder frequency, so they never appear in the
+    // frequency>0 active set — keep them here; cancelled rounds are removed by the
+    // sync loop's active!=1 check instead.
+    if (deriveServiceLine(d.serviceType) === "lawn") continue;
     batch.delete(doc.ref);
     deleted++;
     ops++;
@@ -1697,6 +1711,9 @@ export async function purgeNonRecurring(): Promise<{ companyId: string; scanned:
 
   for (const doc of snap.docs) {
     const d = doc.data();
+    // Lawn rounds are recurring revenue carried with a placeholder frequency —
+    // never purge them as "non-recurring".
+    if (deriveServiceLine(d.serviceType) === "lawn") continue;
     const hasRawFrequency = typeof d.frequency === "number";
     const label = str(d.recurringFrequency);
     const nonRecurring = hasRawFrequency

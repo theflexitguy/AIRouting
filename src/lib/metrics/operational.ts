@@ -3,6 +3,7 @@
 // are AUTO-COMPUTED from data we already pull — there is no manual weekly logging.
 
 import { parseFrequencyDays } from "@/lib/production-value";
+import { serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
 
 /** Minimal shape of a route doc this module needs. */
 export interface RouteLike {
@@ -144,6 +145,12 @@ export function meetsTarget(
 function jobFrequencyDays(j: JobLike): number {
   const raw = Number(j.frequency);
   if (Number.isFinite(raw) && raw > 0) return raw;
+  // A negative frequency is a FieldRoutes placeholder (e.g. -4 for plan-scheduled
+  // lawn rounds). Don't parse the bogus "Every -4 Days" label — use the service
+  // line's default interval (lawn = annual per round) so the target isn't inflated.
+  if (Number.isFinite(raw) && raw < 0) {
+    return serviceLineMeta((j.serviceLine as ServiceLine) || "general").defaultIntervalDays;
+  }
   const parsed = parseFrequencyDays(j.recurringFrequency);
   return parsed && parsed > 0 ? parsed : 0;
 }
