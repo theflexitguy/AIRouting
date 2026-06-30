@@ -7,14 +7,18 @@ import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { centralTodayISO, toDateOnly, num } from "@/lib/fieldroutes/scope";
-import { deriveServiceLine, serviceLineMeta, ServiceLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, serviceLineMeta, isInScopeForLine, ServiceLine } from "@/lib/routing/service-line";
+import { TARGET_SERVICE_LINES, TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
 
-// Live reconciliation for a service line's monthly target: pulls ACTIVE
-// subscriptions straight from FieldRoutes, classifies them, and shows exactly
-// where the active-count drops to the in-scope count and then to the expected
-// monthly-services target — so "315 active but target 221" becomes explainable.
+// Live reconciliation for ALL service-line monthly targets in ONE FieldRoutes
+// pull: fetches every active subscription once, classifies each by line, and
+// for every tracked line (General Pest / Mosquito / Lawn / Termite / Commercial)
+// reports active -> in-scope -> expected-target, PLUS what's currently stored in
+// Firestore for that line — so a stale-sync drift is visible directly, not
+// guessed at. GR and Wildlife are included for visibility (excluded from the
+// dashboard's monthly target by design).
 //
-//   POST { companyId?, line? }   (line defaults to "mosquito")
+//   POST { companyId? }   — single call, no `line` param needed.
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 const clean = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
@@ -28,11 +32,28 @@ const monthOf = (iso: string): number | null => {
 };
 
 const AVG_DAYS_PER_MONTH = 30.4;
+const ALL_LINES: ServiceLine[] = ["general", "mosquito", "lawn", "termite", "commercial", "gr", "wildlife"];
+
+interface LineAgg {
+  line: ServiceLine;
+  label: string;
+  tracked: boolean; // counted in the dashboard's Monthly Targets / Total
+  activeSubscriptions: number;
+  onHold: number;
+  nonRecurringFrequency: number;
+  zeroChargeIncluded: number; // active $0 subs (e.g. bundled) — counted, not dropped
+  inScope: number;
+  seasonalCount: number;
+  offSeasonThisMonth: number;
+  liveExpectedTarget: number;
+  storedInScopeJobs: number; // what's currently in Firestore for this line
+  storedTarget: number; // same target math, run over the STORED docs
+  driftFlag: boolean; // live target vs stored target differ by >5%
+}
 
 export async function POST(request: Request) {
   try {
-    const body = (await request.json().catch(() => ({}))) as { companyId?: string; line?: string };
-    const line = (body.line || "mosquito").toLowerCase() as ServiceLine;
+    const body = (await request.json().catch(() => ({}))) as { companyId?: string };
     const db = adminDb();
 
     let companyId = body.companyId && body.companyId !== "YOUR_COMPANY_ID" ? body.companyId : "";
@@ -77,83 +98,143 @@ export async function POST(request: Request) {
     const today = centralTodayISO();
     const monthIndex = Number(today.slice(5, 7));
 
+    // 1) ONE live pull of every active subscription.
     let subs: Record<string, unknown>[] = [];
     try {
-      // ALL active subscriptions (active:1), classified client-side by serviceType.
       const ids = await client.searchIds("subscription", { active: 1 });
       subs = ids.length ? await client.getEntities("subscription", ids) : [];
     } finally {
       await recordApiUsage(db, companyId, { reads: client.readCount });
     }
 
-    let activeInLine = 0;
-    let onHoldCount = 0;
-    let noChargeCount = 0;
-    let nonRecurringCount = 0; // frequency <= 0
-    let inScope = 0;
-    let seasonalCount = 0;
-    let offSeasonThisMonth = 0;
-    let expectedTarget = 0;
-    const byFrequency: Record<string, number> = {};
-    const byServiceType: Record<string, number> = {};
+    // 2) ONE read of every synced job doc, for the stored-vs-live comparison.
+    const jobsSnap = await db.collection(`companies/${companyId}/jobs`).where("source", "==", "api").get();
+    const storedByLine = new Map<string, Record<string, unknown>[]>();
+    for (const doc of jobsSnap.docs) {
+      const d = doc.data();
+      // Mirror the dashboard's client-side fallback: most docs predate the
+      // serviceLine stamping, so derive it the same way the UI does rather than
+      // dumping everything without a stored field into "general".
+      const ln = str(d.serviceLine) || deriveServiceLine(d.serviceType, d.fieldRoutesRouteGroup);
+      if (!storedByLine.has(ln)) storedByLine.set(ln, []);
+      storedByLine.get(ln)!.push(d);
+    }
+
+    const tracked = new Set<string>(TARGET_SERVICE_LINES as readonly string[]);
+    const lines: LineAgg[] = ALL_LINES.map((line) => ({
+      line,
+      label: (TARGET_SERVICE_LINE_LABELS as Record<string, string>)[line] || line,
+      tracked: tracked.has(line),
+      activeSubscriptions: 0,
+      onHold: 0,
+      nonRecurringFrequency: 0,
+      zeroChargeIncluded: 0,
+      inScope: 0,
+      seasonalCount: 0,
+      offSeasonThisMonth: 0,
+      liveExpectedTarget: 0,
+      storedInScopeJobs: 0,
+      storedTarget: 0,
+      driftFlag: false,
+    }));
+    const byLine = new Map(lines.map((l) => [l.line, l]));
 
     for (const s of subs) {
       const sr = rec(s);
       const serviceType = str(sr.serviceType);
-      if (deriveServiceLine(serviceType) !== line) continue;
-      activeInLine++;
-      byServiceType[serviceType || "(blank)"] = (byServiceType[serviceType || "(blank)"] || 0) + 1;
+      const line = deriveServiceLine(serviceType);
+      const agg = byLine.get(line);
+      if (!agg) continue; // shouldn't happen — ALL_LINES covers every ServiceLine
+      agg.activeSubscriptions++;
 
       const onHold = num(sr.onHold);
       const charge = num(sr.recurringCharge);
       const frequency = num(sr.frequency);
-      if (onHold !== 0) onHoldCount++;
-      if (!(charge > 0)) noChargeCount++; // reported for visibility; $0 is NOT excluded
-      if (!(frequency > 0)) nonRecurringCount++;
+      if (onHold !== 0) agg.onHold++;
+      if (!(charge > 0)) agg.zeroChargeIncluded++;
+      if (!(frequency > 0)) agg.nonRecurringFrequency++;
 
-      // Scope = active + recurring + not on hold. A $0 recurring charge (e.g. an
-      // Outdoor Package bundled into General Pest) still counts.
-      const subInScope = onHold === 0 && frequency > 0;
+      // Same scope rule production uses, INCLUDING the Lawn carve-out (active +
+      // not-on-hold lawn rounds count despite their placeholder frequency).
+      const subInScope = isInScopeForLine({
+        line,
+        onHold: sr.onHold,
+        recurringCharge: sr.recurringCharge,
+        frequency: sr.frequency,
+        active: sr.active,
+      });
       if (!subInScope) continue;
-      inScope++;
+      agg.inScope++;
 
-      // Effective interval (days): raw frequency, else the line default.
       const freqDays = frequency > 0 ? frequency : serviceLineMeta(line).defaultIntervalDays;
-      byFrequency[String(freqDays)] = (byFrequency[String(freqDays)] || 0) + 1;
-
-      // Seasonality: count only in active months (mosquito = its season window).
       const startMonth = monthOf(toDateOnly(sr.seasonalStart));
       const endMonth = monthOf(toDateOnly(sr.seasonalEnd));
       const isSeasonal = startMonth !== null && endMonth !== null;
-      if (isSeasonal) seasonalCount++;
+      if (isSeasonal) agg.seasonalCount++;
       const activeThisMonth = !isSeasonal
         ? true
         : startMonth <= endMonth
           ? monthIndex >= startMonth && monthIndex <= endMonth
           : monthIndex >= startMonth || monthIndex <= endMonth;
       if (!activeThisMonth) {
-        offSeasonThisMonth++;
+        agg.offSeasonThisMonth++;
         continue;
       }
-      expectedTarget += AVG_DAYS_PER_MONTH / freqDays;
+      agg.liveExpectedTarget += AVG_DAYS_PER_MONTH / freqDays;
     }
 
+    // Stored-data target, computed the SAME way the dashboard does, over whatever
+    // is currently sitting in Firestore — this is what the UI is actually showing.
+    for (const agg of lines) {
+      const docs = storedByLine.get(agg.line) || [];
+      let storedInScope = 0;
+      let storedTarget = 0;
+      for (const d of docs) {
+        if (d.inScope !== true || d.pendingCancel === true) continue;
+        storedInScope++;
+        const freq = num(d.frequency);
+        const days = freq > 0 ? freq : serviceLineMeta(agg.line).defaultIntervalDays;
+        if (!(days > 0)) continue;
+        const startMonth = Number(d.seasonalStartMonth) || null;
+        const endMonth = Number(d.seasonalEndMonth) || null;
+        const isSeasonal = Boolean(d.isSeasonal) && startMonth && endMonth;
+        const activeThisMonth = !isSeasonal
+          ? true
+          : (startMonth as number) <= (endMonth as number)
+            ? monthIndex >= (startMonth as number) && monthIndex <= (endMonth as number)
+            : monthIndex >= (startMonth as number) || monthIndex <= (endMonth as number);
+        if (!activeThisMonth) continue;
+        storedTarget += AVG_DAYS_PER_MONTH / days;
+      }
+      agg.storedInScopeJobs = storedInScope;
+      agg.storedTarget = Math.round(storedTarget);
+      agg.liveExpectedTarget = Math.round(agg.liveExpectedTarget);
+      const live = agg.liveExpectedTarget;
+      const stored = agg.storedTarget;
+      const denom = Math.max(1, live);
+      agg.driftFlag = Math.abs(live - stored) / denom > 0.05;
+    }
+
+    const trackedLines = lines.filter((l) => l.tracked);
+    const totals = {
+      liveExpectedTarget: trackedLines.reduce((s, l) => s + l.liveExpectedTarget, 0),
+      storedTarget: trackedLines.reduce((s, l) => s + l.storedTarget, 0),
+      activeSubscriptions: trackedLines.reduce((s, l) => s + l.activeSubscriptions, 0),
+      inScope: trackedLines.reduce((s, l) => s + l.inScope, 0),
+    };
+
     return NextResponse.json({
-      line,
       today,
       monthIndex,
-      activeSubscriptionsInLine: activeInLine,
-      droppedToInScope: {
-        onHold: onHoldCount,
-        nonRecurringFrequency: nonRecurringCount,
-        inScope,
-      },
-      zeroChargeIncluded: noChargeCount, // active $0 subs (e.g. bundled) — counted, not dropped
-      seasonality: { seasonalCount, offSeasonThisMonth, countedThisMonth: inScope - offSeasonThisMonth },
-      expectedMonthlyTarget: Math.round(expectedTarget),
-      byFrequencyDays: byFrequency,
-      byServiceType,
-      note: "active = all active subs in this line; inScope = active & recurring & not on hold ($0 price counts); target = sum(30.4/intervalDays) over in-scope, in-season subs.",
+      totalActiveSubscriptionsPulled: subs.length,
+      totalStoredJobDocs: jobsSnap.size,
+      lines,
+      trackedTotals: totals,
+      driftedLines: lines.filter((l) => l.driftFlag).map((l) => l.line),
+      note:
+        "live* = computed fresh from FieldRoutes right now. stored* = what the dashboard currently shows " +
+        "(synced Firestore data). A mismatch means the synced docs are stale — run a full Sync (after " +
+        "resetting the cursor) to bring them in line with live*.",
       apiReads: client.readCount,
     });
   } catch (err) {

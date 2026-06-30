@@ -12,6 +12,7 @@
 // canonicalRouteGroup in src/lib/route-groups.ts.
 
 import { canonicalRouteGroup } from "@/lib/route-groups";
+import { isInScope, num } from "@/lib/fieldroutes/scope";
 
 export type ServiceLine =
   | "general"
@@ -93,4 +94,31 @@ export function deriveServiceLine(serviceType: unknown, routeGroupTitle?: unknow
 
 export function serviceLineMeta(line: ServiceLine): ServiceLineMeta {
   return SERVICE_LINE_META[line] ?? SERVICE_LINE_META.general;
+}
+
+export interface LineScopeInput {
+  line: ServiceLine;
+  onHold: unknown; // subscription.onHold (0/1)
+  recurringCharge: unknown; // subscription.recurringCharge
+  frequency: unknown; // subscription.frequency (days; -1 One-Time, 0 As Needed, >0 recurring)
+  active: unknown; // subscription.active (1 = active)
+}
+
+/**
+ * Single source of truth for subscription scope, INCLUDING the Lawn carve-out:
+ * Lawn is sold as a 7-round annual program and FieldRoutes gives each round a
+ * placeholder frequency (e.g. -4), which fails the normal "recurring" test. An
+ * active, not-on-hold Lawn round is real recurring revenue regardless, so it's
+ * in scope on that basis alone (price/frequency aside). Every caller that needs
+ * to know "is this subscription in scope" (sync, diagnostics, future routing)
+ * must go through this function so the rule can't drift between call sites.
+ */
+export function isInScopeForLine(input: LineScopeInput): boolean {
+  if (isInScope({ onHold: input.onHold, recurringCharge: input.recurringCharge, frequency: input.frequency })) {
+    return true;
+  }
+  if (input.line === "lawn") {
+    return num(input.onHold) === 0 && num(input.active) === 1;
+  }
+  return false;
 }
