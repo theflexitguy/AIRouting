@@ -741,22 +741,15 @@ async function resolveSubscriptionIds(
 ): Promise<string[]> {
   if (mode === "full" || !cursor) {
     // No cursor yet on an incremental run falls back to a full pull so we don't miss anything.
-    // Prefer a server-side frequency filter so we never even fetch One-Time/As Needed
-    // subs (saves API reads). If FieldRoutes rejects/ignores the filter, fall back to
-    // pulling all active subs — the main loop still drops non-recurring ones.
-    try {
-      return await client.searchIds("subscription", {
-        active: 1,
-        frequency: { operator: ">", value: 0 },
-      });
-    } catch (err) {
-      if (err instanceof FieldRoutesBudgetError) throw err;
-      console.warn(
-        "[fieldroutes/sync] subscription frequency filter unsupported; falling back to active-only:",
-        String(err),
-      );
-      return client.searchIds("subscription", { active: 1 });
-    }
+    //
+    // IMPORTANT: do NOT filter by frequency > 0 here. Lawn rounds are real
+    // recurring revenue but carry a FieldRoutes placeholder frequency (e.g. -4),
+    // so a server-side frequency filter would silently exclude every Lawn
+    // subscription ID before the main loop's per-subscription Lawn carve-out
+    // (isInScopeForLine) ever gets a chance to run — the ID never reaches it.
+    // Pull every active sub and let the main loop's per-subscription logic
+    // decide recurring vs. not (cheap: Firestore-only deletes, no extra API cost).
+    return client.searchIds("subscription", { active: 1 });
   }
 
   const changedSubs = await client.searchIds("subscription", {
