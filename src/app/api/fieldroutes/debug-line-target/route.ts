@@ -7,7 +7,7 @@ import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { centralTodayISO, toDateOnly, num } from "@/lib/fieldroutes/scope";
-import { deriveServiceLine, serviceLineMeta, ServiceLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, serviceLineMeta, isInScopeForLine, ServiceLine } from "@/lib/routing/service-line";
 import { TARGET_SERVICE_LINES, TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
 
 // Live reconciliation for ALL service-line monthly targets in ONE FieldRoutes
@@ -112,7 +112,10 @@ export async function POST(request: Request) {
     const storedByLine = new Map<string, Record<string, unknown>[]>();
     for (const doc of jobsSnap.docs) {
       const d = doc.data();
-      const ln = str(d.serviceLine) || "general";
+      // Mirror the dashboard's client-side fallback: most docs predate the
+      // serviceLine stamping, so derive it the same way the UI does rather than
+      // dumping everything without a stored field into "general".
+      const ln = str(d.serviceLine) || deriveServiceLine(d.serviceType, d.fieldRoutesRouteGroup);
       if (!storedByLine.has(ln)) storedByLine.set(ln, []);
       storedByLine.get(ln)!.push(d);
     }
@@ -151,8 +154,16 @@ export async function POST(request: Request) {
       if (!(charge > 0)) agg.zeroChargeIncluded++;
       if (!(frequency > 0)) agg.nonRecurringFrequency++;
 
-      // Scope = active + recurring + not on hold. $0 price counts (bundled subs).
-      if (onHold !== 0 || !(frequency > 0)) continue;
+      // Same scope rule production uses, INCLUDING the Lawn carve-out (active +
+      // not-on-hold lawn rounds count despite their placeholder frequency).
+      const subInScope = isInScopeForLine({
+        line,
+        onHold: sr.onHold,
+        recurringCharge: sr.recurringCharge,
+        frequency: sr.frequency,
+        active: sr.active,
+      });
+      if (!subInScope) continue;
       agg.inScope++;
 
       const freqDays = frequency > 0 ? frequency : serviceLineMeta(line).defaultIntervalDays;

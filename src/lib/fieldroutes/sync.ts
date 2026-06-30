@@ -22,7 +22,7 @@
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
 import { calculateStopProductionValue } from "@/lib/production-value";
-import { deriveServiceLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, isInScopeForLine } from "@/lib/routing/service-line";
 import { computeDeadlineFlags } from "@/lib/routing/intervals";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
@@ -32,7 +32,6 @@ import {
   centralTodayISO,
   computeFlags,
   deriveCategory,
-  isInScope,
   isRecurringFrequency,
   num,
   recurringFrequencyLabel,
@@ -1246,9 +1245,13 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       // Lawn rounds are recurring revenue even though FieldRoutes gives them a
       // placeholder frequency, so treat an active lawn round as in-scope (price
       // aside — like bundled $0 subs).
-      const inScope =
-        isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency }) ||
-        (isLawnPlan && num(onHold) === 0 && active === 1);
+      const inScope = isInScopeForLine({
+        line: serviceLine,
+        onHold,
+        recurringCharge: sub.recurringCharge,
+        frequency,
+        active,
+      });
       const flags = computeFlags({
         inScope,
         serviceDue,
