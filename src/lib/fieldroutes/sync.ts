@@ -1244,10 +1244,11 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const potentialCustomer = false;
 
       // Lawn rounds are recurring revenue even though FieldRoutes gives them a
-      // placeholder frequency, so treat an active, charged lawn round as in-scope.
+      // placeholder frequency, so treat an active lawn round as in-scope (price
+      // aside — like bundled $0 subs).
       const inScope =
         isInScope({ onHold, recurringCharge: sub.recurringCharge, frequency }) ||
-        (isLawnPlan && num(onHold) === 0 && num(sub.recurringCharge) > 0 && active === 1);
+        (isLawnPlan && num(onHold) === 0 && active === 1);
       const flags = computeFlags({
         inScope,
         serviceDue,
@@ -1257,6 +1258,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         pendingCancel,
         potentialCustomer,
         today,
+        frequencyDays: frequency,
         balanceGate: routingConfig.balanceGate,
         balanceAgeGate: routingConfig.balanceAgeGate,
         customerBalanceAgeDays: num(customer.balanceAge),
@@ -1534,6 +1536,7 @@ export async function recomputePastDue(): Promise<{ companyId: string; scanned: 
       pendingCancel,
       potentialCustomer,
       today,
+      frequencyDays: num(d.frequency),
       balanceGate: routingConfig.balanceGate,
       balanceAgeGate: routingConfig.balanceAgeGate,
       customerBalanceAgeDays: num(d.customerBalanceAge),

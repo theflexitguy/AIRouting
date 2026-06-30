@@ -9,10 +9,12 @@
 //  - already_scheduled = a future appointment exists for THIS subscription_id
 //
 // Date-window model (per owner spec):
-//  - due_soon (a.k.a. "Pending") = service_due within ±30 days of today(Central).
-//    These are the appointments available for route generation.
-//  - past_due_30 (a.k.a. "Past Due") = service_due more than 30 days before today.
-//    These are the highest-priority backlog for route generation.
+//  - past_due (a.k.a. "Past Due") = service_due past a FREQUENCY-SCALED grace
+//    period before today: quarterly (90d) → 15 days, bimonthly (60d) → 10,
+//    monthly (30d) → 5 (= interval ÷ 6, clamped to [2, 30]). Frequent services
+//    flag sooner. These are the highest-priority backlog for route generation.
+//  - due_soon (a.k.a. "Pending") = from the grace threshold through +30 days
+//    ahead. These are the appointments available for route generation.
 //  - A subscription serviced (lastCompleted) on/after its service_due is NOT past
 //    due — that completion rolls the next due date forward (handled in sync via
 //    serviceDueAlreadyCompleted).
@@ -121,18 +123,32 @@ export interface ScopeInput {
  * Default scope predicate — kept as a single named function so it's easy to adjust.
  * "Recurring" is part of scope: frequency > 0 excludes One-Time (-1) and As Needed (0),
  * so they never reach the overdue metric or routing.
+ *
+ * NOTE: a $0 recurring charge is NOT disqualifying. Some active subscriptions are
+ * priced at $0 on purpose — e.g. an Outdoor Package whose cost is bundled into the
+ * customer's General Pest service. Those are real recurring work that must still be
+ * counted and routed, so scope is active + recurring + not on hold, price aside.
  */
 export function isInScope(input: ScopeInput): boolean {
-  return (
-    num(input.onHold) === 0 &&
-    num(input.recurringCharge) > 0 &&
-    num(input.frequency) > 0
-  );
+  return num(input.onHold) === 0 && num(input.frequency) > 0;
 }
 
 /** True only for genuinely recurring subscriptions (frequency in days, > 0). */
 export function isRecurringFrequency(frequency: unknown): boolean {
   return num(frequency) > 0;
+}
+
+/**
+ * Days a service may slip past its due date before it counts as "Past Due".
+ * Scales with the service frequency so frequent services flag sooner (owner's
+ * rule = interval ÷ 6): quarterly (90d) → 15, bimonthly (60d) → 10, monthly
+ * (30d) → 5. Clamped to [2, WINDOW_DAYS] so nothing is more lenient than the old
+ * flat 30 days, and an unknown/non-positive frequency falls back to WINDOW_DAYS.
+ */
+export function pastDueGraceDays(frequencyDays: unknown): number {
+  const f = num(frequencyDays);
+  if (f <= 0) return WINDOW_DAYS;
+  return Math.min(WINDOW_DAYS, Math.max(2, Math.round(f / 6)));
 }
 
 export interface JobFlagsInput {
@@ -144,6 +160,7 @@ export interface JobFlagsInput {
   pendingCancel: boolean;
   potentialCustomer: boolean;
   today: string; // YYYY-MM-DD (Central)
+  frequencyDays?: number; // service interval (days); scales the Past Due threshold
   // Optional Routing-Settings overrides. When omitted, the module defaults apply.
   balanceGate?: number; // overrides BALANCE_GATE (dollars)
   customerBalanceAgeDays?: number; // how long the balance has been outstanding
@@ -152,8 +169,8 @@ export interface JobFlagsInput {
 
 export interface JobFlags {
   pastDue: boolean; // service_due < today (any amount) — kept for debugging/back-compat
-  pastDue30: boolean; // service_due more than 30 days before today ("Past Due")
-  dueSoon: boolean; // service_due within ±30 days of today ("Pending")
+  pastDue30: boolean; // service_due past its frequency-scaled grace ("Past Due")
+  dueSoon: boolean; // within grace-days overdue through the forward window ("Pending")
   balanceOk: boolean;
   hasConstraint: boolean;
   autoRoutable: boolean; // enters the routing pool (due soon OR past due, balance-ok, no constraint)
@@ -164,7 +181,10 @@ export interface JobFlags {
 
 export function computeFlags(input: JobFlagsInput): JobFlags {
   const today = input.today;
-  const windowStart = shiftISODate(today, -WINDOW_DAYS); // today − 30 days
+  // Past Due threshold scales with frequency (quarterly 15 / bimonthly 10 /
+  // monthly 5); the forward "due soon" look-ahead stays at WINDOW_DAYS.
+  const graceDays = pastDueGraceDays(input.frequencyDays);
+  const pastDueStart = shiftISODate(today, -graceDays); // today − grace
   const windowEnd = shiftISODate(today, WINDOW_DAYS); // today + 30 days
   const overdueFloor = shiftISODate(today, -MAX_OVERDUE_DAYS); // today − 365 days
   const sd = input.serviceDue;
@@ -173,14 +193,14 @@ export function computeFlags(input: JobFlagsInput): JobFlags {
   const pastDue = hasDate && sd < today;
   // Older than the 1-year floor = stale/abandoned; ignored everywhere below.
   const tooOld = hasDate && sd < overdueFloor;
-  // "Past Due" = more than 30 days overdue, but not more than a year (service_due
-  // in [today − 365, today − 30)). The floor drops dead service dates.
-  const pastDue30 = hasDate && sd < windowStart && !tooOld;
-  // "Pending" / due soon = within ±30 days of today (inclusive). A date exactly
-  // 30 days ago is Pending, not Past Due; 31+ days ago is Past Due.
-  const dueSoon = hasDate && sd >= windowStart && sd <= windowEnd;
+  // "Past Due" = more than `graceDays` overdue, but not more than a year. The
+  // floor drops dead service dates.
+  const pastDue30 = hasDate && sd < pastDueStart && !tooOld;
+  // "Pending" / due soon = from `graceDays` overdue through the forward window.
+  // A date exactly `graceDays` ago is Pending; older is Past Due.
+  const dueSoon = hasDate && sd >= pastDueStart && sd <= windowEnd;
   // "Relevant now" = anything due now or overdue (the routable consideration set).
-  // Dates more than 30 days in the FUTURE are not yet relevant.
+  // Dates more than WINDOW_DAYS in the FUTURE are not yet relevant.
   const relevant = pastDue30 || dueSoon;
 
   // Balance gate: amount under the cap AND (when an age limit is configured and a
