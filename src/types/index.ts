@@ -27,6 +27,7 @@ export interface Technician {
   employeeId: string;
   active: boolean;
   maxStopsPerDay: number;
+  skillNames?: string[]; // FieldRoutes skills assigned to this tech (e.g. "Termite", "Wildlife", "WI-I")
   workDays?: string[]; // e.g. ["Mon","Tue","Wed","Thu","Fri"]
   serviceArea?: {
     north: number;
@@ -75,6 +76,7 @@ export interface Job {
   pastDeadline?: boolean; // today is past the service deadline
   deadlineFlagZone?: boolean; // within the line's flag-lead window of the deadline
   grEscalation?: boolean; // German Roach past its 14-day deadline (always urgent)
+  requiredSkills?: string[]; // skills this stop's service type requires (e.g. "Wildlife")
   serviceDueCompletionCheck?: string;
   pendingCancel?: boolean;
   potentialCustomer?: boolean;

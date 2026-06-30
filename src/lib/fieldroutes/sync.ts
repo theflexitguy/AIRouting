@@ -24,6 +24,7 @@ import { normalizeServiceType } from "@/lib/job-id";
 import { calculateStopProductionValue } from "@/lib/production-value";
 import { deriveServiceLine, isInScopeForLine } from "@/lib/routing/service-line";
 import { computeDeadlineFlags } from "@/lib/routing/intervals";
+import { buildSkillCatalog, extractSkillRefs, resolveSkillNames } from "./skills";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
 import {
@@ -117,6 +118,7 @@ interface RunProgress {
   apptMap: Record<string, ApptInfo>;
   empNames: Record<string, string>;
   technicianEmpIds: string[];
+  requiredSkillsByServiceType: Record<string, string[]>;
   counts: {
     inScope: number;
     autoRoutable: number;
@@ -236,6 +238,7 @@ async function syncTechnicians(
   empNames: Record<string, string>,
   servingEmployeeIds: Set<string>,
   now: string,
+  empSkills: Record<string, string[]> = {},
 ): Promise<{ empToTech: Map<string, string>; nameToTech: Map<string, string> }> {
   const existingSnap = await db.collection(`companies/${companyId}/technicians`).get();
   const byEmpId = new Map<string, string>();
@@ -273,6 +276,9 @@ async function syncTechnicians(
       fieldRoutesEmployeeId: empId,
       fieldRoutesTechId: empId,
       source: "fieldroutes",
+      // Skills assigned to this tech in FieldRoutes (e.g. "Termite", "Wildlife",
+      // "WI-I"). Phase 2 prep: not yet enforced in routing.
+      skillNames: empSkills[empId] || [],
       updatedAt: now,
     };
 
@@ -502,6 +508,7 @@ async function reconcileScheduledRoutes(
   technicianEmpIds: Set<string>,
   today: string,
   now: string,
+  empSkills: Record<string, string[]> = {},
 ): Promise<{ routesWritten: number; routesDeleted: number; techsLinked: number }> {
   interface SJob {
     id: string;
@@ -567,7 +574,7 @@ async function reconcileScheduledRoutes(
     }
   }
 
-  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, techServing, now);
+  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, techServing, now, empSkills);
   const resolveTechId = (j: SJob) =>
     empToTech.get(j.techEmpId) || nameToTech.get(normName(j.techName)) || "";
 
@@ -807,9 +814,15 @@ async function buildRunSetup(
   apptMap: Record<string, ApptInfo>;
   empNames: Record<string, string>;
   technicianEmpIds: string[];
-  employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean }>;
+  employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean; skillNames: string[] }>;
+  requiredSkillsByServiceType: Record<string, string[]>;
 }> {
   const ids = sortIds(await resolveSubscriptionIds(client, mode, cursor));
+
+  // Skill catalog (skillID -> name), when FieldRoutes exposes one. Shared by
+  // both employee and service-type skill resolution below. Best-effort: an
+  // empty map just means skill fields already carry human-readable labels.
+  const skillCatalog = await buildSkillCatalog(client);
 
   // Employees are few — fetch all once for name resolution.
   const employeeIds = await client.searchIds("employee", {});
@@ -819,7 +832,7 @@ async function buildRunSetup(
   // type). Used to keep office/sales staff out of the technician list. A roster
   // is persisted alongside so the actual type of every employee is inspectable.
   const technicianEmpIds = new Set<string>();
-  const employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean }> = [];
+  const employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean; skillNames: string[] }> = [];
   for (const e of employees) {
     const er = rec(e);
     const isTech = isTechnicianEmployee(er);
@@ -828,6 +841,7 @@ async function buildRunSetup(
       name: employeeName(er),
       type: employeeType(er),
       isTechnician: isTech,
+      skillNames: resolveSkillNames(extractSkillRefs(er), skillCatalog),
     });
     if (!isTech) continue;
     for (const raw of [er.employeeID, er.employeeId, er.roamingRep, er.linkedEmployeeIDs]) {
@@ -933,7 +947,32 @@ async function buildRunSetup(
     }
   }
 
-  return { ids, apptMap, empNames, technicianEmpIds: [...technicianEmpIds], employeeRoster };
+  // Required skills per service type (e.g. Wildlife Exclusion -> "Wildlife"),
+  // keyed by the normalized serviceType description — the same join key the
+  // per-subscription loop already has on hand (sub.serviceType), since that's
+  // the only field confirmed to line up between a subscription and the
+  // serviceType catalog (see /api/fieldroutes/service-types).
+  const requiredSkillsByServiceType: Record<string, string[]> = {};
+  try {
+    const serviceTypes = await client.searchWithData("serviceType");
+    for (const st of serviceTypes) {
+      const description = str(st.description);
+      if (!description) continue;
+      const skills = resolveSkillNames(extractSkillRefs(st), skillCatalog);
+      if (skills.length) requiredSkillsByServiceType[description.toLowerCase()] = skills;
+    }
+  } catch (err) {
+    console.warn("[fieldroutes/sync] serviceType skill pull failed (non-fatal):", String(err));
+  }
+
+  return {
+    ids,
+    apptMap,
+    empNames,
+    technicianEmpIds: [...technicianEmpIds],
+    employeeRoster,
+    requiredSkillsByServiceType,
+  };
 }
 
 export async function runSync(mode: SyncMode): Promise<SyncResult> {
@@ -1012,6 +1051,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   let apptMap: Record<string, ApptInfo>;
   let empNames: Record<string, string>;
   let technicianEmpIds: string[];
+  let requiredSkillsByServiceType: Record<string, string[]>;
   let offset: number;
   let cursor: string;
   let inScopeCount: number;
@@ -1029,6 +1069,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     apptMap = rec(prior.apptMap) as Record<string, ApptInfo>;
     empNames = rec(prior.empNames) as Record<string, string>;
     technicianEmpIds = Array.isArray(prior.technicianEmpIds) ? prior.technicianEmpIds.map(String) : [];
+    requiredSkillsByServiceType = rec(prior.requiredSkillsByServiceType) as Record<string, string[]>;
     offset = num(prior.offset);
     cursor = str(prior.cursor) || priorCursor;
     inScopeCount = num(prior.counts?.inScope);
@@ -1044,9 +1085,11 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       apptMap = setup.apptMap;
       empNames = setup.empNames;
       technicianEmpIds = setup.technicianEmpIds;
-      // Persist the full employee roster (id, name, type, isTechnician) so the
-      // role-based technician filter is auditable — if a real tech is missing,
-      // their actual `type` is visible here.
+      requiredSkillsByServiceType = setup.requiredSkillsByServiceType;
+      // Persist the full employee roster (id, name, type, isTechnician, skillNames)
+      // so the role-based technician filter is auditable — if a real tech is
+      // missing, their actual `type` is visible here. Technician docs are linked
+      // to this roster every sync pass via reconcileScheduledRoutes/syncTechnicians.
       await db.doc(`companies/${companyId}/fieldRoutesState/employeeRoster`).set(
         {
           employees: setup.employeeRoster,
@@ -1315,6 +1358,10 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         serviceTypeNormalized: normalizeServiceType(serviceType),
         subscriptionCategory: deriveCategory(serviceType),
         category: deriveCategory(serviceType),
+        // Skills this stop's service type requires (e.g. Wildlife Exclusion ->
+        // "Wildlife"). Phase 2 prep: not yet enforced anywhere, just stamped so
+        // routing can match against a technician's skillNames once it's wired up.
+        requiredSkills: requiredSkillsByServiceType[serviceType.toLowerCase()] || [],
         duration: serviceDuration,
         status,
         // Routing-relevant assignment fields:
@@ -1411,9 +1458,21 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
 
   // Reconcile scheduled routes after every sync pass (incremental or full) so
   // Today's Routes on the dashboard always reflects the current FieldRoutes state.
-  // Derived from current Firestore job state — zero API cost.
+  // Derived from current Firestore job state — zero API cost. Re-read the
+  // persisted employee roster (written once per fresh run) for technician skill
+  // names so they get linked onto technician docs every pass, not just the first.
   try {
-    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now);
+    const empSkills: Record<string, string[]> = {};
+    const rosterSnap = await db.doc(`companies/${companyId}/fieldRoutesState/employeeRoster`).get();
+    const rosterEmployees = rosterSnap.exists ? (rosterSnap.data()?.employees as unknown[]) : [];
+    if (Array.isArray(rosterEmployees)) {
+      for (const e of rosterEmployees) {
+        const er = rec(e);
+        const id = str(er.employeeId);
+        if (id && Array.isArray(er.skillNames)) empSkills[id] = er.skillNames.map(String);
+      }
+    }
+    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now, empSkills);
     console.log(
       `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
         `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
@@ -1448,6 +1507,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       apptMap,
       empNames,
       technicianEmpIds,
+      requiredSkillsByServiceType,
       counts: {
         inScope: inScopeCount,
         autoRoutable: autoRoutableCount,
