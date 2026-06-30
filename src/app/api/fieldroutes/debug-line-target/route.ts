@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
@@ -51,12 +51,11 @@ interface LineAgg {
   driftFlag: boolean; // live target vs stored target differ by >5%
 }
 
-export async function POST(request: Request) {
+async function handle(companyIdParam: string | undefined) {
   try {
-    const body = (await request.json().catch(() => ({}))) as { companyId?: string };
     const db = adminDb();
 
-    let companyId = body.companyId && body.companyId !== "YOUR_COMPANY_ID" ? body.companyId : "";
+    let companyId = companyIdParam && companyIdParam !== "YOUR_COMPANY_ID" ? companyIdParam : "";
     if (!companyId) {
       const companies = await db.collection("companies").limit(5).get();
       if (companies.empty) return NextResponse.json({ error: "No company docs found" }, { status: 404 });
@@ -276,4 +275,14 @@ export async function POST(request: Request) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json().catch(() => ({}))) as { companyId?: string };
+  return handle(body.companyId);
+}
+
+export async function GET(request: NextRequest) {
+  const companyId = new URL(request.url).searchParams.get("companyId") || undefined;
+  return handle(companyId);
 }
