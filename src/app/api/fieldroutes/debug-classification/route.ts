@@ -16,12 +16,25 @@ const isInitialLabel = (s: string) => /initial/i.test(s);
 
 export async function POST(request: Request) {
   try {
-    const { companyId } = (await request.json()) as { companyId?: string };
-    if (!companyId) {
-      return NextResponse.json({ error: "companyId is required" }, { status: 400 });
-    }
-
+    const body = (await request.json().catch(() => ({}))) as { companyId?: string };
     const db = adminDb();
+
+    // companyId is optional: when omitted, auto-detect the only company doc so
+    // this read-only diagnostic can be run with an empty body from the browser.
+    let companyId = body.companyId && body.companyId !== "YOUR_COMPANY_ID" ? body.companyId : "";
+    if (!companyId) {
+      const companies = await db.collection("companies").limit(5).get();
+      if (companies.empty) {
+        return NextResponse.json({ error: "No company docs found" }, { status: 404 });
+      }
+      if (companies.size > 1) {
+        return NextResponse.json(
+          { error: "Multiple companies — pass companyId", companyIds: companies.docs.map((d) => d.id) },
+          { status: 400 },
+        );
+      }
+      companyId = companies.docs[0].id;
+    }
     const today = centralTodayISO();
     const monthStart = `${today.slice(0, 7)}-01`;
 
