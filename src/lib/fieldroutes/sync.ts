@@ -24,7 +24,13 @@ import { normalizeServiceType } from "@/lib/job-id";
 import { calculateStopProductionValue } from "@/lib/production-value";
 import { deriveServiceLine, isInScopeForLine } from "@/lib/routing/service-line";
 import { computeDeadlineFlags } from "@/lib/routing/intervals";
-import { buildSkillCatalog, extractSkillRefs, resolveSkillNames } from "./skills";
+import {
+  extractSkillRefs,
+  resolveSkillNames,
+  fetchSkillCatalogRows,
+  skillCatalogIdToName,
+  requiredSkillsByServiceTypeDescription,
+} from "./skills";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
 import {
@@ -819,10 +825,14 @@ async function buildRunSetup(
 }> {
   const ids = sortIds(await resolveSubscriptionIds(client, mode, cursor));
 
-  // Skill catalog (skillID -> name), when FieldRoutes exposes one. Shared by
-  // both employee and service-type skill resolution below. Best-effort: an
-  // empty map just means skill fields already carry human-readable labels.
-  const skillCatalog = await buildSkillCatalog(client);
+  // Skill catalog: { skillID, name, serviceTypeIds[] } rows, when FieldRoutes
+  // exposes a `skill` module. Confirmed shape (debug-skills): the catalog
+  // carries the skill -> required-service-types link; the service type record
+  // itself has no skill field. Empty array if no catalog (e.g. another
+  // instance without the Skills feature) — everything below degrades to
+  // "no skills known yet", never an error.
+  const skillCatalogRows = await fetchSkillCatalogRows(client);
+  const skillCatalog = skillCatalogIdToName(skillCatalogRows);
 
   // Employees are few — fetch all once for name resolution.
   const employeeIds = await client.searchIds("employee", {});
@@ -947,20 +957,23 @@ async function buildRunSetup(
     }
   }
 
-  // Required skills per service type (e.g. Wildlife Exclusion -> "Wildlife"),
+  // Required skills per service type (e.g. Wildlife Exclusion -> "Wild Life"),
   // keyed by the normalized serviceType description — the same join key the
-  // per-subscription loop already has on hand (sub.serviceType), since that's
-  // the only field confirmed to line up between a subscription and the
-  // serviceType catalog (see /api/fieldroutes/service-types).
-  const requiredSkillsByServiceType: Record<string, string[]> = {};
+  // per-subscription loop already has on hand (sub.serviceType). The skill ->
+  // service-type link lives on the skill catalog row's serviceTypeIds (the
+  // service type record itself carries no skill field — confirmed via
+  // /api/fieldroutes/debug-skills), so build a typeID -> description map from
+  // the serviceType catalog and resolve through that.
+  let requiredSkillsByServiceType: Record<string, string[]> = {};
   try {
     const serviceTypes = await client.searchWithData("serviceType");
+    const typeIdToDescription = new Map<string, string>();
     for (const st of serviceTypes) {
+      const typeId = str(st.typeID);
       const description = str(st.description);
-      if (!description) continue;
-      const skills = resolveSkillNames(extractSkillRefs(st), skillCatalog);
-      if (skills.length) requiredSkillsByServiceType[description.toLowerCase()] = skills;
+      if (typeId && description) typeIdToDescription.set(typeId, description);
     }
+    requiredSkillsByServiceType = requiredSkillsByServiceTypeDescription(skillCatalogRows, typeIdToDescription);
   } catch (err) {
     console.warn("[fieldroutes/sync] serviceType skill pull failed (non-fatal):", String(err));
   }

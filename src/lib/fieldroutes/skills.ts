@@ -1,18 +1,15 @@
-// FieldRoutes Skills extraction — adaptive, not hardcoded to one field name.
+// FieldRoutes Skills extraction — confirmed against live data via
+// /api/fieldroutes/debug-skills:
+//   - employee.skills: string[] (skillIDs; empty until the office assigns one)
+//   - the `skill` module is a real catalog: { skillID, name, serviceIDs[], productIDs[] }
+//   - the LINK to service types is on the SKILL record's serviceIDs array
+//     (skill -> which service types need it), NOT a field on the service type
+//     itself — service type entities carry no skill-ish field at all.
 //
-// FieldRoutes' Skills feature assigns skills to technicians (e.g. "Termite",
-// "Wildlife", "WI-I") and required skills to service types (e.g. the Wildlife
-// Exclusion service type requires the Wildlife skill). The exact field name(s)
-// FieldRoutes uses to carry this on the employee/serviceType entities hasn't
-// been confirmed against live data (see /api/fieldroutes/debug-skills), so
-// rather than hardcode a guess that could silently miss the real field (and
-// break skill-aware routing without anyone noticing), every entity is scanned
-// for ANY key that looks skill-related and every plausible value shape
-// (array, comma/semicolon list, nested {name,id} object, plain scalar) is
-// normalized into a flat list of refs. This is intentionally permissive: a
-// false-positive key just adds a harmless extra "skill" string; a missed key
-// just means that skill doesn't show up yet (safe default — Phase 2 routing
-// must be a deliberate follow-up before this gates an actual assignment).
+// extractSkillRefs() stays adaptive (scans any skill-ish key) so it keeps
+// working if FieldRoutes adds a differently-named field later or another
+// instance's employee shape differs slightly; the skill-catalog functions
+// below encode the confirmed skill -> serviceIDs join direction.
 
 const isSkillKey = (key: string): boolean => /skill/i.test(key);
 
@@ -49,27 +46,58 @@ export function extractSkillRefs(entity: Record<string, unknown>): string[] {
   return Array.from(out);
 }
 
-/**
- * Best-effort skillID -> name catalog from a dedicated `skill` module, when
- * FieldRoutes exposes one. Returns an empty map (not an error) when it doesn't —
- * callers then use the raw refs as-is, which is correct when skill fields
- * already carry human-readable labels directly on the entity.
- */
-export async function buildSkillCatalog(
-  client: { searchWithData: (module: string, filters?: Record<string, unknown>) => Promise<Record<string, unknown>[]> },
-): Promise<Map<string, string>> {
-  const catalog = new Map<string, string>();
+export interface SkillCatalogRow {
+  id: string;
+  name: string;
+  serviceTypeIds: string[]; // FieldRoutes service-type IDs this skill applies to
+}
+
+type SearchClient = { searchWithData: (module: string, filters?: Record<string, unknown>) => Promise<Record<string, unknown>[]> };
+
+/** Best-effort full skill catalog: { skillID, name, serviceIDs[] } rows. Empty array if FieldRoutes exposes no `skill` module. */
+export async function fetchSkillCatalogRows(client: SearchClient): Promise<SkillCatalogRow[]> {
   try {
     const rows = await client.searchWithData("skill");
-    for (const r of rows) {
-      const id = String(r.skillID ?? r.id ?? r.skillId ?? "").trim();
-      const name = String(r.name ?? r.description ?? r.title ?? "").trim();
-      if (id && name) catalog.set(id, name);
-    }
+    return rows
+      .map((r) => ({
+        id: String(r.skillID ?? r.id ?? r.skillId ?? "").trim(),
+        name: String(r.name ?? r.description ?? r.title ?? "").trim(),
+        serviceTypeIds: Array.isArray(r.serviceIDs)
+          ? Array.from(new Set((r.serviceIDs as unknown[]).map((v) => String(v).trim()).filter((v) => v && v !== "0")))
+          : [],
+      }))
+      .filter((r) => r.id && r.name);
   } catch {
-    // No dedicated skill catalog endpoint — fine, refs are used as-is.
+    return [];
   }
-  return catalog;
+}
+
+/** skillID -> name, from catalog rows. */
+export function skillCatalogIdToName(rows: SkillCatalogRow[]): Map<string, string> {
+  return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+/**
+ * normalized service-type description -> required skill names, built from the
+ * catalog's skill -> serviceTypeIds linkage. typeIdToDescription maps a
+ * FieldRoutes serviceType typeID to its description (the join key the rest of
+ * the app already uses between a subscription and its service type).
+ */
+export function requiredSkillsByServiceTypeDescription(
+  rows: SkillCatalogRow[],
+  typeIdToDescription: Map<string, string>,
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const skill of rows) {
+    for (const typeId of skill.serviceTypeIds) {
+      const description = typeIdToDescription.get(typeId);
+      if (!description) continue;
+      const key = description.toLowerCase();
+      const list = out[key] || (out[key] = []);
+      if (!list.includes(skill.name)) list.push(skill.name);
+    }
+  }
+  return out;
 }
 
 /** Resolve refs (IDs or already-human-readable labels) to display names, deduped + sorted. */
