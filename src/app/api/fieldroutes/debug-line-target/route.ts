@@ -108,10 +108,12 @@ export async function POST(request: Request) {
       const charge = num(sr.recurringCharge);
       const frequency = num(sr.frequency);
       if (onHold !== 0) onHoldCount++;
-      if (!(charge > 0)) noChargeCount++;
+      if (!(charge > 0)) noChargeCount++; // reported for visibility; $0 is NOT excluded
       if (!(frequency > 0)) nonRecurringCount++;
 
-      const subInScope = onHold === 0 && charge > 0 && frequency > 0;
+      // Scope = active + recurring + not on hold. A $0 recurring charge (e.g. an
+      // Outdoor Package bundled into General Pest) still counts.
+      const subInScope = onHold === 0 && frequency > 0;
       if (!subInScope) continue;
       inScope++;
 
@@ -143,15 +145,15 @@ export async function POST(request: Request) {
       activeSubscriptionsInLine: activeInLine,
       droppedToInScope: {
         onHold: onHoldCount,
-        noRecurringCharge: noChargeCount,
         nonRecurringFrequency: nonRecurringCount,
         inScope,
       },
+      zeroChargeIncluded: noChargeCount, // active $0 subs (e.g. bundled) — counted, not dropped
       seasonality: { seasonalCount, offSeasonThisMonth, countedThisMonth: inScope - offSeasonThisMonth },
       expectedMonthlyTarget: Math.round(expectedTarget),
       byFrequencyDays: byFrequency,
       byServiceType,
-      note: "active = all active subs in this line; inScope = active & charged & recurring; target = sum(30.4/intervalDays) over in-scope, in-season subs.",
+      note: "active = all active subs in this line; inScope = active & recurring & not on hold ($0 price counts); target = sum(30.4/intervalDays) over in-scope, in-season subs.",
       apiReads: client.readCount,
     });
   } catch (err) {

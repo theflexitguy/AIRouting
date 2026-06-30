@@ -121,13 +121,14 @@ export interface ScopeInput {
  * Default scope predicate — kept as a single named function so it's easy to adjust.
  * "Recurring" is part of scope: frequency > 0 excludes One-Time (-1) and As Needed (0),
  * so they never reach the overdue metric or routing.
+ *
+ * NOTE: a $0 recurring charge is NOT disqualifying. Some active subscriptions are
+ * priced at $0 on purpose — e.g. an Outdoor Package whose cost is bundled into the
+ * customer's General Pest service. Those are real recurring work that must still be
+ * counted and routed, so scope is active + recurring + not on hold, price aside.
  */
 export function isInScope(input: ScopeInput): boolean {
-  return (
-    num(input.onHold) === 0 &&
-    num(input.recurringCharge) > 0 &&
-    num(input.frequency) > 0
-  );
+  return num(input.onHold) === 0 && num(input.frequency) > 0;
 }
 
 /** True only for genuinely recurring subscriptions (frequency in days, > 0). */
