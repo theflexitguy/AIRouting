@@ -13,14 +13,17 @@ import { DatePicker } from "@/components/ui/date-picker";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { formatTime } from "@/lib/utils";
 import { formatCurrency } from "@/lib/production-value";
+import { deriveServiceLine } from "@/lib/routing/service-line";
+import type { MonthlyDone } from "@/lib/fieldroutes/monthly-done";
 import {
   stopsPerRoute,
   stopsPerHour,
   avgDriveTime,
-  monthlyServiceTarget,
   monthlyServiced,
-  monthlyPace,
   weeklyPace,
+  monthlyTargetsByLine,
+  isTrackedServiceLine,
+  type LineTarget,
   MONTH_WORKING_DAYS,
   meetsTarget,
   STOPS_PER_ROUTE_TARGET,
@@ -87,6 +90,7 @@ interface DashboardStats {
   todayStopsPerHour: number | null;
   overdueStops: number;
   weekKpis: WeekKpis;
+  lineTargets: LineTarget[];
   monthlyTarget: number;
   weeklyTarget: number;
   dailyTarget: number;
@@ -107,6 +111,8 @@ interface RouteRec extends RouteLike {
 interface JobRec extends JobLike {
   status?: string;
   overdueActionable?: boolean;
+  serviceType?: string;
+  fieldRoutesRouteGroup?: string;
 }
 interface TechOption {
   id: string;
@@ -117,6 +123,14 @@ interface TechOption {
 }
 
 const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+
+// Lines shown in the Initials breakdown (new-signup first services).
+const INITIAL_LINE_LABELS: Array<{ key: string; label: string }> = [
+  { key: "general", label: "GP" },
+  { key: "mosquito", label: "Mosq" },
+  { key: "termite", label: "Term" },
+  { key: "commercial", label: "Comm" },
+];
 
 // Does a route belong to the selected technician? Routes carry techId/techName;
 // match against any of the tech's known identifiers.
@@ -136,6 +150,7 @@ export default function DashboardPage() {
   const [rawJobs, setRawJobs] = useState<JobRec[]>([]); // inScope subscriptions
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [groupOptions, setGroupOptions] = useState<string[]>([]);
+  const [monthlyDone, setMonthlyDone] = useState<MonthlyDone | null>(null);
 
   // Filters
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
@@ -180,7 +195,19 @@ export default function DashboardPage() {
       const jobsSnap = await getDocs(
         query(collection(db, `companies/${companyId}/jobs`), where("inScope", "==", true))
       );
-      setRawJobs(jobsSnap.docs.map(d => d.data() as JobRec));
+      // Derive serviceLine on the fly when a doc predates the Phase-1 stamping, so
+      // the per-line targets populate without waiting on a full re-sync.
+      setRawJobs(jobsSnap.docs.map(d => {
+        const data = d.data() as JobRec;
+        if (!data.serviceLine) {
+          data.serviceLine = deriveServiceLine(data.serviceType, data.fieldRoutesRouteGroup);
+        }
+        return data;
+      }));
+
+      // Cached completed-this-month aggregate (Initials / Specialty / Wildlife).
+      const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
+      setMonthlyDone(mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
       setTechs(techSnap.docs.map(d => {
@@ -270,12 +297,17 @@ export default function DashboardPage() {
       rawJobs.filter(j => j.overdueActionable).map(j => String(j.customerId))
     ).size;
 
-    const monthlyTarget = monthlyServiceTarget(rawJobs, bounds.monthIndex);
-    const monthlyDone = monthlyServiced(rawJobs, bounds.monthStart, today);
-    const pace = monthlyPace(monthlyTarget, monthlyDone, today);
+    // Per-service-line monthly targets (General Pest / Mosquito / Lawn / Termite /
+    // Commercial) plus a combined Total. GR + Wildlife are excluded (one-time /
+    // auto-scheduled). Weekly + Daily derive from the tracked-line Total.
+    const lineTargets = monthlyTargetsByLine(rawJobs, bounds.monthIndex, bounds.monthStart, today);
+    const totalRow = lineTargets[lineTargets.length - 1];
+    const monthlyTarget = totalRow.target;
+    const pace = totalRow.pace;
     const weeklyTarget = Math.round(monthlyTarget / 4);
     const dailyTarget = Math.round(monthlyTarget / MONTH_WORKING_DAYS);
-    const weeklyDone = monthlyServiced(rawJobs, bounds.weekStart, today);
+    const trackedJobs = rawJobs.filter(j => isTrackedServiceLine(String(j.serviceLine ?? "")));
+    const weeklyDone = monthlyServiced(trackedJobs, bounds.weekStart, today);
     const weekPace = weeklyPace(weeklyTarget, weeklyDone, bounds.weekStart, today);
 
     const weekKpis: WeekKpis = {
@@ -322,6 +354,7 @@ export default function DashboardPage() {
       todayStopsPerHour: stopsPerHour(todaySet),
       overdueStops,
       weekKpis,
+      lineTargets,
       monthlyTarget,
       weeklyTarget,
       dailyTarget,
@@ -353,8 +386,6 @@ export default function DashboardPage() {
     { title: "Avg Drive Time", value: stats.weekKpis.avgDriveTime === null ? "—" : `${Math.round(stats.weekKpis.avgDriveTime)}m`, target: `< ${DRIVE_TIME_TARGET}m`, ok: meetsTarget(stats.weekKpis.avgDriveTime, DRIVE_TIME_TARGET, true) },
   ];
 
-  const monthDonePct = Math.round(stats.pace.donePct * 100);
-  const monthProgressPct = Math.round(stats.pace.progressPct * 100);
   const weekDonePct = Math.round(stats.weekPace.donePct * 100);
   const weekProgressPct = Math.round(stats.weekPace.progressPct * 100);
 
@@ -481,32 +512,41 @@ export default function DashboardPage() {
               })}
             </div>
 
-            {/* TARGETS — seasonality-aware service targets + pace (company-wide) */}
+            {/* TARGETS — seasonality-aware monthly service targets per service line */}
             <div className="flex items-center justify-between pt-2">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Service Targets</p>
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Monthly Targets by Service</p>
               <p className="text-xs text-muted-foreground/50">{format(parseISO(today), "MMMM")} · company-wide</p>
             </div>
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              {/* Monthly target with done + pace */}
-              <Card className="border-border/40 animate-fade-in lg:col-span-1">
-                <CardContent className="p-5 space-y-3">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <p className="text-[13px] text-muted-foreground font-medium">Monthly Target</p>
-                      <p className="text-3xl font-bold text-foreground tracking-tight">{stats.monthlyTarget.toLocaleString()}</p>
-                      <p className="text-xs text-muted-foreground/70">{stats.pace.done.toLocaleString()} done · {stats.pace.remaining.toLocaleString()} left</p>
-                    </div>
-                    <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400"><Target className="w-4 h-4" /></div>
-                  </div>
-                  <div className="space-y-1">
-                    <Progress value={Math.min(100, monthDonePct)} className="h-2" />
-                    <p className={`text-xs ${stats.pace.ahead ? "text-emerald-400" : "text-red-400"}`}>
-                      {monthDonePct}% of target · {monthProgressPct}% through month · {stats.pace.ahead ? "on/ahead of pace" : "behind pace"}
-                    </p>
-                  </div>
-                </CardContent>
-              </Card>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {stats.lineTargets.map((lt) => {
+                const donePct = Math.round(lt.pace.donePct * 100);
+                const progressPct = Math.round(lt.pace.progressPct * 100);
+                const isTotal = lt.line === "total";
+                return (
+                  <Card key={lt.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
+                    <CardContent className="p-5 space-y-3">
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <p className="text-[13px] text-muted-foreground font-medium">{isTotal ? "Total (All)" : lt.label}</p>
+                          <p className="text-3xl font-bold text-foreground tracking-tight">{lt.target.toLocaleString()}</p>
+                          <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {lt.pace.remaining.toLocaleString()} left</p>
+                        </div>
+                        <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
+                      </div>
+                      <div className="space-y-1">
+                        <Progress value={Math.min(100, donePct)} className="h-2" />
+                        <p className={`text-xs ${lt.pace.ahead ? "text-emerald-400" : "text-red-400"}`}>
+                          {donePct}% of target · {progressPct}% through month · {lt.pace.ahead ? "on/ahead of pace" : "behind pace"}
+                        </p>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+            </div>
 
+            {/* Weekly + Daily — derived from the tracked-line Total */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               {/* Weekly target — with the same %-of-target pace as Monthly */}
               <Card className="border-border/40 animate-fade-in">
                 <CardContent className="p-5 space-y-3">
@@ -541,6 +581,73 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
             </div>
+
+            {/* COMPLETED THIS MONTH — Initials / Specialty / Wildlife (from completed appointments) */}
+            <div className="flex items-center justify-between pt-2">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Completed This Month</p>
+              <p className="text-xs text-muted-foreground/50">
+                {monthlyDone
+                  ? `${monthlyDone.completedAppointments.toLocaleString()} appts · updated ${format(parseISO(monthlyDone.computedAt), "MMM d")}`
+                  : "not yet computed"}
+              </p>
+            </div>
+            {monthlyDone ? (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                {/* Initials with per-line breakdown */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5 space-y-2">
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <p className="text-[13px] text-muted-foreground font-medium">Initials</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.initialsTotal ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">new-signup first services</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-400"><TrendingUp className="w-4 h-4" /></div>
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground/70">
+                      {INITIAL_LINE_LABELS.map(({ key, label }) => (
+                        <span key={key}>{label} <span className="text-foreground font-medium tabular-nums">{monthlyDone.initialsByLine?.[key] ?? 0}</span></span>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Specialty (GR + one-time / flea / misc) */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[13px] text-muted-foreground font-medium">Specialty</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.specialtyDone ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">German Roach · flea · one-time · misc</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-amber-500/10 text-amber-400"><Activity className="w-4 h-4" /></div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Wildlife */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[13px] text-muted-foreground font-medium">Wildlife</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.wildlifeDone ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">exclusion &amp; wildlife work</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-rose-500/10 text-rose-400"><Briefcase className="w-4 h-4" /></div>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            ) : (
+              <Card className="border-border/40">
+                <CardContent className="p-4 text-xs text-muted-foreground/70">
+                  Initials, Specialty, and Wildlife counts come from completed appointments. Run the monthly aggregate
+                  (POST <span className="font-mono">/api/fieldroutes/monthly-done</span>) to populate this section.
+                </CardContent>
+              </Card>
+            )}
 
             {/* Jobs Due This Week chart */}
             <Card className="border-border/40 animate-fade-in">

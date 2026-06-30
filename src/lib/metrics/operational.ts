@@ -3,6 +3,7 @@
 // are AUTO-COMPUTED from data we already pull — there is no manual weekly logging.
 
 import { parseFrequencyDays } from "@/lib/production-value";
+import { serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
 
 /** Minimal shape of a route doc this module needs. */
 export interface RouteLike {
@@ -25,6 +26,7 @@ export interface JobLike {
   isSeasonal?: boolean;
   seasonalStartMonth?: number | null; // 1–12
   seasonalEndMonth?: number | null;
+  serviceLine?: string; // general | gr | termite | lawn | mosquito | commercial | wildlife
 }
 
 // Assume 20 working days in a service month (owner's standard).
@@ -143,6 +145,12 @@ export function meetsTarget(
 function jobFrequencyDays(j: JobLike): number {
   const raw = Number(j.frequency);
   if (Number.isFinite(raw) && raw > 0) return raw;
+  // A negative frequency is a FieldRoutes placeholder (e.g. -4 for plan-scheduled
+  // lawn rounds). Don't parse the bogus "Every -4 Days" label — use the service
+  // line's default interval (lawn = annual per round) so the target isn't inflated.
+  if (Number.isFinite(raw) && raw < 0) {
+    return serviceLineMeta((j.serviceLine as ServiceLine) || "general").defaultIntervalDays;
+  }
   const parsed = parseFrequencyDays(j.recurringFrequency);
   return parsed && parsed > 0 ? parsed : 0;
 }
@@ -251,4 +259,58 @@ export function monthlyPace(target: number, done: number, today: string): PaceRe
 /** Pace toward the weekly target vs % through the work-week (5 working days). */
 export function weeklyPace(target: number, done: number, weekStart: string, today: string): PaceResult {
   return paceOf(target, done, workingDaysInRange(weekStart, today), WEEK_WORKING_DAYS);
+}
+
+// Service lines tracked as their own monthly targets on the dashboard. German
+// Roach and Wildlife are intentionally excluded — those are one-time / auto-
+// scheduled in FieldRoutes, not part of the recurring monthly book of business.
+export const TARGET_SERVICE_LINES = ["general", "mosquito", "lawn", "termite", "commercial"] as const;
+export type TargetServiceLine = (typeof TARGET_SERVICE_LINES)[number];
+
+export const TARGET_SERVICE_LINE_LABELS: Record<TargetServiceLine, string> = {
+  general: "General Pest",
+  mosquito: "Mosquito",
+  lawn: "Lawn",
+  termite: "Termite",
+  commercial: "Commercial",
+};
+
+const lineOf = (j: JobLike): string => String(j.serviceLine ?? "");
+
+/** True when a service line is one of the tracked monthly-target lines. */
+export function isTrackedServiceLine(line: string): boolean {
+  return (TARGET_SERVICE_LINES as readonly string[]).includes(line);
+}
+
+export interface LineTarget {
+  line: TargetServiceLine | "total";
+  label: string;
+  target: number;
+  done: number;
+  pace: PaceResult;
+}
+
+/**
+ * Per-service-line monthly targets + pace, plus a combined Total over the tracked
+ * lines. Each line uses the same seasonality-aware target math as the company-wide
+ * number, scoped to that line's subscriptions. Mosquito here includes Outdoor /
+ * Boat Docks (they share the "mosquito" service line). GR and Wildlife are excluded.
+ */
+export function monthlyTargetsByLine(
+  jobs: JobLike[],
+  month: number,
+  monthStart: string,
+  today: string,
+): LineTarget[] {
+  const rows: LineTarget[] = TARGET_SERVICE_LINES.map((line) => {
+    const lineJobs = jobs.filter((j) => lineOf(j) === line);
+    const target = monthlyServiceTarget(lineJobs, month);
+    const done = monthlyServiced(lineJobs, monthStart, today);
+    return { line, label: TARGET_SERVICE_LINE_LABELS[line], target, done, pace: monthlyPace(target, done, today) };
+  });
+  const tracked = jobs.filter((j) => isTrackedServiceLine(lineOf(j)));
+  const target = monthlyServiceTarget(tracked, month);
+  const done = monthlyServiced(tracked, monthStart, today);
+  rows.push({ line: "total", label: "Total", target, done, pace: monthlyPace(target, done, today) });
+  return rows;
 }

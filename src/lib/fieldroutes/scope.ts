@@ -3,7 +3,8 @@
 // Non-negotiable rules (see build brief §3–4):
 //  - "Today" is America/Chicago, DST-safe. Never use a UTC server date.
 //  - in_scope        = onHold == 0 && recurringCharge > 0 && frequency > 0 (recurring only)
-//  - balance_ok      = customer_balance <= 149
+//  - balance_ok      = customer_balance <= BALANCE_GATE (default 420; the Flex
+//                      "do not schedule" hard stop — Sensei Office 101 / v1 Job Pool)
 //  - has_constraint  = special_scheduling is non-empty
 //  - already_scheduled = a future appointment exists for THIS subscription_id
 //
@@ -15,11 +16,14 @@
 //  - A subscription serviced (lastCompleted) on/after its service_due is NOT past
 //    due — that completion rolls the next due date forward (handled in sync via
 //    serviceDueAlreadyCompleted).
-//  - The $149 balance cap (and special-scheduling constraint) excludes a stop from
+//  - The balance cap (and special-scheduling constraint) excludes a stop from
 //    the Pending / Past Due *counts* and from routing, but the stop still appears
 //    in the Jobs tab (status "review") so it can be audited and addressed.
 
-export const BALANCE_GATE = 149;
+// Customer balance (dollars) at/above which a stop is NOT scheduled. Flex's hard
+// "do not schedule" line is $420 (Sensei Office 101 / v1 Job Pool). Overridable
+// per company via Routing Settings (companies/{id}.routingBalanceGate).
+export const BALANCE_GATE = 420;
 
 /** Half-width of the "due soon / Pending" window, in days, on either side of today. */
 export const WINDOW_DAYS = 30;
@@ -140,6 +144,10 @@ export interface JobFlagsInput {
   pendingCancel: boolean;
   potentialCustomer: boolean;
   today: string; // YYYY-MM-DD (Central)
+  // Optional Routing-Settings overrides. When omitted, the module defaults apply.
+  balanceGate?: number; // overrides BALANCE_GATE (dollars)
+  customerBalanceAgeDays?: number; // how long the balance has been outstanding
+  balanceAgeGate?: number; // max allowed balance age in days; 0/undefined = unenforced
 }
 
 export interface JobFlags {
@@ -175,7 +183,16 @@ export function computeFlags(input: JobFlagsInput): JobFlags {
   // Dates more than 30 days in the FUTURE are not yet relevant.
   const relevant = pastDue30 || dueSoon;
 
-  const balanceOk = input.customerBalance <= BALANCE_GATE;
+  // Balance gate: amount under the cap AND (when an age limit is configured and a
+  // positive age is known) not past the allowed days-outstanding. Age is only
+  // enforced when both a gate and a known age are present, so it's a no-op until
+  // the balance-age field is synced.
+  const gate = typeof input.balanceGate === "number" && input.balanceGate > 0 ? input.balanceGate : BALANCE_GATE;
+  const ageGate = typeof input.balanceAgeGate === "number" && input.balanceAgeGate > 0 ? input.balanceAgeGate : 0;
+  const age = typeof input.customerBalanceAgeDays === "number" ? input.customerBalanceAgeDays : 0;
+  const amountOk = input.customerBalance <= gate;
+  const ageOk = ageGate <= 0 || age <= 0 || age <= ageGate;
+  const balanceOk = amountOk && ageOk;
   const hasConstraint = input.specialScheduling.trim().length > 0;
 
   const excluded = input.pendingCancel || input.potentialCustomer;

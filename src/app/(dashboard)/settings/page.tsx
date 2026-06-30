@@ -50,6 +50,9 @@ export default function SettingsPage() {
   const [addingTech, setAddingTech] = useState(false);
   const [savingRouting, setSavingRouting] = useState(false);
   const [allowCrossTechRouteEdits, setAllowCrossTechRouteEdits] = useState(true);
+  // Routing Settings: customer-balance "do not schedule" gate (Flex default $420).
+  const [balanceGate, setBalanceGate] = useState("420");
+  const [balanceAgeDays, setBalanceAgeDays] = useState("");
   const [emailNotifications, setEmailNotifications] = useState(true);
   const [apiDailyCap, setApiDailyCap] = useState("");
   const [apiCapSaving, setApiCapSaving] = useState(false);
@@ -93,6 +96,8 @@ export default function SettingsPage() {
         setMosquitoServiceId(String(data.fieldRoutesMosquitoServiceId || ""));
         setOutdoorPackageServiceId(String(data.fieldRoutesOutdoorPackageServiceId || ""));
         setAllowCrossTechRouteEdits(data.allowCrossTechRouteEdits !== false);
+        setBalanceGate(data.routingBalanceGate ? String(data.routingBalanceGate) : "420");
+        setBalanceAgeDays(data.routingBalanceAgeDays ? String(data.routingBalanceAgeDays) : "");
         setApiDailyCap(data.fieldRoutesApiDailyCap ? String(data.fieldRoutesApiDailyCap) : "");
         if (data.fieldRoutesServiceIdMap && typeof data.fieldRoutesServiceIdMap === "object") {
           setServiceIdMap(
@@ -305,11 +310,12 @@ export default function SettingsPage() {
     if (!userProfile?.companyId) return;
     setSavingRouting(true);
     try {
-      await setDoc(
-        doc(db, "companies", userProfile.companyId),
-        { allowCrossTechRouteEdits },
-        { merge: true },
-      );
+      const gate = parseInt(balanceGate, 10);
+      const ageDays = parseInt(balanceAgeDays, 10);
+      const update: Record<string, unknown> = { allowCrossTechRouteEdits };
+      update.routingBalanceGate = Number.isFinite(gate) && gate > 0 ? gate : 420;
+      update.routingBalanceAgeDays = Number.isFinite(ageDays) && ageDays > 0 ? ageDays : 0;
+      await setDoc(doc(db, "companies", userProfile.companyId), update, { merge: true });
       toast.success("Routing settings saved");
     } catch (err) {
       console.error("Save routing settings error:", err);
@@ -668,6 +674,50 @@ export default function SettingsPage() {
           </TabsContent>
 
           <TabsContent value="routing" className="space-y-4">
+            <Card className="border-border/40">
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold">Scheduling Gates</CardTitle>
+                <CardDescription className="text-xs">
+                  Balance limits that decide whether a customer can be scheduled. Flex&apos;s hard
+                  &quot;do not schedule&quot; line is a $420 balance.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label className="text-sm">Balance cap ($)</Label>
+                    <Input
+                      value={balanceGate}
+                      onChange={(e) => setBalanceGate(e.target.value.replace(/[^0-9]/g, ""))}
+                      placeholder="420"
+                      inputMode="numeric"
+                      className="h-10 max-w-[160px]"
+                    />
+                    <p className="text-xs text-muted-foreground/50">
+                      At or above this balance, a stop is excluded from routing (shown as &quot;review&quot;).
+                    </p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-sm">Max balance age (days)</Label>
+                    <Input
+                      value={balanceAgeDays}
+                      onChange={(e) => setBalanceAgeDays(e.target.value.replace(/[^0-9]/g, ""))}
+                      placeholder="Optional"
+                      inputMode="numeric"
+                      className="h-10 max-w-[160px]"
+                    />
+                    <p className="text-xs text-muted-foreground/50">
+                      Optional. Blocks customers whose balance is older than this. Leave blank to disable.
+                    </p>
+                  </div>
+                </div>
+                <Button onClick={saveRoutingSettings} disabled={savingRouting} className="bg-blue-500 hover:bg-blue-600 text-white">
+                  {savingRouting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  Save Scheduling Gates
+                </Button>
+              </CardContent>
+            </Card>
+
             <Card className="border-border/40">
               <CardHeader>
                 <CardTitle className="text-sm font-semibold">Route Editing</CardTitle>
