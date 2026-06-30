@@ -22,7 +22,7 @@
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
 import { calculateStopProductionValue } from "@/lib/production-value";
-import { deriveServiceLine, isInScopeForLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, isInScopeForLine, lawnRoundSeasonalWindow } from "@/lib/routing/service-line";
 import { computeDeadlineFlags } from "@/lib/routing/intervals";
 import {
   extractSkillRefs,
@@ -1191,6 +1191,33 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     }
     const customerById = new Map(customers.map((c) => [str(rec(c).customerID), rec(c)]));
 
+    // Lawn "Round N" subscriptions are FieldRoutes servicePlanRound entities —
+    // a separate resource from the generic subscription record, carrying the
+    // REAL per-customer/per-cycle startDate/endDate/skipped status (confirmed
+    // via the FieldRoutes API reference). Fetch it for this batch's lawn rounds
+    // so the seasonal window reflects FieldRoutes' actual configured schedule
+    // instead of a hardcoded month table (used only as a fallback below).
+    const lawnRoundIds = subscriptions
+      .map((s) => rec(s))
+      .filter((sr) => deriveServiceLine(str(sr.serviceType)) === "lawn")
+      .map((sr) => str(sr.subscriptionID))
+      .filter(Boolean);
+    let servicePlanRounds: Record<string, unknown>[] = [];
+    if (lawnRoundIds.length) {
+      try {
+        servicePlanRounds = await client.getEntities("servicePlanRound", lawnRoundIds, {
+          idParam: "subscriptionIDs",
+        });
+      } catch (err) {
+        if (err instanceof FieldRoutesBudgetError) {
+          capped = true;
+          break;
+        }
+        console.warn("[fieldroutes/sync] servicePlanRound fetch failed (non-fatal, falling back to round-number table):", String(err));
+      }
+    }
+    const servicePlanRoundById = new Map(servicePlanRounds.map((r) => [str(rec(r).subscriptionID), rec(r)]));
+
     for (const subRaw of subscriptions) {
       const sub = rec(subRaw);
       const subscriptionId = str(sub.subscriptionID);
@@ -1218,8 +1245,19 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         const n = m ? Number(m[1]) : 0;
         return n >= 1 && n <= 12 ? n : null;
       };
-      const seasonalStartMonth = monthOf(seasonalStartDate);
-      const seasonalEndMonth = monthOf(seasonalEndDate);
+      // Lawn rounds don't carry a per-subscription season on FieldRoutes (that
+      // field is unset for them). Prefer the REAL per-cycle window from the
+      // servicePlanRound resource (startDate/endDate); fall back to the
+      // hardcoded round-number table only if that fetch failed or is missing.
+      const planRound = servicePlanRoundById.get(subscriptionId);
+      const planRoundStartMonth = planRound ? monthOf(toDateOnly(planRound.startDate)) : null;
+      const planRoundEndMonth = planRound ? monthOf(toDateOnly(planRound.endDate)) : null;
+      const lawnWindow =
+        planRoundStartMonth !== null && planRoundEndMonth !== null
+          ? { startMonth: planRoundStartMonth, endMonth: planRoundEndMonth }
+          : lawnRoundSeasonalWindow(serviceType);
+      const seasonalStartMonth = lawnWindow ? lawnWindow.startMonth : monthOf(seasonalStartDate);
+      const seasonalEndMonth = lawnWindow ? lawnWindow.endMonth : monthOf(seasonalEndDate);
       const isSeasonal = seasonalStartMonth !== null && seasonalEndMonth !== null;
       const customerBalance = num(customer.balance);
       const specialScheduling = str(customer.specialScheduling);

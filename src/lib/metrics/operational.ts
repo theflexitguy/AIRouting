@@ -146,10 +146,20 @@ function jobFrequencyDays(j: JobLike): number {
   const raw = Number(j.frequency);
   if (Number.isFinite(raw) && raw > 0) return raw;
   // A negative frequency is a FieldRoutes placeholder (e.g. -4 for plan-scheduled
-  // lawn rounds). Don't parse the bogus "Every -4 Days" label — use the service
-  // line's default interval (lawn = annual per round) so the target isn't inflated.
+  // lawn rounds). Don't parse the bogus "Every -4 Days" label.
   if (Number.isFinite(raw) && raw < 0) {
-    return serviceLineMeta((j.serviceLine as ServiceLine) || "general").defaultIntervalDays;
+    const line = (j.serviceLine as ServiceLine) || "general";
+    // Lawn rounds occur ONCE per year within their own ~6-week seasonal window
+    // (not continuously like a normal seasonal service) — a flat 365-day
+    // interval would only contribute ~1/6 of an occurrence across that short
+    // window. Scale the interval to the window length so the seasonal
+    // contribution (30.4/interval, summed over the window's active months)
+    // works out to ~1 occurrence/year, matching reality.
+    if (line === "lawn" && j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth) {
+      const windowMonths = j.seasonalEndMonth - j.seasonalStartMonth + 1;
+      if (windowMonths > 0) return windowMonths * AVG_DAYS_PER_MONTH;
+    }
+    return serviceLineMeta(line).defaultIntervalDays;
   }
   const parsed = parseFrequencyDays(j.recurringFrequency);
   return parsed && parsed > 0 ? parsed : 0;
