@@ -1580,7 +1580,9 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   if (done) {
     try {
       const md = await computeMonthlyDone(client, today);
+      // Legacy single-doc (current-month card) + per-month doc (history selector).
       await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(md.done);
+      await db.doc(`companies/${companyId}/monthlyDone/${md.done.month}`).set(md.done);
     } catch (err) {
       console.warn("[fieldroutes/sync] monthly-done refresh skipped:", String(err));
     }

@@ -7,18 +7,36 @@ import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { computeMonthlyDone } from "@/lib/fieldroutes/monthly-done";
+import { centralTodayISO } from "@/lib/fieldroutes/scope";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 const clean = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
-// Computes this month's completed-appointment aggregate (Initials / Specialty /
-// Wildlife / recurring done per line), caches it under
-// companies/{id}/fieldRoutesState/monthlyDone, and returns it + a verification
-// sample. companyId is optional when there's a single company doc.
-//   POST { companyId? }  or  GET ?companyId=...  (GET lets this be fetched
-//   directly — e.g. via a Vercel-protected-deployment fetch tool — without a
-//   JSON body).
-async function handle(companyIdParam: string | undefined) {
+// Computes completed-appointment aggregates (Initials / Specialty / Wildlife /
+// recurring done per line) and caches them per month under
+// companies/{id}/monthlyDone/{YYYY-MM} (plus the legacy current-month doc at
+// fieldRoutesState/monthlyDone). Powers the dashboard's history range selector.
+//   POST { companyId?, month?, months? } or GET ?companyId=&month=&months=
+//     month  = "YYYY-MM" to (re)compute a specific month (default: current)
+//     months = N to backfill the last N months (current + N-1 prior), capped 24
+// GET lets this be fetched directly (e.g. via a Vercel-protected fetch tool).
+
+/** The last N month keys (YYYY-MM) ending at `today`'s month, newest first. */
+function recentMonthKeys(today: string, n: number): string[] {
+  const m = /^(\d{4})-(\d{2})/.exec(today);
+  if (!m) return [today.slice(0, 7)];
+  let year = Number(m[1]);
+  let month = Number(m[2]); // 1-12
+  const keys: string[] = [];
+  for (let i = 0; i < n; i++) {
+    keys.push(`${year}-${String(month).padStart(2, "0")}`);
+    month--;
+    if (month === 0) { month = 12; year--; }
+  }
+  return keys;
+}
+
+async function handle(companyIdParam: string | undefined, monthParam?: string, monthsParam?: string) {
   try {
     const db = adminDb();
 
@@ -65,16 +83,45 @@ async function handle(companyIdParam: string | undefined) {
       return NextResponse.json({ error: "FieldRoutes API daily cap reached" }, { status: 429 });
     }
 
-    let result;
+    const today = centralTodayISO();
+    // Which months to compute: an explicit month, a backfill of the last N, or
+    // just the current month. Only backfill months not already cached (unless a
+    // specific month was requested, which always recomputes).
+    let monthsToCompute: string[];
+    const backfillN = Math.min(24, Math.max(0, Number(monthsParam) || 0));
+    if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
+      monthsToCompute = [monthParam];
+    } else if (backfillN > 0) {
+      const keys = recentMonthKeys(today, backfillN);
+      const existing = await Promise.all(
+        keys.map((k) => db.doc(`companies/${companyId}/monthlyDone/${k}`).get()),
+      );
+      // Always refresh the current month; only fill gaps for prior months.
+      monthsToCompute = keys.filter((k, i) => k === today.slice(0, 7) || !existing[i].exists);
+    } else {
+      monthsToCompute = [today.slice(0, 7)];
+    }
+
+    const results: Array<Record<string, unknown>> = [];
     try {
-      result = await computeMonthlyDone(client);
+      for (const mk of monthsToCompute) {
+        if (client.readCount >= budget.remaining) break; // out of budget — stop cleanly
+        const { done, sample } = await computeMonthlyDone(client, today, mk);
+        await db.doc(`companies/${companyId}/monthlyDone/${done.month}`).set(done);
+        if (done.month === today.slice(0, 7)) {
+          await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(done);
+        }
+        results.push(mk === monthsToCompute[0] ? { ...done, sample } : done);
+      }
     } finally {
       await recordApiUsage(db, companyId, { reads: client.readCount });
     }
 
-    await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(result.done, { merge: true });
-
-    return NextResponse.json({ ...result.done, sample: result.sample, apiReads: client.readCount });
+    return NextResponse.json({
+      computedMonths: results.map((r) => r.month),
+      results,
+      apiReads: client.readCount,
+    });
   } catch (err) {
     console.error("[fieldroutes/monthly-done] Error:", err);
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -83,11 +130,11 @@ async function handle(companyIdParam: string | undefined) {
 }
 
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as { companyId?: string };
-  return handle(body.companyId);
+  const body = (await request.json().catch(() => ({}))) as { companyId?: string; month?: string; months?: string | number };
+  return handle(body.companyId, body.month, body.months !== undefined ? String(body.months) : undefined);
 }
 
 export async function GET(request: NextRequest) {
-  const companyId = new URL(request.url).searchParams.get("companyId") || undefined;
-  return handle(companyId);
+  const params = new URL(request.url).searchParams;
+  return handle(params.get("companyId") || undefined, params.get("month") || undefined, params.get("months") || undefined);
 }

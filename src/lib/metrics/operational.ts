@@ -366,3 +366,96 @@ export function monthlyTargetsByLine(
   rows.push({ line: "total", label: "Total", target, done, pace: monthlyPace(target, done, today) });
   return rows;
 }
+
+// ── Historical period selector (targets vs actuals over past ranges) ──────────
+
+export type DashboardPeriod =
+  | "this_month"
+  | "last_month"
+  | "last_3_months"
+  | "this_quarter"
+  | "last_quarter"
+  | "this_year"
+  | "last_year";
+
+export const DASHBOARD_PERIODS: Array<{ value: DashboardPeriod; label: string }> = [
+  { value: "this_month", label: "This month" },
+  { value: "last_month", label: "Last month" },
+  { value: "last_3_months", label: "Last 3 months" },
+  { value: "this_quarter", label: "This quarter" },
+  { value: "last_quarter", label: "Last quarter" },
+  { value: "this_year", label: "This year" },
+  { value: "last_year", label: "Last year" },
+];
+
+const monthKey = (y: number, m: number): string => `${y}-${String(m).padStart(2, "0")}`;
+
+/** Ascending list of YYYY-MM month keys covered by a period, relative to `today`. */
+export function monthKeysForPeriod(period: DashboardPeriod, today: string): string[] {
+  const mm = /^(\d{4})-(\d{2})/.exec(today);
+  if (!mm) return [today.slice(0, 7)];
+  const year = Number(mm[1]);
+  const month = Number(mm[2]); // 1–12
+  const trailing = (n: number): string[] => {
+    const keys: string[] = [];
+    let y = year;
+    let m = month;
+    for (let i = 0; i < n; i++) {
+      keys.unshift(monthKey(y, m));
+      m--;
+      if (m === 0) { m = 12; y--; }
+    }
+    return keys;
+  };
+  const quarterStart = (m: number) => m - ((m - 1) % 3); // 1,4,7,10
+  switch (period) {
+    case "this_month":
+      return [monthKey(year, month)];
+    case "last_month": {
+      const y = month === 1 ? year - 1 : year;
+      const m = month === 1 ? 12 : month - 1;
+      return [monthKey(y, m)];
+    }
+    case "last_3_months":
+      return trailing(3);
+    case "this_quarter": {
+      const qs = quarterStart(month);
+      const keys: string[] = [];
+      for (let m = qs; m <= month; m++) keys.push(monthKey(year, m));
+      return keys;
+    }
+    case "last_quarter": {
+      let qs = quarterStart(month) - 3;
+      let y = year;
+      if (qs <= 0) { qs += 12; y--; }
+      return [monthKey(y, qs), monthKey(y, qs + 1), monthKey(y, qs + 2)];
+    }
+    case "this_year": {
+      const keys: string[] = [];
+      for (let m = 1; m <= month; m++) keys.push(monthKey(year, m));
+      return keys;
+    }
+    case "last_year": {
+      const keys: string[] = [];
+      for (let m = 1; m <= 12; m++) keys.push(monthKey(year - 1, m));
+      return keys;
+    }
+  }
+}
+
+/**
+ * Per-line TARGET summed across a set of months, using the seasonality-rate
+ * model for every line (works for any month, unlike the current-month lawn
+ * due-count). Used by the history selector to draw a target baseline for a past
+ * range; the current month's live cards still use monthlyTargetsByLine.
+ */
+export function targetsByLineForMonths(jobs: JobLike[], monthKeys: string[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const line of TARGET_SERVICE_LINES) {
+    const lineJobs = jobs.filter((j) => lineOf(j) === line);
+    let t = 0;
+    for (const mk of monthKeys) t += monthlyServiceTarget(lineJobs, Number(mk.slice(5, 7)));
+    out[line] = t;
+  }
+  return out;
+}
