@@ -16,12 +16,16 @@ import {
 } from "@/lib/google-routing";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { calculateStopProductionValue } from "@/lib/production-value";
+import { deriveServiceLine, serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
 const DEFAULT_MAX_STOPS = 16;
 const DEFAULT_MAX_DRIVE_MINUTES = 240;
+// Hard cap on a technician's day: drive + service minutes (Flex rule: keeping
+// the total estimated duration at or under 8 hours every day is a must).
+const DEFAULT_MAX_DAY_MINUTES = 480;
 const JOB_CAP = 500;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
@@ -98,6 +102,67 @@ function routeSlotKey(date: string, techId: string) {
   return `${date}::${techId}`;
 }
 
+// ── Phase 2: skills + service-line + preferred-tech enforcement ───────────────
+
+/** Lower-cased set of the FieldRoutes skills assigned to a technician. */
+function techSkillSet(tech: Record<string, unknown> & { id: string }): Set<string> {
+  const raw = Array.isArray(tech.skillNames) ? (tech.skillNames as unknown[]) : [];
+  return new Set(raw.map((s) => String(s).trim().toLowerCase()).filter(Boolean));
+}
+
+/** Skills this job's service type requires (stamped by sync from the FieldRoutes skill catalog). */
+function jobRequiredSkills(job: JobDoc): string[] {
+  const raw = Array.isArray(job.requiredSkills) ? (job.requiredSkills as unknown[]) : [];
+  return raw.map((s) => String(s).trim()).filter(Boolean);
+}
+
+/** Does the tech carry every skill this job's service type requires? */
+function techHasRequiredSkills(
+  tech: Record<string, unknown> & { id: string },
+  job: JobDoc,
+): boolean {
+  const required = jobRequiredSkills(job);
+  if (required.length === 0) return true;
+  const skills = techSkillSet(tech);
+  return required.every((skill) => skills.has(skill.toLowerCase()));
+}
+
+/** The job's service line (stamped by sync; derived from serviceType as a fallback). */
+const VALID_SERVICE_LINES = new Set(["general", "gr", "termite", "lawn", "mosquito", "commercial", "wildlife"]);
+function jobServiceLine(job: JobDoc): ServiceLine {
+  const stored = String(job.serviceLine || "").trim().toLowerCase();
+  if (VALID_SERVICE_LINES.has(stored)) return stored as ServiceLine;
+  return deriveServiceLine(job.serviceType);
+}
+
+/**
+ * Service-line segregation (Flex rule: GR, Termite, Lawn, and Wildlife ride
+ * their own certified routes — they never mix onto a general pest route, or
+ * with each other). A route may carry EITHER one own-route line exclusively,
+ * or any mix of the shared lines (general / mosquito / commercial).
+ */
+function unitCompatibleWithSlotJobs(unitJobsArr: JobDoc[], slotJobs: JobDoc[]): boolean {
+  const lines = new Set<ServiceLine>();
+  for (const job of unitJobsArr) lines.add(jobServiceLine(job));
+  for (const job of slotJobs) lines.add(jobServiceLine(job));
+  const ownRouteLines = Array.from(lines).filter((line) => serviceLineMeta(line).requiresOwnRoute);
+  if (ownRouteLines.length === 0) return true; // shared lines mix freely
+  return lines.size === 1; // an own-route line must be the ONLY line on the route
+}
+
+/** Does this tech match the job's preferred technician (a name resolved during sync)? */
+function techIsPreferredForJob(
+  job: JobDoc,
+  tech: Record<string, unknown> & { id: string },
+): boolean {
+  const preferred = String(job.preferredTech || "").trim();
+  if (!preferred) return false;
+  const normalizedPreferred = normalizeName(preferred);
+  return techMatchTokens(tech).some(
+    (token) => token === preferred || normalizeName(token) === normalizedPreferred,
+  );
+}
+
 function jobHasExplicitAssignment(job: JobDoc) {
   return [job.assignedTechId, job.fieldRoutesServicedBy, job.fieldRoutesServicedById]
     .some((value) => String(value || "").trim().length > 0);
@@ -105,8 +170,14 @@ function jobHasExplicitAssignment(job: JobDoc) {
 
 // Every job must belong to exactly ONE technician. Without this, unassigned
 // jobs (which match every tech) get routed once per tech — duplicate stops.
-// Order of precedence: pinned route slot > explicit assignment > nearest tech
-// with a load penalty so unassigned work spreads evenly across the team.
+// Order of precedence: pinned route slot > explicit assignment > preferred
+// technician (Flex rule: start with the customer's preferred tech) > nearest
+// qualified tech with a load penalty so unassigned work spreads evenly.
+// Technicians must carry every skill the job's service type requires; jobs no
+// selected tech is qualified for are returned as skillBlocked (deferred), never
+// silently assigned to an unqualified tech.
+const PREFERRED_TECH_BONUS_MINUTES = 45;
+
 function partitionJobsAmongTechs(
   jobs: JobDoc[],
   techs: Array<Record<string, unknown> & { id: string }>,
@@ -115,6 +186,7 @@ function partitionJobsAmongTechs(
   const byTech = new Map<string, JobDoc[]>();
   techs.forEach((tech) => byTech.set(tech.id, []));
   const unassigned: JobDoc[] = [];
+  const skillBlocked: Array<{ job: JobDoc; reason: string }> = [];
   const seen = new Set<string>();
 
   for (const job of jobs) {
@@ -130,6 +202,9 @@ function partitionJobsAmongTechs(
         continue;
       }
     }
+    // Explicit assignments (FieldRoutes / dispatcher) are honored as committed
+    // decisions even when the skill matrix disagrees — mirroring FieldRoutes,
+    // which warns on a mismatch but lets the office schedule anyway.
     if (jobHasExplicitAssignment(job)) {
       const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
       if (tech) byTech.get(tech.id)!.push(job);
@@ -139,14 +214,24 @@ function partitionJobsAmongTechs(
   }
 
   for (const job of unassigned) {
-    let bestTechId = techs[0]?.id || "";
+    const qualified = techs.filter((tech) => techHasRequiredSkills(tech, job));
+    if (qualified.length === 0) {
+      skillBlocked.push({
+        job,
+        reason: `requires skill(s) ${jobRequiredSkills(job).join(", ")} — no selected technician has them`,
+      });
+      continue;
+    }
+    let bestTechId = qualified[0]?.id || "";
     let bestScore = Number.POSITIVE_INFINITY;
-    for (const tech of techs) {
+    for (const tech of qualified) {
       const current = byTech.get(tech.id) || [];
       const nearestMinutes = current.length
         ? Math.min(...current.map((existing) => estimateDriveMinutes(job, existing)))
         : 0;
-      const score = nearestMinutes + current.length * 4;
+      let score = nearestMinutes + current.length * 4;
+      // Preferred technician wins unless they are far away or heavily loaded.
+      if (techIsPreferredForJob(job, tech)) score -= PREFERRED_TECH_BONUS_MINUTES;
       if (score < bestScore) {
         bestScore = score;
         bestTechId = tech.id;
@@ -155,7 +240,7 @@ function partitionJobsAmongTechs(
     byTech.get(bestTechId)?.push(job);
   }
 
-  return byTech;
+  return { byTech, skillBlocked };
 }
 
 function isFieldRoutesScheduledJob(job: JobDoc) {
@@ -661,12 +746,35 @@ function orderedDriveMinutesFromMatrix(
 async function buildOrderedRoute(
   picked: JobDoc[],
   routeDate: string,
+  endNear?: { lat: number; lng: number } | null,
 ): Promise<OrderedRouteBuild> {
   const matrixResult = await getDriveMatrix(picked, routeDate);
   const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
   const matrixById = new Map<string, number>();
   picked.forEach((job, idx) => matrixById.set(job.docId, idx));
-  const ordered = keepSameAddressJobsTogether(orderedResult.ordered);
+  let ordered = keepSameAddressJobsTogether(orderedResult.ordered);
+  // Flex sequencing rule: start at the stop furthest from the tech's home and
+  // work back so the day ENDS near home. When the tech's end location is known,
+  // flip the route direction if that lands the last stop closer to home without
+  // meaningfully increasing drive (haversine ordering is near-symmetric; the
+  // matrix check guards the asymmetric real-drive case).
+  if (endNear && ordered.length > 1) {
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    if (
+      typeof first.lat === "number" && typeof first.lng === "number" &&
+      typeof last.lat === "number" && typeof last.lng === "number"
+    ) {
+      const endsAtMiles = haversineMiles(last.lat, last.lng, endNear.lat, endNear.lng);
+      const reversedEndsAtMiles = haversineMiles(first.lat, first.lng, endNear.lat, endNear.lng);
+      if (reversedEndsAtMiles + 0.25 < endsAtMiles) {
+        const reversed = [...ordered].reverse();
+        const forwardCost = orderedDriveMinutesFromMatrix(ordered, matrixById, matrixResult.matrix);
+        const reversedCost = orderedDriveMinutesFromMatrix(reversed, matrixById, matrixResult.matrix);
+        if (reversedCost <= forwardCost * 1.08 + 2) ordered = reversed;
+      }
+    }
+  }
   const orderedMatrixDriveMinutes = orderedDriveMinutesFromMatrix(
     ordered,
     matrixById,
@@ -1000,10 +1108,11 @@ function canScheduleUnitOnDate(unit: JobUnit, slotDate: string) {
   return unit.jobs.every((job) => canScheduleJobOnDate(job, slotDate));
 }
 
-function canPlaceUnitOnSlot(unit: JobUnit, slot: RouteSlot) {
+function canPlaceUnitOnSlot(unit: JobUnit, slot: RouteSlot, slotJobs: JobDoc[] = []) {
   return (
     (!unit.lockedSlotKey || unit.lockedSlotKey === routeSlotKey(slot.date, slot.tech.id)) &&
-    canScheduleUnitOnDate(unit, slot.date)
+    canScheduleUnitOnDate(unit, slot.date) &&
+    unitCompatibleWithSlotJobs(unit.jobs, slotJobs)
   );
 }
 
@@ -1098,7 +1207,8 @@ function optimizeUnitAssignments(
             !movingA.lockedSlotKey &&
             routeBStopCount + movingA.jobs.length <= routeBStopLimit &&
             routeA.units.length > 1 &&
-            canScheduleUnitOnDate(movingA, routeB.slot.date)
+            canScheduleUnitOnDate(movingA, routeB.slot.date) &&
+            unitCompatibleWithSlotJobs(movingA.jobs, unitJobs(routeB.units))
           ) {
             const nextAUnits = routeA.units.filter((_, idx) => idx !== i);
             const nextBUnits = [...routeB.units, movingA];
@@ -1121,7 +1231,15 @@ function optimizeUnitAssignments(
               routeAStopCount - movingA.jobs.length + movingB.jobs.length > routeAStopLimit ||
               routeBStopCount - movingB.jobs.length + movingA.jobs.length > routeBStopLimit ||
               !canScheduleUnitOnDate(movingB, routeA.slot.date) ||
-              !canScheduleUnitOnDate(movingA, routeB.slot.date)
+              !canScheduleUnitOnDate(movingA, routeB.slot.date) ||
+              !unitCompatibleWithSlotJobs(
+                movingB.jobs,
+                unitJobs(routeA.units.filter((_, idx) => idx !== i)),
+              ) ||
+              !unitCompatibleWithSlotJobs(
+                movingA.jobs,
+                unitJobs(routeB.units.filter((_, idx) => idx !== j)),
+              )
             ) {
               continue;
             }
@@ -1228,7 +1346,7 @@ function assignJobsToTechSlots({
     const target = assignments
       .filter((assignment) =>
         unitStopCount(assignment.units) + unit.jobs.length <= slotStopLimit(assignment.slot) &&
-        canPlaceUnitOnSlot(unit, assignment.slot),
+        canPlaceUnitOnSlot(unit, assignment.slot, unitJobs(assignment.units)),
       )
       .map((assignment) => ({
         assignment,
@@ -1244,6 +1362,13 @@ function assignJobsToTechSlots({
     if (target) {
       target.units.push(unit);
     } else {
+      // Detect when service-line segregation was the only blocker so the
+      // deferral reason says so instead of a generic "no route capacity".
+      const lineBlocked = assignments.some((assignment) =>
+        unitStopCount(assignment.units) + unit.jobs.length <= slotStopLimit(assignment.slot) &&
+        canScheduleUnitOnDate(unit, assignment.slot.date) &&
+        !unitCompatibleWithSlotJobs(unit.jobs, unitJobs(assignment.units)),
+      );
       unit.jobs.forEach((job) => {
         const blockedDates = slots
           .map((slot) => `${slot.date}: ${jobScheduleBlockReason(job, slot.date)}`)
@@ -1252,6 +1377,8 @@ function assignJobsToTechSlots({
           job,
           reason: unit.lockedSlotKey
             ? "FieldRoutes scheduled stop does not match an available selected tech/date route"
+            : lineBlocked
+            ? `${jobServiceLine(job)} rides its own route (service-line segregation) — no free same-line route in this range`
             : blockedDates.length > 0
             ? blockedDates.join("; ")
             : "no route capacity",
@@ -1273,6 +1400,7 @@ async function buildFastFallbackRoutes({
   dates,
   maxStops,
   maxDriveTime,
+  maxDayMinutes = DEFAULT_MAX_DAY_MINUTES,
   rangeStart,
   rangeEnd,
   pinnedSlotByJobId = new Map<string, string>(),
@@ -1282,6 +1410,7 @@ async function buildFastFallbackRoutes({
   dates: string[];
   maxStops: number;
   maxDriveTime: number;
+  maxDayMinutes?: number;
   rangeStart: string;
   rangeEnd: string;
   pinnedSlotByJobId?: Map<string, string>;
@@ -1294,7 +1423,23 @@ async function buildFastFallbackRoutes({
   const polylineSources = new Set<string>();
   const driveCapDeferrals: Array<{ job: JobDoc; routeName: string; driveMinutes: number }> = [];
   let slotIndex = 0;
-  const partitionedByTech = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId);
+  const partition = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId);
+  const partitionedByTech = partition.byTech;
+  // Jobs whose required skills no selected technician carries: defer with the
+  // skill named, never assign to an unqualified tech.
+  partition.skillBlocked.forEach((entry) => {
+    deferredJobIds.add(entry.job.docId);
+    constraintDeferrals.push(entry);
+  });
+  const serviceMinutesOf = (jobs: JobDoc[]) =>
+    jobs.reduce((sum, job) => sum + Number(job.duration || 25), 0);
+  const techEndPoint = (tech: Record<string, unknown> & { id: string }) => {
+    const lat = Number(tech.endLat ?? tech.startLat);
+    const lng = Number(tech.endLng ?? tech.startLng);
+    return Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0)
+      ? { lat, lng }
+      : null;
+  };
 
   for (const tech of selectedTechs) {
     const techJobs = partitionedByTech.get(tech.id) || [];
@@ -1330,14 +1475,20 @@ async function buildFastFallbackRoutes({
       let picked = assignment.jobs;
       if (picked.length === 0) continue;
 
-      let orderedBuild = await buildOrderedRoute(picked, slot.date);
+      const endNear = techEndPoint(slot.tech);
+      let orderedBuild = await buildOrderedRoute(picked, slot.date, endNear);
       let driveTrimPasses = 0;
-      while (
+      const overDriveCap = () =>
         maxDriveTime > 0 &&
-        orderedBuild.totalDriveMinutes > maxDriveTime + DRIVE_CAP_SLACK_MINUTES &&
-        picked.length > 1 &&
-        driveTrimPasses < 30
-      ) {
+        orderedBuild.totalDriveMinutes > maxDriveTime + DRIVE_CAP_SLACK_MINUTES;
+      // Flex hard rule: the technician's DAY (drive + service) stays at or under
+      // the day cap (default 8 hours). Trim the same way the drive cap does.
+      const overDayCap = () =>
+        maxDayMinutes > 0 &&
+        orderedBuild.totalDriveMinutes + serviceMinutesOf(picked) >
+          maxDayMinutes + DRIVE_CAP_SLACK_MINUTES;
+      while ((overDriveCap() || overDayCap()) && picked.length > 1 && driveTrimPasses < 30) {
+        const dayCapTriggered = !overDriveCap();
         const removal = chooseDriveCapRemoval({
           ordered: orderedBuild.ordered,
           slot,
@@ -1350,7 +1501,9 @@ async function buildFastFallbackRoutes({
         });
         if (!removal) {
           routeWarnings.add(
-            `${String(slot.tech.name || slot.tech.id)} ${slot.date} is over the ${maxDriveTime}-minute drive target, but remaining stops are already on a route and won't be dropped.`,
+            dayCapTriggered
+              ? `${String(slot.tech.name || slot.tech.id)} ${slot.date} is over the ${Math.round(maxDayMinutes / 60 * 10) / 10}-hour day cap (drive + service), but remaining stops are already on a route and won't be dropped.`
+              : `${String(slot.tech.name || slot.tech.id)} ${slot.date} is over the ${maxDriveTime}-minute drive target, but remaining stops are already on a route and won't be dropped.`,
           );
           break;
         }
@@ -1361,7 +1514,7 @@ async function buildFastFallbackRoutes({
           driveMinutes: Math.round(orderedBuild.totalDriveMinutes * 10) / 10,
         });
         picked = picked.filter((job) => job.docId !== removal.docId);
-        orderedBuild = await buildOrderedRoute(picked, slot.date);
+        orderedBuild = await buildOrderedRoute(picked, slot.date, endNear);
         driveTrimPasses++;
       }
 
@@ -1432,6 +1585,9 @@ async function buildFastFallbackRoutes({
             ? geometryResult.path
             : [],
         overDriveCap: maxDriveTime > 0 && totalDriveMinutes > maxDriveTime,
+        overDayCap:
+          maxDayMinutes > 0 && totalDriveMinutes + totalServiceMinutes > maxDayMinutes,
+        maxDayMinutesParam: maxDayMinutes,
       });
     }
   }
@@ -1472,6 +1628,7 @@ export async function POST(request: NextRequest) {
       techIds,
       maxStops: rawMaxStops,
       maxDriveTime: rawMaxDriveTime,
+      maxDayMinutes: rawMaxDayMinutes,
       requestedBy,
       runSettings,
     } = body as {
@@ -1482,6 +1639,7 @@ export async function POST(request: NextRequest) {
       techIds?: string[];
       maxStops?: number;
       maxDriveTime?: number;
+      maxDayMinutes?: number;
       requestedBy?: string;
       runSettings?: Record<string, unknown>;
     };
@@ -1511,6 +1669,11 @@ export async function POST(request: NextRequest) {
       Number.isFinite(rawMaxDriveTime) && (rawMaxDriveTime as number) > 0
         ? Math.min(600, Math.floor(rawMaxDriveTime as number))
         : DEFAULT_MAX_DRIVE_MINUTES;
+
+    const maxDayMinutes =
+      Number.isFinite(rawMaxDayMinutes) && (rawMaxDayMinutes as number) > 0
+        ? Math.min(720, Math.floor(rawMaxDayMinutes as number))
+        : DEFAULT_MAX_DAY_MINUTES;
 
     console.log(`[generate-routes] START companyId=${companyId} range=${rangeStart}..${rangeEnd} techIds=${techIds?.length ?? "all"}`);
 
@@ -1867,6 +2030,7 @@ export async function POST(request: NextRequest) {
           maxStops,
           tuesdayMaxStops,
           maxDriveTime,
+          maxDayMinutes,
           numDays,
           numTechs: selectedTechs.length,
         },
@@ -1917,6 +2081,7 @@ export async function POST(request: NextRequest) {
         dates,
         maxStops,
         maxDriveTime,
+        maxDayMinutes,
         rangeStart,
         rangeEnd,
         pinnedSlotByJobId,
@@ -1954,6 +2119,7 @@ export async function POST(request: NextRequest) {
           dates,
           maxStops,
           maxDriveTime,
+        maxDayMinutes,
           rangeStart,
           rangeEnd,
           pinnedSlotByJobId,
@@ -2284,7 +2450,7 @@ export async function POST(request: NextRequest) {
         inWindowSelected: selectedInWindowCount,
         futureSelected: selectedFutureCount,
       },
-      params: { targetStops: maxStops, maxStops, maxDriveTime },
+      params: { targetStops: maxStops, maxStops, maxDriveTime, maxDayMinutes },
       deferredCount: totalDeferred,
       warnings: [
         ...(replacedRouteCount > 0
