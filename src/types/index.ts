@@ -28,6 +28,10 @@ export interface Technician {
   active: boolean;
   maxStopsPerDay: number;
   skillNames?: string[]; // FieldRoutes skills assigned to this tech (e.g. "Termite", "Wildlife", "WI-I")
+  startLat?: number | null; // FieldRoutes tech start (home) location
+  startLng?: number | null;
+  endLat?: number | null; // FieldRoutes tech end-of-day location
+  endLng?: number | null;
   workDays?: string[]; // e.g. ["Mon","Tue","Wed","Thu","Fri"]
   serviceArea?: {
     north: number;

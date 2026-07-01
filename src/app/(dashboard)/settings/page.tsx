@@ -57,6 +57,13 @@ export default function SettingsPage() {
   const [apiDailyCap, setApiDailyCap] = useState("");
   const [apiCapSaving, setApiCapSaving] = useState(false);
   const [apiUsage, setApiUsage] = useState<{ date: string; reads: number; writes: number } | null>(null);
+  // FieldRoutes Skills picture, persisted by the sync (fieldRoutesState/skills):
+  // the skill catalog and which skills each service type requires.
+  const [skillsInfo, setSkillsInfo] = useState<{
+    catalog: Array<{ id: string; name: string; serviceTypeIds: string[] }>;
+    requiredSkillsByServiceType: Record<string, string[]>;
+    updatedAt?: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!userProfile?.companyId || settingsLoaded) return;
@@ -108,6 +115,20 @@ export default function SettingsPage() {
           setRouteGroups(data.fieldRoutesRouteGroups.map((t: unknown) => String(t)).filter(Boolean));
         }
       }
+      try {
+        const skillsSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/skills`));
+        if (skillsSnap.exists()) {
+          const d = skillsSnap.data();
+          setSkillsInfo({
+            catalog: Array.isArray(d.catalog) ? d.catalog : [],
+            requiredSkillsByServiceType:
+              d.requiredSkillsByServiceType && typeof d.requiredSkillsByServiceType === "object"
+                ? d.requiredSkillsByServiceType
+                : {},
+            updatedAt: d.updatedAt ? String(d.updatedAt) : undefined,
+          });
+        }
+      } catch { /* skills doc optional until first post-upgrade sync */ }
       setSettingsLoaded(true);
     } catch { }
   }
@@ -649,6 +670,15 @@ export default function SettingsPage() {
                       <div className="flex-1 min-w-0">
                         <p className="font-medium text-sm">{tech.name}</p>
                         <p className="text-xs text-muted-foreground/50">ID: {tech.employeeId} · Max {tech.maxStopsPerDay} stops/day</p>
+                        {Array.isArray(tech.skillNames) && tech.skillNames.length > 0 ? (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {tech.skillNames.map(skill => (
+                              <Badge key={skill} variant="secondary" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-300 border border-blue-500/20">{skill}</Badge>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-[10px] text-muted-foreground/40 mt-1">No FieldRoutes skills assigned</p>
+                        )}
                       </div>
                       <Switch checked={tech.active} onCheckedChange={() => toggleTechActive(tech)} />
                       <Button
@@ -674,6 +704,66 @@ export default function SettingsPage() {
           </TabsContent>
 
           <TabsContent value="routing" className="space-y-4">
+            <Card className="border-border/40">
+              <CardHeader>
+                <CardTitle className="text-sm font-semibold">FieldRoutes Skills</CardTitle>
+                <CardDescription className="text-xs">
+                  Skills pulled from FieldRoutes. Route generation only assigns a stop to a technician
+                  who carries every skill its service type requires.
+                  {skillsInfo?.updatedAt ? ` Updated ${new Date(skillsInfo.updatedAt).toLocaleDateString()}.` : ""}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {skillsInfo && skillsInfo.catalog.length > 0 ? (
+                  <>
+                    <div className="space-y-2">
+                      <Label className="text-xs uppercase tracking-wider text-muted-foreground/60">Skills &amp; who has them</Label>
+                      <div className="rounded-lg border border-border/30 divide-y divide-border/20">
+                        {skillsInfo.catalog.map(skill => {
+                          const holders = techs.filter(t => Array.isArray(t.skillNames) && t.skillNames.some(n => String(n).toLowerCase() === skill.name.toLowerCase()));
+                          return (
+                            <div key={skill.id} className="flex items-start gap-3 px-3 py-2.5">
+                              <Badge variant="secondary" className="text-xs shrink-0 bg-blue-500/10 text-blue-300 border border-blue-500/20">{skill.name}</Badge>
+                              <p className="text-xs text-muted-foreground/70 flex-1">
+                                {holders.length > 0
+                                  ? holders.map(t => t.name).join(", ")
+                                  : "No technician has this skill yet — assign it in FieldRoutes, then Sync."}
+                              </p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label className="text-xs uppercase tracking-wider text-muted-foreground/60">Service types &amp; required skills</Label>
+                      {Object.keys(skillsInfo.requiredSkillsByServiceType).length > 0 ? (
+                        <div className="rounded-lg border border-border/30 divide-y divide-border/20 max-h-72 overflow-y-auto">
+                          {Object.entries(skillsInfo.requiredSkillsByServiceType)
+                            .sort(([a], [b]) => a.localeCompare(b))
+                            .map(([serviceType, skills]) => (
+                              <div key={serviceType} className="flex items-center justify-between gap-3 px-3 py-2">
+                                <span className="text-sm capitalize truncate">{serviceType}</span>
+                                <div className="flex flex-wrap gap-1 justify-end">
+                                  {(skills as string[]).map(skill => (
+                                    <Badge key={skill} variant="secondary" className="text-[10px] px-1.5 py-0 bg-amber-500/10 text-amber-300 border border-amber-500/20">{skill}</Badge>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground/50">No service type currently requires a skill.</p>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground/50">
+                    No skills data yet — run a Sync to pull the FieldRoutes skill catalog.
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+
             <Card className="border-border/40">
               <CardHeader>
                 <CardTitle className="text-sm font-semibold">Scheduling Gates</CardTitle>

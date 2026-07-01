@@ -239,13 +239,21 @@ function haversineRouteMetrics(
  * FieldRoutes routes are silently dropped (and could be double-booked).
  * Returns lookup maps so callers can resolve a job's tech to a technician doc id.
  */
+interface EmpRoutingInfo {
+  skillNames: string[];
+  startLat?: number | null;
+  startLng?: number | null;
+  endLat?: number | null;
+  endLng?: number | null;
+}
+
 async function syncTechnicians(
   db: FirebaseFirestore.Firestore,
   companyId: string,
   empNames: Record<string, string>,
   servingEmployeeIds: Set<string>,
   now: string,
-  empSkills: Record<string, string[]> = {},
+  empInfo: Record<string, EmpRoutingInfo> = {},
 ): Promise<{ empToTech: Map<string, string>; nameToTech: Map<string, string> }> {
   const existingSnap = await db.collection(`companies/${companyId}/technicians`).get();
   const byEmpId = new Map<string, string>();
@@ -276,7 +284,8 @@ async function syncTechnicians(
     const name = empNames[empId] || empId;
     const existingId = byEmpId.get(empId) || byName.get(normName(name));
 
-    const linkFields = {
+    const info = empInfo[empId];
+    const linkFields: Record<string, unknown> = {
       companyId,
       name,
       employeeId: empId,
@@ -284,10 +293,17 @@ async function syncTechnicians(
       fieldRoutesTechId: empId,
       source: "fieldroutes",
       // Skills assigned to this tech in FieldRoutes (e.g. "Termite", "Wildlife",
-      // "WI-I"). Phase 2 prep: not yet enforced in routing.
-      skillNames: empSkills[empId] || [],
+      // "WI-I"). Enforced by generate-routes (a tech only gets jobs whose
+      // required skills they carry).
+      skillNames: info?.skillNames || [],
       updatedAt: now,
     };
+    // Tech start/end (home) coordinates — used for end-near-home sequencing.
+    // Written only when present so a transient miss never wipes stored values.
+    for (const key of ["startLat", "startLng", "endLat", "endLng"] as const) {
+      const v = info?.[key];
+      if (typeof v === "number" && Number.isFinite(v)) linkFields[key] = v;
+    }
 
     let techId: string;
     if (existingId) {
@@ -515,7 +531,7 @@ async function reconcileScheduledRoutes(
   technicianEmpIds: Set<string>,
   today: string,
   now: string,
-  empSkills: Record<string, string[]> = {},
+  empInfo: Record<string, EmpRoutingInfo> = {},
 ): Promise<{ routesWritten: number; routesDeleted: number; techsLinked: number }> {
   interface SJob {
     id: string;
@@ -581,7 +597,7 @@ async function reconcileScheduledRoutes(
     }
   }
 
-  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, techServing, now, empSkills);
+  const { empToTech, nameToTech } = await syncTechnicians(db, companyId, empNames, techServing, now, empInfo);
   const resolveTechId = (j: SJob) =>
     empToTech.get(j.techEmpId) || nameToTech.get(normName(j.techName)) || "";
 
@@ -811,6 +827,24 @@ async function resolveSubscriptionIds(
  * and the employee-name map. These are persisted with the run so resume
  * invocations skip the setup cost entirely.
  */
+interface RosterEmployee {
+  employeeId: string;
+  name: string;
+  type: number | null;
+  isTechnician: boolean;
+  skillNames: string[];
+  startLat: number | null;
+  startLng: number | null;
+  endLat: number | null;
+  endLng: number | null;
+}
+
+/** Numeric coordinate, or null when missing/zero (FieldRoutes uses 0 for unset). */
+function coordOrNull(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n !== 0 ? n : null;
+}
+
 async function buildRunSetup(
   client: FieldRoutesClient,
   mode: SyncMode,
@@ -821,8 +855,9 @@ async function buildRunSetup(
   apptMap: Record<string, ApptInfo>;
   empNames: Record<string, string>;
   technicianEmpIds: string[];
-  employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean; skillNames: string[] }>;
+  employeeRoster: Array<RosterEmployee>;
   requiredSkillsByServiceType: Record<string, string[]>;
+  skillCatalog: Array<{ id: string; name: string; serviceTypeIds: string[] }>;
 }> {
   const ids = sortIds(await resolveSubscriptionIds(client, mode, cursor));
 
@@ -843,7 +878,7 @@ async function buildRunSetup(
   // type). Used to keep office/sales staff out of the technician list. A roster
   // is persisted alongside so the actual type of every employee is inspectable.
   const technicianEmpIds = new Set<string>();
-  const employeeRoster: Array<{ employeeId: string; name: string; type: number | null; isTechnician: boolean; skillNames: string[] }> = [];
+  const employeeRoster: Array<RosterEmployee> = [];
   for (const e of employees) {
     const er = rec(e);
     const isTech = isTechnicianEmployee(er);
@@ -853,6 +888,12 @@ async function buildRunSetup(
       type: employeeType(er),
       isTechnician: isTech,
       skillNames: resolveSkillNames(extractSkillRefs(er), skillCatalog),
+      // Tech start/end (home) locations from FieldRoutes — drive the Flex
+      // "end the day near home" sequencing rule in route generation.
+      startLat: coordOrNull(er.startLat),
+      startLng: coordOrNull(er.startLng),
+      endLat: coordOrNull(er.endLat),
+      endLng: coordOrNull(er.endLng),
     });
     if (!isTech) continue;
     for (const raw of [er.employeeID, er.employeeId, er.roamingRep, er.linkedEmployeeIDs]) {
@@ -986,6 +1027,7 @@ async function buildRunSetup(
     technicianEmpIds: [...technicianEmpIds],
     employeeRoster,
     requiredSkillsByServiceType,
+    skillCatalog: skillCatalogRows,
   };
 }
 
@@ -1112,6 +1154,14 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         },
         { merge: true },
       );
+      // Persist the skills picture for the Settings UI: the FieldRoutes skill
+      // catalog (skill -> service types that need it) and the derived
+      // service-type -> required-skills map used by routing.
+      await db.doc(`companies/${companyId}/fieldRoutesState/skills`).set({
+        catalog: setup.skillCatalog,
+        requiredSkillsByServiceType: setup.requiredSkillsByServiceType,
+        updatedAt: new Date().toISOString(),
+      });
     } catch (err) {
       if (err instanceof FieldRoutesBudgetError) {
         // Ran out of budget while building the account-wide lookups. No per-sub
@@ -1514,17 +1564,24 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   // persisted employee roster (written once per fresh run) for technician skill
   // names so they get linked onto technician docs every pass, not just the first.
   try {
-    const empSkills: Record<string, string[]> = {};
+    const empInfo: Record<string, EmpRoutingInfo> = {};
     const rosterSnap = await db.doc(`companies/${companyId}/fieldRoutesState/employeeRoster`).get();
     const rosterEmployees = rosterSnap.exists ? (rosterSnap.data()?.employees as unknown[]) : [];
     if (Array.isArray(rosterEmployees)) {
       for (const e of rosterEmployees) {
         const er = rec(e);
         const id = str(er.employeeId);
-        if (id && Array.isArray(er.skillNames)) empSkills[id] = er.skillNames.map(String);
+        if (!id) continue;
+        empInfo[id] = {
+          skillNames: Array.isArray(er.skillNames) ? er.skillNames.map(String) : [],
+          startLat: typeof er.startLat === "number" ? er.startLat : null,
+          startLng: typeof er.startLng === "number" ? er.startLng : null,
+          endLat: typeof er.endLat === "number" ? er.endLat : null,
+          endLng: typeof er.endLng === "number" ? er.endLng : null,
+        };
       }
     }
-    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now, empSkills);
+    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now, empInfo);
     console.log(
       `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
         `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
