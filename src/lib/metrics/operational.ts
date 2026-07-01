@@ -292,6 +292,38 @@ export function isTrackedServiceLine(line: string): boolean {
   return (TARGET_SERVICE_LINES as readonly string[]).includes(line);
 }
 
+/**
+ * Lawn target/done for a specific month, counted DIRECTLY from the round
+ * subscriptions rather than the seasonality-rate formula. Lawn is a 7-round
+ * program where each customer's round is due on a real date inside its ~6-week
+ * window, so "how many are due this month" is the honest count:
+ *   done   = round subs COMPLETED this month (lastCompleted in [monthStart, today])
+ *   left   = round subs still DUE this month  (serviceDue in [monthStart, monthEnd],
+ *            not already completed this month)
+ *   target = done + left (every round appointment that belongs to this month)
+ * Counts subscriptions (each round is its own sub), not distinct customers.
+ */
+function lawnMonthTargetDone(
+  lawnJobs: JobLike[],
+  monthStart: string,
+  monthEnd: string,
+  today: string,
+): { target: number; done: number } {
+  let done = 0;
+  let due = 0;
+  for (const j of lawnJobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && lc >= monthStart && lc <= today) {
+      done++;
+      continue;
+    }
+    const sd = j.scheduledDate;
+    if (sd && sd >= monthStart && sd <= monthEnd) due++;
+  }
+  return { target: done + due, done };
+}
+
 export interface LineTarget {
   line: TargetServiceLine | "total";
   label: string;
@@ -310,17 +342,120 @@ export function monthlyTargetsByLine(
   jobs: JobLike[],
   month: number,
   monthStart: string,
+  monthEnd: string,
   today: string,
 ): LineTarget[] {
+  const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number } => {
+    // Lawn is counted by rounds actually due this month; every other line uses
+    // the seasonality-aware expected-services-per-month rate.
+    if (line === "lawn") return lawnMonthTargetDone(lineJobs, monthStart, monthEnd, today);
+    return {
+      target: monthlyServiceTarget(lineJobs, month),
+      done: monthlyServiced(lineJobs, monthStart, today),
+    };
+  };
+
   const rows: LineTarget[] = TARGET_SERVICE_LINES.map((line) => {
     const lineJobs = jobs.filter((j) => lineOf(j) === line);
-    const target = monthlyServiceTarget(lineJobs, month);
-    const done = monthlyServiced(lineJobs, monthStart, today);
+    const { target, done } = targetDoneFor(line, lineJobs);
     return { line, label: TARGET_SERVICE_LINE_LABELS[line], target, done, pace: monthlyPace(target, done, today) };
   });
-  const tracked = jobs.filter((j) => isTrackedServiceLine(lineOf(j)));
-  const target = monthlyServiceTarget(tracked, month);
-  const done = monthlyServiced(tracked, monthStart, today);
+  // Total sums the per-line figures so Lawn's due-count contributes consistently.
+  const target = rows.reduce((s, r) => s + r.target, 0);
+  const done = rows.reduce((s, r) => s + r.done, 0);
   rows.push({ line: "total", label: "Total", target, done, pace: monthlyPace(target, done, today) });
   return rows;
+}
+
+// ── Historical period selector (targets vs actuals over past ranges) ──────────
+
+export type DashboardPeriod =
+  | "this_month"
+  | "last_month"
+  | "last_3_months"
+  | "this_quarter"
+  | "last_quarter"
+  | "this_year"
+  | "last_year";
+
+export const DASHBOARD_PERIODS: Array<{ value: DashboardPeriod; label: string }> = [
+  { value: "this_month", label: "This month" },
+  { value: "last_month", label: "Last month" },
+  { value: "last_3_months", label: "Last 3 months" },
+  { value: "this_quarter", label: "This quarter" },
+  { value: "last_quarter", label: "Last quarter" },
+  { value: "this_year", label: "This year" },
+  { value: "last_year", label: "Last year" },
+];
+
+const monthKey = (y: number, m: number): string => `${y}-${String(m).padStart(2, "0")}`;
+
+/** Ascending list of YYYY-MM month keys covered by a period, relative to `today`. */
+export function monthKeysForPeriod(period: DashboardPeriod, today: string): string[] {
+  const mm = /^(\d{4})-(\d{2})/.exec(today);
+  if (!mm) return [today.slice(0, 7)];
+  const year = Number(mm[1]);
+  const month = Number(mm[2]); // 1–12
+  const trailing = (n: number): string[] => {
+    const keys: string[] = [];
+    let y = year;
+    let m = month;
+    for (let i = 0; i < n; i++) {
+      keys.unshift(monthKey(y, m));
+      m--;
+      if (m === 0) { m = 12; y--; }
+    }
+    return keys;
+  };
+  const quarterStart = (m: number) => m - ((m - 1) % 3); // 1,4,7,10
+  switch (period) {
+    case "this_month":
+      return [monthKey(year, month)];
+    case "last_month": {
+      const y = month === 1 ? year - 1 : year;
+      const m = month === 1 ? 12 : month - 1;
+      return [monthKey(y, m)];
+    }
+    case "last_3_months":
+      return trailing(3);
+    case "this_quarter": {
+      const qs = quarterStart(month);
+      const keys: string[] = [];
+      for (let m = qs; m <= month; m++) keys.push(monthKey(year, m));
+      return keys;
+    }
+    case "last_quarter": {
+      let qs = quarterStart(month) - 3;
+      let y = year;
+      if (qs <= 0) { qs += 12; y--; }
+      return [monthKey(y, qs), monthKey(y, qs + 1), monthKey(y, qs + 2)];
+    }
+    case "this_year": {
+      const keys: string[] = [];
+      for (let m = 1; m <= month; m++) keys.push(monthKey(year, m));
+      return keys;
+    }
+    case "last_year": {
+      const keys: string[] = [];
+      for (let m = 1; m <= 12; m++) keys.push(monthKey(year - 1, m));
+      return keys;
+    }
+  }
+}
+
+/**
+ * Per-line TARGET summed across a set of months, using the seasonality-rate
+ * model for every line (works for any month, unlike the current-month lawn
+ * due-count). Used by the history selector to draw a target baseline for a past
+ * range; the current month's live cards still use monthlyTargetsByLine.
+ */
+export function targetsByLineForMonths(jobs: JobLike[], monthKeys: string[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const line of TARGET_SERVICE_LINES) {
+    const lineJobs = jobs.filter((j) => lineOf(j) === line);
+    let t = 0;
+    for (const mk of monthKeys) t += monthlyServiceTarget(lineJobs, Number(mk.slice(5, 7)));
+    out[line] = t;
+  }
+  return out;
 }

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
 import { collection, query, where, getDocs, doc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
@@ -23,6 +24,12 @@ import {
   weeklyPace,
   monthlyTargetsByLine,
   isTrackedServiceLine,
+  targetsByLineForMonths,
+  monthKeysForPeriod,
+  DASHBOARD_PERIODS,
+  TARGET_SERVICE_LINES,
+  TARGET_SERVICE_LINE_LABELS,
+  type DashboardPeriod,
   type LineTarget,
   MONTH_WORKING_DAYS,
   meetsTarget,
@@ -152,6 +159,23 @@ export default function DashboardPage() {
   const [groupOptions, setGroupOptions] = useState<string[]>([]);
   const [monthlyDone, setMonthlyDone] = useState<MonthlyDone | null>(null);
 
+  // History selector: targets vs actuals over a past range. "this_month" keeps
+  // the live current-month cards; any other period loads cached per-month
+  // aggregates + a rate-based target baseline.
+  const [period, setPeriod] = useState<DashboardPeriod>("this_month");
+  const [rangeDone, setRangeDone] = useState<{
+    byLine: Record<string, number>;
+    initials: number;
+    initialsByLine: Record<string, number>;
+    specialty: number;
+    wildlife: number;
+    completedAppointments: number;
+    monthsAvailable: number;
+    monthsTotal: number;
+  } | null>(null);
+  const [rangeLoading, setRangeLoading] = useState(false);
+  const [rangeRefreshing, setRangeRefreshing] = useState(false);
+
   // Filters
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
   const [dateFrom, setDateFrom] = useState(() => format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd"));
@@ -206,8 +230,11 @@ export default function DashboardPage() {
       }));
 
       // Cached completed-this-month aggregate (Initials / Specialty / Wildlife).
+      // Ignore a doc left over from a previous month — showing last month's
+      // numbers under "Completed This Month" would be misleading on the 1st.
       const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
-      setMonthlyDone(mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null);
+      const md = mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null;
+      setMonthlyDone(md && md.month === today.slice(0, 7) ? md : null);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
       setTechs(techSnap.docs.map(d => {
@@ -232,6 +259,71 @@ export default function DashboardPage() {
       setLoading(false);
     }
   }
+
+  // Load cached per-month "done" aggregates for the selected history period and
+  // sum them per line. Only runs for non-current periods (this_month uses the
+  // live cards). Re-runs when `period` or a refresh bumps `rangeRefreshing`.
+  const loadRangeDone = useCallback(async () => {
+    const companyId = userProfile?.companyId;
+    if (!companyId || period === "this_month") { setRangeDone(null); return; }
+    setRangeLoading(true);
+    try {
+      const months = monthKeysForPeriod(period, today);
+      const snaps = await Promise.all(
+        months.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`))),
+      );
+      const byLine: Record<string, number> = {};
+      const initialsByLine: Record<string, number> = {};
+      for (const l of TARGET_SERVICE_LINES) { byLine[l] = 0; initialsByLine[l] = 0; }
+      let initials = 0, specialty = 0, wildlife = 0, completedAppointments = 0, monthsAvailable = 0;
+      for (const s of snaps) {
+        if (!s.exists()) continue;
+        monthsAvailable++;
+        const d = s.data() as MonthlyDone;
+        for (const l of TARGET_SERVICE_LINES) byLine[l] += Number(d.recurringDoneByLine?.[l] || 0);
+        for (const k of Object.keys(d.initialsByLine || {})) initialsByLine[k] = (initialsByLine[k] || 0) + Number(d.initialsByLine[k] || 0);
+        initials += Number(d.initialsTotal || 0);
+        specialty += Number(d.specialtyDone || 0);
+        wildlife += Number(d.wildlifeDone || 0);
+        completedAppointments += Number(d.completedAppointments || 0);
+      }
+      setRangeDone({ byLine, initials, initialsByLine, specialty, wildlife, completedAppointments, monthsAvailable, monthsTotal: months.length });
+    } catch (e) {
+      console.error("Range done load error:", e);
+      setRangeDone(null);
+    } finally {
+      setRangeLoading(false);
+    }
+  }, [userProfile?.companyId, period, today]);
+
+  useEffect(() => { loadRangeDone(); }, [loadRangeDone]);
+
+  // Backfill any missing months for the selected period via the aggregate
+  // endpoint, then reload from cache.
+  const refreshRange = useCallback(async () => {
+    const companyId = userProfile?.companyId;
+    if (!companyId) return;
+    setRangeRefreshing(true);
+    try {
+      const months = monthKeysForPeriod(period, today).length;
+      const res = await fetch("/api/fieldroutes/monthly-done", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companyId, months }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        toast.error(d.error || "Couldn't refresh history — check API budget.");
+      } else {
+        await loadRangeDone();
+        toast.success("History refreshed");
+      }
+    } catch {
+      toast.error("Couldn't refresh history.");
+    } finally {
+      setRangeRefreshing(false);
+    }
+  }, [userProfile?.companyId, period, today, loadRangeDone]);
 
   // Fetch routes for a custom date range only while that filter is enabled.
   useEffect(() => {
@@ -300,7 +392,7 @@ export default function DashboardPage() {
     // Per-service-line monthly targets (General Pest / Mosquito / Lawn / Termite /
     // Commercial) plus a combined Total. GR + Wildlife are excluded (one-time /
     // auto-scheduled). Weekly + Daily derive from the tracked-line Total.
-    const lineTargets = monthlyTargetsByLine(rawJobs, bounds.monthIndex, bounds.monthStart, today);
+    const lineTargets = monthlyTargetsByLine(rawJobs, bounds.monthIndex, bounds.monthStart, bounds.monthEnd, today);
     const totalRow = lineTargets[lineTargets.length - 1];
     const monthlyTarget = totalRow.target;
     const pace = totalRow.pace;
@@ -364,6 +456,25 @@ export default function DashboardPage() {
       jobsDueThisWeek,
     };
   }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, filterRoutes, bounds, today]);
+
+  // Historical period view (null for the current month, which uses the live cards).
+  const periodView = useMemo(() => {
+    if (period === "this_month") return null;
+    const months = monthKeysForPeriod(period, today);
+    const targets = targetsByLineForMonths(rawJobs, months);
+    const rows = TARGET_SERVICE_LINES.map((line) => ({
+      line,
+      label: TARGET_SERVICE_LINE_LABELS[line],
+      target: targets[line] || 0,
+      done: rangeDone?.byLine?.[line] || 0,
+    }));
+    const total = {
+      target: rows.reduce((s, r) => s + r.target, 0),
+      done: rows.reduce((s, r) => s + r.done, 0),
+    };
+    const label = DASHBOARD_PERIODS.find((p) => p.value === period)?.label || "";
+    return { months, rows, total, label };
+  }, [period, today, rawJobs, rangeDone]);
 
   const routeWindowLabel = dateFilterEnabled ? "Selected range" : "Today";
   const kpiWindowLabel = dateFilterEnabled ? "Selected range" : "This Week";
@@ -512,40 +623,99 @@ export default function DashboardPage() {
               })}
             </div>
 
-            {/* TARGETS — seasonality-aware monthly service targets per service line */}
-            <div className="flex items-center justify-between pt-2">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Monthly Targets by Service</p>
-              <p className="text-xs text-muted-foreground/50">{format(parseISO(today), "MMMM")} · company-wide</p>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {stats.lineTargets.map((lt) => {
-                const donePct = Math.round(lt.pace.donePct * 100);
-                const progressPct = Math.round(lt.pace.progressPct * 100);
-                const isTotal = lt.line === "total";
-                return (
-                  <Card key={lt.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
-                    <CardContent className="p-5 space-y-3">
-                      <div className="flex items-start justify-between">
-                        <div>
-                          <p className="text-[13px] text-muted-foreground font-medium">{isTotal ? "Total (All)" : lt.label}</p>
-                          <p className="text-3xl font-bold text-foreground tracking-tight">{lt.target.toLocaleString()}</p>
-                          <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {lt.pace.remaining.toLocaleString()} left</p>
-                        </div>
-                        <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
-                      </div>
-                      <div className="space-y-1">
-                        <Progress value={Math.min(100, donePct)} className="h-2" />
-                        <p className={`text-xs ${lt.pace.ahead ? "text-emerald-400" : "text-red-400"}`}>
-                          {donePct}% of target · {progressPct}% through month · {lt.pace.ahead ? "on/ahead of pace" : "behind pace"}
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
-                );
-              })}
+            {/* TARGETS — per service line, with a history period selector */}
+            <div className="flex items-center justify-between pt-2 gap-3 flex-wrap">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Targets by Service</p>
+              <div className="flex items-center gap-2">
+                {periodView && (
+                  <span className="text-xs text-muted-foreground/50">
+                    {rangeLoading ? "loading…" : `${rangeDone?.monthsAvailable ?? 0}/${rangeDone?.monthsTotal ?? periodView.months.length} months`}
+                  </span>
+                )}
+                {periodView && (
+                  <button
+                    onClick={refreshRange}
+                    disabled={rangeRefreshing}
+                    className="text-xs px-2 py-1 rounded-md border border-border/50 text-muted-foreground hover:bg-accent/30 disabled:opacity-50 transition-colors"
+                  >
+                    {rangeRefreshing ? "Refreshing…" : "Refresh"}
+                  </button>
+                )}
+                <select
+                  value={period}
+                  onChange={(e) => setPeriod(e.target.value as DashboardPeriod)}
+                  className="text-xs bg-card border border-border/50 rounded-md px-2 py-1.5 text-foreground focus:outline-none focus:ring-1 focus:ring-blue-500/40"
+                >
+                  {DASHBOARD_PERIODS.map((p) => (
+                    <option key={p.value} value={p.value}>{p.label}</option>
+                  ))}
+                </select>
+              </div>
             </div>
 
-            {/* Weekly + Daily — derived from the tracked-line Total */}
+            {periodView ? (
+              // Historical range: actual completed vs a rate-based target baseline.
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {[...periodView.rows, { line: "total" as const, label: "Total (All)", target: periodView.total.target, done: periodView.total.done }].map((r) => {
+                  const isTotal = r.line === "total";
+                  const pct = r.target > 0 ? Math.round((r.done / r.target) * 100) : 0;
+                  const ok = r.done >= r.target;
+                  return (
+                    <Card key={r.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
+                      <CardContent className="p-5 space-y-3">
+                        <div className="flex items-start justify-between">
+                          <div>
+                            <p className="text-[13px] text-muted-foreground font-medium">{r.label}</p>
+                            <p className="text-3xl font-bold text-foreground tracking-tight">
+                              {r.done.toLocaleString()}
+                              <span className="text-base text-muted-foreground/60 font-medium"> / {r.target.toLocaleString()}</span>
+                            </p>
+                            <p className="text-xs text-muted-foreground/70">{periodView.label} · done / target</p>
+                          </div>
+                          <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
+                        </div>
+                        <div className="space-y-1">
+                          <Progress value={Math.min(100, pct)} className="h-2" />
+                          <p className={`text-xs ${ok ? "text-emerald-400" : "text-red-400"}`}>{pct}% of target</p>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            ) : (
+              // Current month: live cards with pace.
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {stats.lineTargets.map((lt) => {
+                  const donePct = Math.round(lt.pace.donePct * 100);
+                  const progressPct = Math.round(lt.pace.progressPct * 100);
+                  const isTotal = lt.line === "total";
+                  return (
+                    <Card key={lt.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
+                      <CardContent className="p-5 space-y-3">
+                        <div className="flex items-start justify-between">
+                          <div>
+                            <p className="text-[13px] text-muted-foreground font-medium">{isTotal ? "Total (All)" : lt.label}</p>
+                            <p className="text-3xl font-bold text-foreground tracking-tight">{lt.target.toLocaleString()}</p>
+                            <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {lt.pace.remaining.toLocaleString()} left</p>
+                          </div>
+                          <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
+                        </div>
+                        <div className="space-y-1">
+                          <Progress value={Math.min(100, donePct)} className="h-2" />
+                          <p className={`text-xs ${lt.pace.ahead ? "text-emerald-400" : "text-red-400"}`}>
+                            {donePct}% of target · {progressPct}% through month · {lt.pace.ahead ? "on/ahead of pace" : "behind pace"}
+                          </p>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Weekly + Daily — current month only (derived from the tracked-line Total) */}
+            {!periodView && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               {/* Weekly target — with the same %-of-target pace as Monthly */}
               <Card className="border-border/40 animate-fade-in">
@@ -581,17 +751,34 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
             </div>
+            )}
 
-            {/* COMPLETED THIS MONTH — Initials / Specialty / Wildlife (from completed appointments) */}
+            {/* COMPLETED — Initials / Specialty / Wildlife (from completed appointments) */}
+            {(() => {
+              // Period-aware: current month uses the live monthlyDone doc; a
+              // historical period uses the summed cached aggregates.
+              const cd = periodView
+                ? (rangeDone && rangeDone.monthsAvailable > 0
+                    ? {
+                        initialsTotal: rangeDone.initials,
+                        initialsByLine: rangeDone.initialsByLine,
+                        specialtyDone: rangeDone.specialty,
+                        wildlifeDone: rangeDone.wildlife,
+                        completedAppointments: rangeDone.completedAppointments,
+                      }
+                    : null)
+                : monthlyDone;
+              const heading = periodView ? `Completed · ${periodView.label}` : "Completed This Month";
+              const caption = periodView
+                ? (rangeLoading ? "loading…" : cd ? `${cd.completedAppointments.toLocaleString()} appts` : "not yet computed — use Refresh")
+                : (monthlyDone ? `${monthlyDone.completedAppointments.toLocaleString()} appts · updated ${format(parseISO(monthlyDone.computedAt), "MMM d")}` : "not yet computed");
+              return (
+                <>
             <div className="flex items-center justify-between pt-2">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Completed This Month</p>
-              <p className="text-xs text-muted-foreground/50">
-                {monthlyDone
-                  ? `${monthlyDone.completedAppointments.toLocaleString()} appts · updated ${format(parseISO(monthlyDone.computedAt), "MMM d")}`
-                  : "not yet computed"}
-              </p>
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{heading}</p>
+              <p className="text-xs text-muted-foreground/50">{caption}</p>
             </div>
-            {monthlyDone ? (
+            {cd ? (
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 {/* Initials with per-line breakdown */}
                 <Card className="border-border/40 animate-fade-in">
@@ -599,14 +786,14 @@ export default function DashboardPage() {
                     <div className="flex items-start justify-between">
                       <div>
                         <p className="text-[13px] text-muted-foreground font-medium">Initials</p>
-                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.initialsTotal ?? 0).toLocaleString()}</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.initialsTotal ?? 0).toLocaleString()}</p>
                         <p className="text-xs text-muted-foreground/70">new-signup first services</p>
                       </div>
                       <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-400"><TrendingUp className="w-4 h-4" /></div>
                     </div>
                     <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground/70">
                       {INITIAL_LINE_LABELS.map(({ key, label }) => (
-                        <span key={key}>{label} <span className="text-foreground font-medium tabular-nums">{monthlyDone.initialsByLine?.[key] ?? 0}</span></span>
+                        <span key={key}>{label} <span className="text-foreground font-medium tabular-nums">{cd.initialsByLine?.[key] ?? 0}</span></span>
                       ))}
                     </div>
                   </CardContent>
@@ -618,7 +805,7 @@ export default function DashboardPage() {
                     <div className="flex items-start justify-between">
                       <div className="space-y-1">
                         <p className="text-[13px] text-muted-foreground font-medium">Specialty</p>
-                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.specialtyDone ?? 0).toLocaleString()}</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.specialtyDone ?? 0).toLocaleString()}</p>
                         <p className="text-xs text-muted-foreground/70">German Roach · flea · one-time · misc</p>
                       </div>
                       <div className="p-2 rounded-lg bg-amber-500/10 text-amber-400"><Activity className="w-4 h-4" /></div>
@@ -632,7 +819,7 @@ export default function DashboardPage() {
                     <div className="flex items-start justify-between">
                       <div className="space-y-1">
                         <p className="text-[13px] text-muted-foreground font-medium">Wildlife</p>
-                        <p className="text-3xl font-bold text-foreground tracking-tight">{(monthlyDone.wildlifeDone ?? 0).toLocaleString()}</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.wildlifeDone ?? 0).toLocaleString()}</p>
                         <p className="text-xs text-muted-foreground/70">exclusion &amp; wildlife work</p>
                       </div>
                       <div className="p-2 rounded-lg bg-rose-500/10 text-rose-400"><Briefcase className="w-4 h-4" /></div>
@@ -643,11 +830,16 @@ export default function DashboardPage() {
             ) : (
               <Card className="border-border/40">
                 <CardContent className="p-4 text-xs text-muted-foreground/70">
-                  Initials, Specialty, and Wildlife counts come from completed appointments. Run the monthly aggregate
-                  (POST <span className="font-mono">/api/fieldroutes/monthly-done</span>) to populate this section.
+                  Initials, Specialty, and Wildlife counts come from completed appointments.{" "}
+                  {periodView
+                    ? "This period hasn't been computed yet — hit Refresh above to pull it."
+                    : "Run a Sync (or the monthly aggregate) to populate this section."}
                 </CardContent>
               </Card>
             )}
+                </>
+              );
+            })()}
 
             {/* Jobs Due This Week chart */}
             <Card className="border-border/40 animate-fade-in">

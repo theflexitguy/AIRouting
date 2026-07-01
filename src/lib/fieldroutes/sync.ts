@@ -33,6 +33,7 @@ import {
 } from "./skills";
 import { FieldRoutesClient, FieldRoutesBudgetError } from "./client";
 import { loadBudget, recordApiUsage } from "./usage";
+import { computeMonthlyDone } from "./monthly-done";
 import {
   BALANCE_GATE,
   billingFrequencyLabel,
@@ -1570,6 +1571,21 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     };
     // Replace the whole run object (set without merge on the field) so stale keys don't linger.
     await stateRef.set({ run: progress, lastRunMode: mode, lastRunAt: finishedAt }, { merge: true });
+  }
+
+  // Keep the "Completed This Month" aggregate fresh on every completed sync so it
+  // rolls over automatically at month boundaries (fixes it showing last month's
+  // numbers on the 1st). Best-effort: any error (e.g. budget) just leaves the
+  // dashboard showing "not yet computed" until the next sync.
+  if (done) {
+    try {
+      const md = await computeMonthlyDone(client, today);
+      // Legacy single-doc (current-month card) + per-month doc (history selector).
+      await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(md.done);
+      await db.doc(`companies/${companyId}/monthlyDone/${md.done.month}`).set(md.done);
+    } catch (err) {
+      console.warn("[fieldroutes/sync] monthly-done refresh skipped:", String(err));
+    }
   }
 
   // Meter the reads this invocation spent against the daily cap.

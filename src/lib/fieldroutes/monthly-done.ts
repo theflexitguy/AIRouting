@@ -52,6 +52,7 @@ export function classifyServiceForTracking(description: string): TrackingClass {
 export interface MonthlyDone {
   month: string; // YYYY-MM
   monthStart: string;
+  monthEnd: string; // last day of the month (or today, for the current month)
   today: string;
   computedAt: string;
   completedAppointments: number;
@@ -66,16 +67,32 @@ export interface MonthlyDone {
 
 const RECURRING_LINES: ServiceLine[] = ["general", "mosquito", "lawn", "termite", "commercial"];
 
+/** Last calendar day of a YYYY-MM month, as YYYY-MM-DD. */
+function lastDayOfMonth(monthKey: string): string {
+  const m = /^(\d{4})-(\d{2})$/.exec(monthKey);
+  if (!m) return `${monthKey}-28`;
+  const day = new Date(Date.UTC(Number(m[1]), Number(m[2]), 0)).getUTCDate();
+  return `${monthKey}-${String(day).padStart(2, "0")}`;
+}
+
 /**
- * Pull this month's completed appointments and aggregate the done-counts.
- * Returns the aggregate plus a small raw sample for verification. Metered: ~1
- * serviceType catalog read + 1 appointment search + a couple of get chunks.
+ * Pull a month's completed appointments and aggregate the done-counts. Defaults
+ * to the current month; pass monthKey ("YYYY-MM") for any historical month (the
+ * window is bounded to that month, and to `today` for the current month so we
+ * never count the future). Returns the aggregate plus a small raw sample for
+ * verification. Metered: ~1 serviceType catalog read + 1 appointment search + a
+ * couple of get chunks.
  */
 export async function computeMonthlyDone(
   client: FieldRoutesClient,
   today: string = centralTodayISO(),
+  monthKey?: string,
 ): Promise<{ done: MonthlyDone; sample: { keys: string[]; rows: Record<string, unknown>[]; serviceTypeFieldUsed: string } }> {
-  const monthStart = `${today.slice(0, 7)}-01`;
+  const month = monthKey && /^\d{4}-\d{2}$/.test(monthKey) ? monthKey : today.slice(0, 7);
+  const monthStart = `${month}-01`;
+  const isCurrentMonth = month === today.slice(0, 7);
+  // For a past month, count the whole month; for the current month, stop at today.
+  const monthEnd = isCurrentMonth ? today : lastDayOfMonth(month);
 
   // 1) serviceType catalog: typeID -> description.
   const catalog = new Map<string, string>();
@@ -90,10 +107,10 @@ export async function computeMonthlyDone(
     // Catalog optional; we fall back to any description on the appointment itself.
   }
 
-  // 2) Completed appointments this month (status 1 = Completed).
+  // 2) Completed appointments in [monthStart, monthEnd] (status 1 = Completed).
   const apptIds = await client.searchIds("appointment", {
     status: 1,
-    date: { operator: ">=", value: monthStart },
+    date: { operator: "BETWEEN", value: [monthStart, monthEnd] },
   });
   const appts = apptIds.length ? await client.getEntities("appointment", apptIds) : [];
 
@@ -133,7 +150,7 @@ export async function computeMonthlyDone(
     const ar = rec(a);
     if (num(ar.status) !== 1) continue; // defensive: completed only
     const date = toDateOnly(ar.date);
-    if (!date || date < monthStart || date > today) continue;
+    if (!date || date < monthStart || date > monthEnd) continue;
     completed++;
 
     const desc = describe(ar);
@@ -164,8 +181,9 @@ export async function computeMonthlyDone(
   const initialsTotal = Object.values(initialsByLine).reduce((s, v) => s + v, 0);
 
   const done: MonthlyDone = {
-    month: today.slice(0, 7),
+    month,
     monthStart,
+    monthEnd,
     today,
     computedAt: new Date().toISOString(),
     completedAppointments: completed,
