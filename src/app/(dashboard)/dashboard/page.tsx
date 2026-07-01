@@ -206,8 +206,11 @@ export default function DashboardPage() {
       }));
 
       // Cached completed-this-month aggregate (Initials / Specialty / Wildlife).
+      // Ignore a doc left over from a previous month — showing last month's
+      // numbers under "Completed This Month" would be misleading on the 1st.
       const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
-      setMonthlyDone(mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null);
+      const md = mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null;
+      setMonthlyDone(md && md.month === today.slice(0, 7) ? md : null);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
       setTechs(techSnap.docs.map(d => {
@@ -300,7 +303,7 @@ export default function DashboardPage() {
     // Per-service-line monthly targets (General Pest / Mosquito / Lawn / Termite /
     // Commercial) plus a combined Total. GR + Wildlife are excluded (one-time /
     // auto-scheduled). Weekly + Daily derive from the tracked-line Total.
-    const lineTargets = monthlyTargetsByLine(rawJobs, bounds.monthIndex, bounds.monthStart, today);
+    const lineTargets = monthlyTargetsByLine(rawJobs, bounds.monthIndex, bounds.monthStart, bounds.monthEnd, today);
     const totalRow = lineTargets[lineTargets.length - 1];
     const monthlyTarget = totalRow.target;
     const pace = totalRow.pace;

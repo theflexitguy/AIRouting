@@ -292,6 +292,38 @@ export function isTrackedServiceLine(line: string): boolean {
   return (TARGET_SERVICE_LINES as readonly string[]).includes(line);
 }
 
+/**
+ * Lawn target/done for a specific month, counted DIRECTLY from the round
+ * subscriptions rather than the seasonality-rate formula. Lawn is a 7-round
+ * program where each customer's round is due on a real date inside its ~6-week
+ * window, so "how many are due this month" is the honest count:
+ *   done   = round subs COMPLETED this month (lastCompleted in [monthStart, today])
+ *   left   = round subs still DUE this month  (serviceDue in [monthStart, monthEnd],
+ *            not already completed this month)
+ *   target = done + left (every round appointment that belongs to this month)
+ * Counts subscriptions (each round is its own sub), not distinct customers.
+ */
+function lawnMonthTargetDone(
+  lawnJobs: JobLike[],
+  monthStart: string,
+  monthEnd: string,
+  today: string,
+): { target: number; done: number } {
+  let done = 0;
+  let due = 0;
+  for (const j of lawnJobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && lc >= monthStart && lc <= today) {
+      done++;
+      continue;
+    }
+    const sd = j.scheduledDate;
+    if (sd && sd >= monthStart && sd <= monthEnd) due++;
+  }
+  return { target: done + due, done };
+}
+
 export interface LineTarget {
   line: TargetServiceLine | "total";
   label: string;
@@ -310,17 +342,27 @@ export function monthlyTargetsByLine(
   jobs: JobLike[],
   month: number,
   monthStart: string,
+  monthEnd: string,
   today: string,
 ): LineTarget[] {
+  const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number } => {
+    // Lawn is counted by rounds actually due this month; every other line uses
+    // the seasonality-aware expected-services-per-month rate.
+    if (line === "lawn") return lawnMonthTargetDone(lineJobs, monthStart, monthEnd, today);
+    return {
+      target: monthlyServiceTarget(lineJobs, month),
+      done: monthlyServiced(lineJobs, monthStart, today),
+    };
+  };
+
   const rows: LineTarget[] = TARGET_SERVICE_LINES.map((line) => {
     const lineJobs = jobs.filter((j) => lineOf(j) === line);
-    const target = monthlyServiceTarget(lineJobs, month);
-    const done = monthlyServiced(lineJobs, monthStart, today);
+    const { target, done } = targetDoneFor(line, lineJobs);
     return { line, label: TARGET_SERVICE_LINE_LABELS[line], target, done, pace: monthlyPace(target, done, today) };
   });
-  const tracked = jobs.filter((j) => isTrackedServiceLine(lineOf(j)));
-  const target = monthlyServiceTarget(tracked, month);
-  const done = monthlyServiced(tracked, monthStart, today);
+  // Total sums the per-line figures so Lawn's due-count contributes consistently.
+  const target = rows.reduce((s, r) => s + r.target, 0);
+  const done = rows.reduce((s, r) => s + r.done, 0);
   rows.push({ line: "total", label: "Total", target, done, pace: monthlyPace(target, done, today) });
   return rows;
 }
