@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
@@ -11,16 +11,18 @@ import { computeMonthlyDone } from "@/lib/fieldroutes/monthly-done";
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 const clean = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
-// POST { companyId? } -> compute this month's completed-appointment aggregate
-// (Initials / Specialty / Wildlife / recurring done per line), cache it under
-// companies/{id}/fieldRoutesState/monthlyDone, and return it + a verification
+// Computes this month's completed-appointment aggregate (Initials / Specialty /
+// Wildlife / recurring done per line), caches it under
+// companies/{id}/fieldRoutesState/monthlyDone, and returns it + a verification
 // sample. companyId is optional when there's a single company doc.
-export async function POST(request: Request) {
+//   POST { companyId? }  or  GET ?companyId=...  (GET lets this be fetched
+//   directly — e.g. via a Vercel-protected-deployment fetch tool — without a
+//   JSON body).
+async function handle(companyIdParam: string | undefined) {
   try {
-    const body = (await request.json().catch(() => ({}))) as { companyId?: string };
     const db = adminDb();
 
-    let companyId = body.companyId && body.companyId !== "YOUR_COMPANY_ID" ? body.companyId : "";
+    let companyId = companyIdParam && companyIdParam !== "YOUR_COMPANY_ID" ? companyIdParam : "";
     if (!companyId) {
       const companies = await db.collection("companies").limit(5).get();
       if (companies.empty) return NextResponse.json({ error: "No company docs found" }, { status: 404 });
@@ -78,4 +80,14 @@ export async function POST(request: Request) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json().catch(() => ({}))) as { companyId?: string };
+  return handle(body.companyId);
+}
+
+export async function GET(request: NextRequest) {
+  const companyId = new URL(request.url).searchParams.get("companyId") || undefined;
+  return handle(companyId);
 }

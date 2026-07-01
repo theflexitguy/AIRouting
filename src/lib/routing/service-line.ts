@@ -40,8 +40,10 @@ export const SERVICE_LINE_META: Record<ServiceLine, ServiceLineMeta> = {
   gr:         { requiresOwnRoute: true,  defaultIntervalDays: 14,  flagLeadDays: 3,  seasonal: false },
   termite:    { requiresOwnRoute: true,  defaultIntervalDays: 365, flagLeadDays: 60, seasonal: false },
   // Lawn is sold as a 7-round annual program — each "Round" is a separate
-  // subscription that runs ~once per year, so the per-round interval is annual.
-  lawn:       { requiresOwnRoute: true,  defaultIntervalDays: 365, flagLeadDays: 14, seasonal: false },
+  // subscription/servicePlanRound that fires once within its own ~6-week
+  // seasonal window (see lawnRoundSeasonalWindow). defaultIntervalDays here is
+  // only the last-resort fallback when no real window can be determined.
+  lawn:       { requiresOwnRoute: true,  defaultIntervalDays: 365, flagLeadDays: 14, seasonal: true },
   mosquito:   { requiresOwnRoute: false, defaultIntervalDays: 30,  flagLeadDays: 5,  seasonal: true  },
   commercial: { requiresOwnRoute: false, defaultIntervalDays: 90,  flagLeadDays: 14, seasonal: false },
   wildlife:   { requiresOwnRoute: true,  defaultIntervalDays: 30,  flagLeadDays: 14, seasonal: false },
@@ -94,6 +96,32 @@ export function deriveServiceLine(serviceType: unknown, routeGroupTitle?: unknow
 
 export function serviceLineMeta(line: ServiceLine): ServiceLineMeta {
   return SERVICE_LINE_META[line] ?? SERVICE_LINE_META.general;
+}
+
+// Lawn round seasonal windows (owner-provided schedule). Each of the 7 "Round"
+// service types runs once a year in its own ~6-week window — FieldRoutes does
+// NOT populate subscription.seasonalStart/End for these (that's an account-wide
+// field, not set per round subscription), so the window is looked up by round
+// number instead of read off the subscription. Month-level approximation of the
+// day-level schedule (a day landing mid-month rounds to that month, so adjacent
+// rounds share their boundary month — e.g. both R2 and R3 touch April).
+//   R1  01/01–02/28   R2  03/01–04/14   R3  04/15–05/31   R4  06/01–07/15
+//   R5  07/16–08/31   R6  09/01–10/15   R7  10/16–11/30
+const LAWN_ROUND_SEASONS: Record<number, { startMonth: number; endMonth: number }> = {
+  1: { startMonth: 1, endMonth: 2 },
+  2: { startMonth: 3, endMonth: 4 },
+  3: { startMonth: 4, endMonth: 5 },
+  4: { startMonth: 6, endMonth: 7 },
+  5: { startMonth: 7, endMonth: 8 },
+  6: { startMonth: 9, endMonth: 10 },
+  7: { startMonth: 10, endMonth: 11 },
+};
+
+/** Seasonal window for a Lawn "Round N - ..." service type, or null if it doesn't match a known round. */
+export function lawnRoundSeasonalWindow(serviceType: unknown): { startMonth: number; endMonth: number } | null {
+  const m = /round\s*(\d)/i.exec(String(serviceType ?? ""));
+  if (!m) return null;
+  return LAWN_ROUND_SEASONS[Number(m[1])] || null;
 }
 
 export interface LineScopeInput {

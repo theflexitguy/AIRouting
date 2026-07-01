@@ -2,12 +2,12 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { centralTodayISO, toDateOnly, num } from "@/lib/fieldroutes/scope";
-import { deriveServiceLine, serviceLineMeta, isInScopeForLine, ServiceLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, serviceLineMeta, isInScopeForLine, lawnRoundSeasonalWindow, ServiceLine } from "@/lib/routing/service-line";
 import { TARGET_SERVICE_LINES, TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
 
 // Live reconciliation for ALL service-line monthly targets in ONE FieldRoutes
@@ -51,12 +51,11 @@ interface LineAgg {
   driftFlag: boolean; // live target vs stored target differ by >5%
 }
 
-export async function POST(request: Request) {
+async function handle(companyIdParam: string | undefined) {
   try {
-    const body = (await request.json().catch(() => ({}))) as { companyId?: string };
     const db = adminDb();
 
-    let companyId = body.companyId && body.companyId !== "YOUR_COMPANY_ID" ? body.companyId : "";
+    let companyId = companyIdParam && companyIdParam !== "YOUR_COMPANY_ID" ? companyIdParam : "";
     if (!companyId) {
       const companies = await db.collection("companies").limit(5).get();
       if (companies.empty) return NextResponse.json({ error: "No company docs found" }, { status: 404 });
@@ -100,9 +99,23 @@ export async function POST(request: Request) {
 
     // 1) ONE live pull of every active subscription.
     let subs: Record<string, unknown>[] = [];
+    let servicePlanRoundById = new Map<string, Record<string, unknown>>();
     try {
       const ids = await client.searchIds("subscription", { active: 1 });
       subs = ids.length ? await client.getEntities("subscription", ids) : [];
+      // Lawn "Round N" rows are servicePlanRound entities with the REAL
+      // per-customer/per-cycle startDate/endDate (a separate resource from the
+      // generic subscription record) — fetch it so this matches what production
+      // sync now stamps, instead of a flat/hardcoded window.
+      const lawnRoundIds = subs
+        .map((s) => rec(s))
+        .filter((sr) => deriveServiceLine(str(sr.serviceType)) === "lawn")
+        .map((sr) => str(sr.subscriptionID))
+        .filter(Boolean);
+      if (lawnRoundIds.length) {
+        const rounds = await client.getEntities("servicePlanRound", lawnRoundIds, { idParam: "subscriptionIDs" });
+        servicePlanRoundById = new Map(rounds.map((r) => [str(rec(r).subscriptionID), rec(r)]));
+      }
     } finally {
       await recordApiUsage(db, companyId, { reads: client.readCount });
     }
@@ -166,10 +179,30 @@ export async function POST(request: Request) {
       if (!subInScope) continue;
       agg.inScope++;
 
-      const freqDays = frequency > 0 ? frequency : serviceLineMeta(line).defaultIntervalDays;
-      const startMonth = monthOf(toDateOnly(sr.seasonalStart));
-      const endMonth = monthOf(toDateOnly(sr.seasonalEnd));
+      // Lawn rounds: prefer the REAL per-cycle window from servicePlanRound,
+      // falling back to the hardcoded round-number table — same precedence
+      // production sync uses. The effective interval scales with the window
+      // length (a round fires ONCE within its ~6-week window, not on a flat
+      // 365-day cycle), matching the production target-math fix.
+      const planRound = servicePlanRoundById.get(str(sr.subscriptionID));
+      const planRoundStart = planRound ? monthOf(toDateOnly(planRound.startDate)) : null;
+      const planRoundEnd = planRound ? monthOf(toDateOnly(planRound.endDate)) : null;
+      const lawnWindow =
+        line === "lawn"
+          ? planRoundStart !== null && planRoundEnd !== null
+            ? { startMonth: planRoundStart, endMonth: planRoundEnd }
+            : lawnRoundSeasonalWindow(serviceType)
+          : null;
+      const startMonth = lawnWindow ? lawnWindow.startMonth : monthOf(toDateOnly(sr.seasonalStart));
+      const endMonth = lawnWindow ? lawnWindow.endMonth : monthOf(toDateOnly(sr.seasonalEnd));
       const isSeasonal = startMonth !== null && endMonth !== null;
+      const windowMonths = isSeasonal ? endMonth - startMonth + 1 : 0;
+      const freqDays =
+        frequency > 0
+          ? frequency
+          : lawnWindow && windowMonths > 0
+            ? windowMonths * AVG_DAYS_PER_MONTH
+            : serviceLineMeta(line).defaultIntervalDays;
       if (isSeasonal) agg.seasonalCount++;
       const activeThisMonth = !isSeasonal
         ? true
@@ -242,4 +275,14 @@ export async function POST(request: Request) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json().catch(() => ({}))) as { companyId?: string };
+  return handle(body.companyId);
+}
+
+export async function GET(request: NextRequest) {
+  const companyId = new URL(request.url).searchParams.get("companyId") || undefined;
+  return handle(companyId);
 }
