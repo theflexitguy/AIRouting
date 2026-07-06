@@ -459,3 +459,168 @@ export function targetsByLineForMonths(jobs: JobLike[], monthKeys: string[]): Re
   }
   return out;
 }
+
+// ── Technicians Needed: 12-month workforce forecast ───────────────────────────
+//
+// "How many technicians must be hired each month, assuming we hit all of our
+// targets?" The workforce splits into 5 categories with owner-set daily
+// capacities. Recurring demand comes from the seasonality-aware per-line
+// targets projected onto each future month (current book); one-time demand
+// (specialty/initials/wildlife — new sales, not in the subscription book) uses
+// a trailing run rate of actual completed appointments. An optional monthly
+// growth % compounds the whole workload forward.
+
+export type TechCategory = "gpc" | "specialty" | "lawn" | "termite" | "wildlife";
+
+export const TECH_CATEGORIES: Array<{ key: TechCategory; label: string; perDay: number; handles: string }> = [
+  { key: "gpc", label: "GPC", perDay: 14, handles: "General Pest + Mosquito" },
+  { key: "specialty", label: "Specialty", perDay: 8, handles: "Commercial + GR + one-time + initials" },
+  { key: "lawn", label: "Lawn", perDay: 12, handles: "Lawn rounds" },
+  { key: "termite", label: "Termite", perDay: 5, handles: "Termite work" },
+  { key: "wildlife", label: "Wildlife", perDay: 4, handles: "Wildlife exclusion" },
+];
+
+/** Minimal slice of a cached MonthlyDone doc the forecast needs. */
+export interface MonthlyDoneLike {
+  specialtyDone?: number;
+  grDone?: number;
+  initialsTotal?: number;
+  wildlifeDone?: number;
+}
+
+/** The next `n` month keys (YYYY-MM) starting with `today`'s month, ascending. */
+export function nextMonthKeys(today: string, n: number): string[] {
+  const mm = /^(\d{4})-(\d{2})/.exec(today);
+  if (!mm) return [today.slice(0, 7)];
+  let year = Number(mm[1]);
+  let month = Number(mm[2]);
+  const keys: string[] = [];
+  for (let i = 0; i < n; i++) {
+    keys.push(monthKey(year, month));
+    month++;
+    if (month === 13) { month = 1; year++; }
+  }
+  return keys;
+}
+
+export interface TechForecastCell {
+  workload: number; // appointments that month
+  need: number; // FRACTIONAL techs needed: workload / (perDay * working days), 1 decimal
+  hire: number; // whole-person hires in THIS category after cross-coverage
+}
+
+export interface TechForecastRow {
+  month: string; // YYYY-MM
+  byCategory: Record<TechCategory, TechForecastCell>;
+  totalHires: number; // whole people to employ, after spare-day spillover
+  totalNeed: number; // sum of fractional needs (the raw workload in tech-months)
+  totalWorkload: number;
+}
+
+/**
+ * Whole-person hire plan with cross-coverage. Needs are fractional tech-months;
+ * a hired tech's SPARE DAYS cover other categories they're qualified for (days
+ * transfer 1:1 — a lawn tech doing GPC works at GPC's own daily pace):
+ *   - Only Termite techs do termite; their spare covers Specialty.
+ *   - Only Lawn techs do lawn; their spare covers GPC.
+ *   - Only Wildlife techs do wildlife; their spare covers GPC.
+ *   - Specialty techs' spare covers GPC.
+ *   - GPC absorbs everyone's leftovers, so a 0.15-tech lawn month never forces
+ *     a full lawn hire to sit idle — the fraction is visible and the remainder
+ *     of that person offsets the GPC (or Specialty) headcount.
+ */
+function hirePlanWithCoverage(need: Record<TechCategory, number>): Record<TechCategory, number> {
+  const termite = need.termite > 0 ? Math.ceil(need.termite) : 0;
+  const termiteSpare = termite - need.termite;
+
+  const specialtyNet = Math.max(0, need.specialty - termiteSpare);
+  const specialty = specialtyNet > 0 ? Math.ceil(specialtyNet) : 0;
+  const specialtySpare = specialty - specialtyNet;
+
+  const lawn = need.lawn > 0 ? Math.ceil(need.lawn) : 0;
+  const lawnSpare = lawn - need.lawn;
+
+  const wildlife = need.wildlife > 0 ? Math.ceil(need.wildlife) : 0;
+  const wildlifeSpare = wildlife - need.wildlife;
+
+  const gpcNet = Math.max(0, need.gpc - specialtySpare - lawnSpare - wildlifeSpare);
+  const gpc = gpcNet > 0 ? Math.ceil(gpcNet) : 0;
+
+  return { gpc, specialty, lawn, termite, wildlife };
+}
+
+/**
+ * 12-month technicians-needed forecast. `recentDone` = the last ≤3 cached
+ * monthly aggregates (for the one-time run rates); `growthPct` compounds
+ * monthly (0 = flat book). Old cached docs without grDone are treated as 0
+ * (slight run-rate overcount that self-corrects as syncs recompute months).
+ */
+export function technicianForecast(
+  jobs: JobLike[],
+  recentDone: MonthlyDoneLike[],
+  today: string,
+  growthPct: number,
+  months = 12,
+): TechForecastRow[] {
+  const keys = nextMonthKeys(today, months);
+  const avg = (values: number[]) =>
+    values.length ? values.reduce((s, v) => s + v, 0) / values.length : 0;
+  // One-time run rates from actual completed appointments (new-sales work that
+  // never appears in the recurring book): specialty minus its GR portion plus
+  // initials; wildlife on its own.
+  const oneTimeSpecialtyRate = avg(
+    recentDone.map((d) => Math.max(0, Number(d.specialtyDone || 0) - Number(d.grDone || 0)) + Number(d.initialsTotal || 0)),
+  );
+  const wildlifeRate = avg(recentDone.map((d) => Number(d.wildlifeDone || 0)));
+
+  const jobsByLine = new Map<string, JobLike[]>();
+  for (const line of ["general", "mosquito", "lawn", "termite", "commercial", "gr"]) {
+    jobsByLine.set(line, jobs.filter((j) => lineOf(j) === line));
+  }
+  const lineTarget = (line: string, month: number) =>
+    monthlyServiceTarget(jobsByLine.get(line) || [], month);
+
+  const growth = Number.isFinite(growthPct) ? Math.max(-50, Math.min(50, growthPct)) : 0;
+
+  return keys.map((mk, idx) => {
+    const month = Number(mk.slice(5, 7));
+    const factor = Math.pow(1 + growth / 100, idx);
+    const workloads: Record<TechCategory, number> = {
+      gpc: (lineTarget("general", month) + lineTarget("mosquito", month)) * factor,
+      specialty:
+        (lineTarget("commercial", month) + lineTarget("gr", month) + oneTimeSpecialtyRate) * factor,
+      lawn: lineTarget("lawn", month) * factor,
+      termite: lineTarget("termite", month) * factor,
+      wildlife: wildlifeRate * factor,
+    };
+    const need = {} as Record<TechCategory, number>;
+    let totalWorkload = 0;
+    for (const cat of TECH_CATEGORIES) {
+      const workload = Math.round(workloads[cat.key]);
+      need[cat.key] = workload > 0 ? workload / (cat.perDay * MONTH_WORKING_DAYS) : 0;
+      totalWorkload += workload;
+    }
+    const hires = hirePlanWithCoverage(need);
+
+    const byCategory = {} as Record<TechCategory, TechForecastCell>;
+    let totalHires = 0;
+    let totalNeed = 0;
+    for (const cat of TECH_CATEGORIES) {
+      const roundedNeed = Math.round(need[cat.key] * 10) / 10;
+      byCategory[cat.key] = {
+        workload: Math.round(workloads[cat.key]),
+        need: roundedNeed,
+        hire: hires[cat.key],
+      };
+      totalHires += hires[cat.key];
+      totalNeed += need[cat.key];
+    }
+    return {
+      month: mk,
+      byCategory,
+      totalHires,
+      totalNeed: Math.round(totalNeed * 10) / 10,
+      totalWorkload,
+    };
+  });
+}
