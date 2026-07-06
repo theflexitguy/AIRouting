@@ -505,14 +505,48 @@ export function nextMonthKeys(today: string, n: number): string[] {
 
 export interface TechForecastCell {
   workload: number; // appointments that month
-  techs: number; // ceil(workload / (perDay * working days))
+  need: number; // FRACTIONAL techs needed: workload / (perDay * working days), 1 decimal
+  hire: number; // whole-person hires in THIS category after cross-coverage
 }
 
 export interface TechForecastRow {
   month: string; // YYYY-MM
   byCategory: Record<TechCategory, TechForecastCell>;
-  totalTechs: number;
+  totalHires: number; // whole people to employ, after spare-day spillover
+  totalNeed: number; // sum of fractional needs (the raw workload in tech-months)
   totalWorkload: number;
+}
+
+/**
+ * Whole-person hire plan with cross-coverage. Needs are fractional tech-months;
+ * a hired tech's SPARE DAYS cover other categories they're qualified for (days
+ * transfer 1:1 — a lawn tech doing GPC works at GPC's own daily pace):
+ *   - Only Termite techs do termite; their spare covers Specialty.
+ *   - Only Lawn techs do lawn; their spare covers GPC.
+ *   - Only Wildlife techs do wildlife; their spare covers GPC.
+ *   - Specialty techs' spare covers GPC.
+ *   - GPC absorbs everyone's leftovers, so a 0.15-tech lawn month never forces
+ *     a full lawn hire to sit idle — the fraction is visible and the remainder
+ *     of that person offsets the GPC (or Specialty) headcount.
+ */
+function hirePlanWithCoverage(need: Record<TechCategory, number>): Record<TechCategory, number> {
+  const termite = need.termite > 0 ? Math.ceil(need.termite) : 0;
+  const termiteSpare = termite - need.termite;
+
+  const specialtyNet = Math.max(0, need.specialty - termiteSpare);
+  const specialty = specialtyNet > 0 ? Math.ceil(specialtyNet) : 0;
+  const specialtySpare = specialty - specialtyNet;
+
+  const lawn = need.lawn > 0 ? Math.ceil(need.lawn) : 0;
+  const lawnSpare = lawn - need.lawn;
+
+  const wildlife = need.wildlife > 0 ? Math.ceil(need.wildlife) : 0;
+  const wildlifeSpare = wildlife - need.wildlife;
+
+  const gpcNet = Math.max(0, need.gpc - specialtySpare - lawnSpare - wildlifeSpare);
+  const gpc = gpcNet > 0 ? Math.ceil(gpcNet) : 0;
+
+  return { gpc, specialty, lawn, termite, wildlife };
 }
 
 /**
@@ -559,16 +593,34 @@ export function technicianForecast(
       termite: lineTarget("termite", month) * factor,
       wildlife: wildlifeRate * factor,
     };
-    const byCategory = {} as Record<TechCategory, TechForecastCell>;
-    let totalTechs = 0;
+    const need = {} as Record<TechCategory, number>;
     let totalWorkload = 0;
     for (const cat of TECH_CATEGORIES) {
       const workload = Math.round(workloads[cat.key]);
-      const techs = workload > 0 ? Math.ceil(workload / (cat.perDay * MONTH_WORKING_DAYS)) : 0;
-      byCategory[cat.key] = { workload, techs };
-      totalTechs += techs;
+      need[cat.key] = workload > 0 ? workload / (cat.perDay * MONTH_WORKING_DAYS) : 0;
       totalWorkload += workload;
     }
-    return { month: mk, byCategory, totalTechs, totalWorkload };
+    const hires = hirePlanWithCoverage(need);
+
+    const byCategory = {} as Record<TechCategory, TechForecastCell>;
+    let totalHires = 0;
+    let totalNeed = 0;
+    for (const cat of TECH_CATEGORIES) {
+      const roundedNeed = Math.round(need[cat.key] * 10) / 10;
+      byCategory[cat.key] = {
+        workload: Math.round(workloads[cat.key]),
+        need: roundedNeed,
+        hire: hires[cat.key],
+      };
+      totalHires += hires[cat.key];
+      totalNeed += need[cat.key];
+    }
+    return {
+      month: mk,
+      byCategory,
+      totalHires,
+      totalNeed: Math.round(totalNeed * 10) / 10,
+      totalWorkload,
+    };
   });
 }

@@ -919,7 +919,7 @@ export default function DashboardPage() {
                             {cat.label} <span className="text-muted-foreground/40 font-normal">({cat.perDay}/day)</span>
                           </th>
                         ))}
-                        <th className="py-2.5 pr-4 font-medium text-right">Total</th>
+                        <th className="py-2.5 pr-4 font-medium text-right">Total hires</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -930,19 +930,22 @@ export default function DashboardPage() {
                           </td>
                           {TECH_CATEGORIES.map((cat) => {
                             const cell = row.byCategory[cat.key];
+                            const partial = cell.need > 0 && cell.need < 1;
                             return (
                               <td key={cat.key} className="py-2 pr-4 text-right">
-                                <span className="font-semibold tabular-nums">{cell.techs}</span>
+                                <span className={`font-semibold tabular-nums ${partial ? "text-amber-400" : ""}`}>
+                                  {cell.workload > 0 && cell.need < 0.05 ? "<0.1" : cell.need.toFixed(1)}
+                                </span>
                                 <span className="text-[10px] text-muted-foreground/50 tabular-nums block leading-tight">
-                                  {cell.workload.toLocaleString()} appts
+                                  {cell.workload.toLocaleString()} appts · hire {cell.hire}
                                 </span>
                               </td>
                             );
                           })}
                           <td className="py-2 pr-4 text-right">
-                            <span className="font-bold text-blue-400 tabular-nums">{row.totalTechs}</span>
+                            <span className="font-bold text-blue-400 tabular-nums">{row.totalHires}</span>
                             <span className="text-[10px] text-muted-foreground/50 tabular-nums block leading-tight">
-                              {row.totalWorkload.toLocaleString()} appts
+                              need {row.totalNeed.toFixed(1)} · {row.totalWorkload.toLocaleString()} appts
                             </span>
                           </td>
                         </tr>
@@ -951,10 +954,12 @@ export default function DashboardPage() {
                   </table>
                 </div>
                 <p className="text-[11px] text-muted-foreground/50 px-4 py-2.5 border-t border-border/30">
-                  Current book projected onto each month&apos;s seasonality · {MONTH_WORKING_DAYS} working days/month ·
-                  capacities: GPC 14, Specialty 8, Lawn 12, Termite 5, Wildlife 4 per day · Specialty includes Commercial,
-                  German Roach, and one-time/initial work; one-time &amp; wildlife volume uses a 3-month run rate of completed
-                  appointments{recentDone.length === 0 ? " (no history cached yet — run a Sync or backfill history to populate the run rates)" : ` (${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history)`}.
+                  Numbers are FRACTIONAL techs needed (0.2 = ~4 days of work, not a full hire — shown amber). &quot;Hire&quot; and the Total
+                  are whole people AFTER cross-coverage: a Termite tech&apos;s spare days cover Specialty; Specialty, Lawn &amp; Wildlife
+                  spare days cover GPC — so a partial tech&apos;s remainder offsets headcount elsewhere. Current book projected onto each
+                  month&apos;s seasonality · {MONTH_WORKING_DAYS} working days/month · capacities: GPC 14, Specialty 8, Lawn 12, Termite 5,
+                  Wildlife 4 per day · Specialty includes Commercial, German Roach, and one-time/initial work; one-time &amp; wildlife
+                  volume uses a 3-month run rate of completed appointments{recentDone.length === 0 ? " (no history cached yet — run a Sync or backfill history to populate the run rates)" : ` (${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history)`}.
                 </p>
               </CardContent>
             </Card>
