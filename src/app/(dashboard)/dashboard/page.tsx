@@ -26,6 +26,9 @@ import {
   isTrackedServiceLine,
   targetsByLineForMonths,
   monthKeysForPeriod,
+  technicianForecast,
+  TECH_CATEGORIES,
+  type MonthlyDoneLike,
   DASHBOARD_PERIODS,
   TARGET_SERVICE_LINES,
   TARGET_SERVICE_LINE_LABELS,
@@ -158,6 +161,11 @@ export default function DashboardPage() {
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [groupOptions, setGroupOptions] = useState<string[]>([]);
   const [monthlyDone, setMonthlyDone] = useState<MonthlyDone | null>(null);
+  // Technicians Needed forecast inputs: last <=3 cached monthly aggregates (for
+  // one-time run rates) + the persisted monthly growth %.
+  const [recentDone, setRecentDone] = useState<MonthlyDoneLike[]>([]);
+  const [growthPct, setGrowthPct] = useState("0");
+  const [savingGrowth, setSavingGrowth] = useState(false);
 
   // History selector: targets vs actuals over a past range. "this_month" keeps
   // the live current-month cards; any other period loads cached per-month
@@ -251,6 +259,17 @@ export default function DashboardPage() {
       const companySnap = await getDoc(doc(db, "companies", companyId));
       const saved = companySnap.exists() ? companySnap.data().fieldRoutesRouteGroups : undefined;
       setGroupOptions(Array.isArray(saved) ? saved.map((t: unknown) => String(t)).filter(Boolean) : []);
+      const g = companySnap.exists() ? Number(companySnap.data().forecastMonthlyGrowthPct) : 0;
+      setGrowthPct(Number.isFinite(g) && g !== 0 ? String(g) : "0");
+
+      // Last 3 months of cached completed-appointment aggregates — the one-time
+      // run rates for the Technicians Needed forecast. Missing docs just mean a
+      // 0 run rate until history is backfilled.
+      const last3 = monthKeysForPeriod("last_3_months", today);
+      const doneSnaps = await Promise.all(
+        last3.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
+      );
+      setRecentDone(doneSnaps.filter((s2) => s2.exists()).map((s2) => s2.data() as MonthlyDoneLike));
     } catch (error) {
       console.error("Dashboard data error:", error);
       setRawRoutes([]);
@@ -475,6 +494,32 @@ export default function DashboardPage() {
     const label = DASHBOARD_PERIODS.find((p) => p.value === period)?.label || "";
     return { months, rows, total, label };
   }, [period, today, rawJobs, rangeDone]);
+
+  // Technicians Needed: 12-month forecast from targets + one-time run rates.
+  const techForecast = useMemo(() => {
+    if (rawJobs.length === 0) return [];
+    return technicianForecast(rawJobs, recentDone, today, Number(growthPct) || 0);
+  }, [rawJobs, recentDone, today, growthPct]);
+
+  const saveGrowthPct = useCallback(async () => {
+    const companyId = userProfile?.companyId;
+    if (!companyId) return;
+    const g = Number(growthPct);
+    if (!Number.isFinite(g) || g < -50 || g > 50) {
+      toast.error("Growth % must be between -50 and 50.");
+      return;
+    }
+    setSavingGrowth(true);
+    try {
+      const { setDoc } = await import("firebase/firestore");
+      await setDoc(doc(db, "companies", companyId), { forecastMonthlyGrowthPct: g }, { merge: true });
+      toast.success(`Forecast growth set to ${g}%/month`);
+    } catch {
+      toast.error("Couldn't save growth %.");
+    } finally {
+      setSavingGrowth(false);
+    }
+  }, [userProfile?.companyId, growthPct]);
 
   const routeWindowLabel = dateFilterEnabled ? "Selected range" : "Today";
   const kpiWindowLabel = dateFilterEnabled ? "Selected range" : "This Week";
@@ -840,6 +885,79 @@ export default function DashboardPage() {
                 </>
               );
             })()}
+
+            {/* TECHNICIANS NEEDED — 12-month workforce forecast */}
+            <div className="flex items-center justify-between pt-2 gap-3 flex-wrap">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Technicians Needed — 12-Month Forecast</p>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground/50">Monthly growth</span>
+                <input
+                  value={growthPct}
+                  onChange={(e) => setGrowthPct(e.target.value.replace(/[^0-9.\-]/g, ""))}
+                  inputMode="decimal"
+                  className="w-16 text-xs bg-card border border-border/50 rounded-md px-2 py-1.5 text-foreground text-right focus:outline-none focus:ring-1 focus:ring-blue-500/40"
+                />
+                <span className="text-xs text-muted-foreground/50">%</span>
+                <button
+                  onClick={saveGrowthPct}
+                  disabled={savingGrowth}
+                  className="text-xs px-2 py-1 rounded-md border border-border/50 text-muted-foreground hover:bg-accent/30 disabled:opacity-50 transition-colors"
+                >
+                  {savingGrowth ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
+            <Card className="border-border/40 animate-fade-in">
+              <CardContent className="p-0">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                        <th className="py-2.5 pl-4 pr-4 font-medium">Month</th>
+                        {TECH_CATEGORIES.map((cat) => (
+                          <th key={cat.key} className="py-2.5 pr-4 font-medium text-right" title={cat.handles}>
+                            {cat.label} <span className="text-muted-foreground/40 font-normal">({cat.perDay}/day)</span>
+                          </th>
+                        ))}
+                        <th className="py-2.5 pr-4 font-medium text-right">Total</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {techForecast.map((row) => (
+                        <tr key={row.month} className="border-b border-border/20 last:border-0">
+                          <td className="py-2 pl-4 pr-4 text-foreground whitespace-nowrap">
+                            {format(parseISO(`${row.month}-01`), "MMM yyyy")}
+                          </td>
+                          {TECH_CATEGORIES.map((cat) => {
+                            const cell = row.byCategory[cat.key];
+                            return (
+                              <td key={cat.key} className="py-2 pr-4 text-right">
+                                <span className="font-semibold tabular-nums">{cell.techs}</span>
+                                <span className="text-[10px] text-muted-foreground/50 tabular-nums block leading-tight">
+                                  {cell.workload.toLocaleString()} appts
+                                </span>
+                              </td>
+                            );
+                          })}
+                          <td className="py-2 pr-4 text-right">
+                            <span className="font-bold text-blue-400 tabular-nums">{row.totalTechs}</span>
+                            <span className="text-[10px] text-muted-foreground/50 tabular-nums block leading-tight">
+                              {row.totalWorkload.toLocaleString()} appts
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-[11px] text-muted-foreground/50 px-4 py-2.5 border-t border-border/30">
+                  Current book projected onto each month&apos;s seasonality · {MONTH_WORKING_DAYS} working days/month ·
+                  capacities: GPC 14, Specialty 8, Lawn 12, Termite 5, Wildlife 4 per day · Specialty includes Commercial,
+                  German Roach, and one-time/initial work; one-time &amp; wildlife volume uses a 3-month run rate of completed
+                  appointments{recentDone.length === 0 ? " (no history cached yet — run a Sync or backfill history to populate the run rates)" : ` (${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history)`}.
+                </p>
+              </CardContent>
+            </Card>
 
             {/* Jobs Due This Week chart */}
             <Card className="border-border/40 animate-fade-in">

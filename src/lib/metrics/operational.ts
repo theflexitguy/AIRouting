@@ -459,3 +459,116 @@ export function targetsByLineForMonths(jobs: JobLike[], monthKeys: string[]): Re
   }
   return out;
 }
+
+// ── Technicians Needed: 12-month workforce forecast ───────────────────────────
+//
+// "How many technicians must be hired each month, assuming we hit all of our
+// targets?" The workforce splits into 5 categories with owner-set daily
+// capacities. Recurring demand comes from the seasonality-aware per-line
+// targets projected onto each future month (current book); one-time demand
+// (specialty/initials/wildlife — new sales, not in the subscription book) uses
+// a trailing run rate of actual completed appointments. An optional monthly
+// growth % compounds the whole workload forward.
+
+export type TechCategory = "gpc" | "specialty" | "lawn" | "termite" | "wildlife";
+
+export const TECH_CATEGORIES: Array<{ key: TechCategory; label: string; perDay: number; handles: string }> = [
+  { key: "gpc", label: "GPC", perDay: 14, handles: "General Pest + Mosquito" },
+  { key: "specialty", label: "Specialty", perDay: 8, handles: "Commercial + GR + one-time + initials" },
+  { key: "lawn", label: "Lawn", perDay: 12, handles: "Lawn rounds" },
+  { key: "termite", label: "Termite", perDay: 5, handles: "Termite work" },
+  { key: "wildlife", label: "Wildlife", perDay: 4, handles: "Wildlife exclusion" },
+];
+
+/** Minimal slice of a cached MonthlyDone doc the forecast needs. */
+export interface MonthlyDoneLike {
+  specialtyDone?: number;
+  grDone?: number;
+  initialsTotal?: number;
+  wildlifeDone?: number;
+}
+
+/** The next `n` month keys (YYYY-MM) starting with `today`'s month, ascending. */
+export function nextMonthKeys(today: string, n: number): string[] {
+  const mm = /^(\d{4})-(\d{2})/.exec(today);
+  if (!mm) return [today.slice(0, 7)];
+  let year = Number(mm[1]);
+  let month = Number(mm[2]);
+  const keys: string[] = [];
+  for (let i = 0; i < n; i++) {
+    keys.push(monthKey(year, month));
+    month++;
+    if (month === 13) { month = 1; year++; }
+  }
+  return keys;
+}
+
+export interface TechForecastCell {
+  workload: number; // appointments that month
+  techs: number; // ceil(workload / (perDay * working days))
+}
+
+export interface TechForecastRow {
+  month: string; // YYYY-MM
+  byCategory: Record<TechCategory, TechForecastCell>;
+  totalTechs: number;
+  totalWorkload: number;
+}
+
+/**
+ * 12-month technicians-needed forecast. `recentDone` = the last ≤3 cached
+ * monthly aggregates (for the one-time run rates); `growthPct` compounds
+ * monthly (0 = flat book). Old cached docs without grDone are treated as 0
+ * (slight run-rate overcount that self-corrects as syncs recompute months).
+ */
+export function technicianForecast(
+  jobs: JobLike[],
+  recentDone: MonthlyDoneLike[],
+  today: string,
+  growthPct: number,
+  months = 12,
+): TechForecastRow[] {
+  const keys = nextMonthKeys(today, months);
+  const avg = (values: number[]) =>
+    values.length ? values.reduce((s, v) => s + v, 0) / values.length : 0;
+  // One-time run rates from actual completed appointments (new-sales work that
+  // never appears in the recurring book): specialty minus its GR portion plus
+  // initials; wildlife on its own.
+  const oneTimeSpecialtyRate = avg(
+    recentDone.map((d) => Math.max(0, Number(d.specialtyDone || 0) - Number(d.grDone || 0)) + Number(d.initialsTotal || 0)),
+  );
+  const wildlifeRate = avg(recentDone.map((d) => Number(d.wildlifeDone || 0)));
+
+  const jobsByLine = new Map<string, JobLike[]>();
+  for (const line of ["general", "mosquito", "lawn", "termite", "commercial", "gr"]) {
+    jobsByLine.set(line, jobs.filter((j) => lineOf(j) === line));
+  }
+  const lineTarget = (line: string, month: number) =>
+    monthlyServiceTarget(jobsByLine.get(line) || [], month);
+
+  const growth = Number.isFinite(growthPct) ? Math.max(-50, Math.min(50, growthPct)) : 0;
+
+  return keys.map((mk, idx) => {
+    const month = Number(mk.slice(5, 7));
+    const factor = Math.pow(1 + growth / 100, idx);
+    const workloads: Record<TechCategory, number> = {
+      gpc: (lineTarget("general", month) + lineTarget("mosquito", month)) * factor,
+      specialty:
+        (lineTarget("commercial", month) + lineTarget("gr", month) + oneTimeSpecialtyRate) * factor,
+      lawn: lineTarget("lawn", month) * factor,
+      termite: lineTarget("termite", month) * factor,
+      wildlife: wildlifeRate * factor,
+    };
+    const byCategory = {} as Record<TechCategory, TechForecastCell>;
+    let totalTechs = 0;
+    let totalWorkload = 0;
+    for (const cat of TECH_CATEGORIES) {
+      const workload = Math.round(workloads[cat.key]);
+      const techs = workload > 0 ? Math.ceil(workload / (cat.perDay * MONTH_WORKING_DAYS)) : 0;
+      byCategory[cat.key] = { workload, techs };
+      totalTechs += techs;
+      totalWorkload += workload;
+    }
+    return { month: mk, byCategory, totalTechs, totalWorkload };
+  });
+}

@@ -16,6 +16,7 @@ export interface Company {
   allowCrossTechRouteEdits?: boolean;
   routingBalanceGate?: number; // customer balance ($) at/above which a stop is not scheduled (default 420)
   routingBalanceAgeDays?: number; // max balance age (days) allowed before blocking; 0 = unenforced
+  forecastMonthlyGrowthPct?: number; // Technicians Needed forecast: monthly book growth % (0 = flat)
   createdAt: string;
   active: boolean;
 }

@@ -61,6 +61,9 @@ export interface MonthlyDone {
   initialsByLine: Record<string, number>;
   initialsTotal: number;
   specialtyDone: number;
+  grDone: number; // GR completions (also counted inside specialtyDone) — split out
+  // so the tech forecast can use GR's recurring TARGET without double-counting
+  // GR actuals in the one-time run rate.
   wildlifeDone: number;
   unclassified: number;
 }
@@ -142,6 +145,7 @@ export async function computeMonthlyDone(
     initialsByLine[l] = 0;
   }
   let specialtyDone = 0;
+  let grDone = 0;
   let wildlifeDone = 0;
   let unclassified = 0;
   let completed = 0;
@@ -171,6 +175,7 @@ export async function computeMonthlyDone(
     }
     if (c.isSpecialty) {
       specialtyDone++;
+      if (c.line === "gr") grDone++;
       continue;
     }
     if (c.line in recurringDoneByLine) recurringDoneByLine[c.line]++;
@@ -192,6 +197,7 @@ export async function computeMonthlyDone(
     initialsByLine,
     initialsTotal,
     specialtyDone,
+    grDone,
     wildlifeDone,
     unclassified,
   };
