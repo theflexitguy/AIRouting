@@ -24,6 +24,8 @@ import {
   weeklyPace,
   monthlyTargetsByLine,
   isTrackedServiceLine,
+  scheduledCountByLine,
+  scheduledTrackedTotal,
   targetsByLineForMonths,
   monthKeysForPeriod,
   technicianForecast,
@@ -55,6 +57,8 @@ import {
   TrendingUp,
   Activity,
   CalendarDays,
+  CheckCircle2,
+  ListTodo,
 } from "lucide-react";
 import {
   BarChart,
@@ -94,13 +98,21 @@ interface TrendRow {
 interface DashboardStats {
   todayRoutes: number;
   totalStops: number;
+  completedToday: number;
+  stopsLeftToday: number;
   estimatedDriveTime: number;
   totalRouteValue: number;
   avgRouteValue: number;
   todayStopsPerHour: number | null;
   overdueStops: number;
   weekKpis: WeekKpis;
+  weekStopsBooked: number;
+  stopsLeftWeek: number;
   lineTargets: LineTarget[];
+  monthScheduledByLine: Record<string, number>;
+  monthScheduledTotal: number;
+  weekScheduled: number;
+  todayScheduled: number;
   monthlyTarget: number;
   weeklyTarget: number;
   dailyTarget: number;
@@ -123,6 +135,7 @@ interface JobRec extends JobLike {
   overdueActionable?: boolean;
   serviceType?: string;
   fieldRoutesRouteGroup?: string;
+  scheduledTech?: string; // FieldRoutes tech name on the booked appointment
 }
 interface TechOption {
   id: string;
@@ -405,6 +418,48 @@ export default function DashboardPage() {
     const totalRouteValue = todaySet.reduce((s, r) => s + (Number(r.routeValue) || 0), 0);
     const avgRouteValue = todaySet.length > 0 ? totalRouteValue / todaySet.length : 0;
 
+    // Jobs completed today within the tech/group filter scope (jobs carry the
+    // scheduled tech name + route group). Freshness is bounded by the last sync.
+    const jobInFilterScope = (j: JobRec) => {
+      if (filterGroup !== "all" && canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")) !== filterGroup) return false;
+      if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
+      return true;
+    };
+    const completedToday = rawJobs.filter(
+      j => j.subscriptionLastCompletedDate === today && jobInFilterScope(j)
+    ).length;
+
+    // Work still sitting on routes: future days count whole, today counts booked
+    // minus what's already been completed (as of the last sync). Past days are
+    // history, not remaining work.
+    const stopsStillToDo = (routes: RouteRec[]): number => {
+      let future = 0;
+      let todayBooked = 0;
+      for (const r of routes) {
+        if (r.date > today) future += r.totalStops || 0;
+        else if (r.date === today) todayBooked += r.totalStops || 0;
+      }
+      return future + Math.max(0, todayBooked - completedToday);
+    };
+    const stopsLeftToday = stopsStillToDo(todaySet);
+    const stopsLeftWeek = stopsStillToDo(kpiSet);
+    const weekStopsBooked = kpiSet.reduce((s, r) => s + (r.totalStops || 0), 0);
+
+    // Already-booked FieldRoutes appointments (the schedule as it stands) — the
+    // forward half of pace: done + booked vs target says whether the current
+    // schedule is enough to stay on track or the books need more.
+    const monthScheduledByLine = scheduledCountByLine(rawJobs, today, bounds.monthEnd);
+    const monthScheduledTotal = scheduledTrackedTotal(monthScheduledByLine);
+    const weekScheduled = scheduledTrackedTotal(scheduledCountByLine(rawJobs, today, bounds.weekEnd));
+    // "Booked today" answers "did we put enough on today's schedule?" — so an
+    // appointment completed earlier today still counts (unlike the month/week
+    // projections, which exclude completed appts to avoid double-counting done).
+    const todayScheduled = rawJobs.filter(
+      j => j.alreadyScheduled === true &&
+        j.fieldRoutesScheduledDate === today &&
+        isTrackedServiceLine(String(j.serviceLine ?? ""))
+    ).length;
+
     // Overdue + targets stay company-wide (subscriptions aren't tied to a route
     // group, and overdue subs are typically unassigned).
     const overdueStops = new Set(
@@ -462,13 +517,21 @@ export default function DashboardPage() {
     return {
       todayRoutes: todaySet.length,
       totalStops,
+      completedToday,
+      stopsLeftToday,
       estimatedDriveTime,
       totalRouteValue,
       avgRouteValue,
       todayStopsPerHour: stopsPerHour(todaySet),
       overdueStops,
       weekKpis,
+      weekStopsBooked,
+      stopsLeftWeek,
       lineTargets,
+      monthScheduledByLine,
+      monthScheduledTotal,
+      weekScheduled,
+      todayScheduled,
       monthlyTarget,
       weeklyTarget,
       dailyTarget,
@@ -477,7 +540,7 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, filterRoutes, bounds, today]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, filterRoutes, filterGroup, techKeys, bounds, today]);
 
   // Historical period view (null for the current month, which uses the live cards).
   const periodView = useMemo(() => {
@@ -532,17 +595,20 @@ export default function DashboardPage() {
   const todayCards = [
     { title: "Routes", value: String(stats.todayRoutes), subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
     { title: "Total Stops", value: String(stats.totalStops), subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
+    { title: "Completed", value: String(stats.completedToday), subtitle: "today · as of last sync", icon: CheckCircle2, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
+    { title: "Stops Remaining", value: String(stats.stopsLeftToday), subtitle: `${routeWindowLabel} · still on routes`, icon: ListTodo, color: "text-sky-400", bgColor: "bg-sky-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
     { title: "Avg Route Value", value: formatCurrency(stats.avgRouteValue), subtitle: `${routeWindowLabel} · per route`, icon: TrendingUp, color: "text-teal-400", bgColor: "bg-teal-500/10" },
     { title: "Stops / Hour", value: fmt1(stats.todayStopsPerHour), subtitle: `${routeWindowLabel} · per working hour`, icon: Activity, color: "text-yellow-400", bgColor: "bg-yellow-500/10" },
   ];
 
-  // THIS WEEK efficiency KPIs vs targets.
+  // THIS WEEK efficiency KPIs vs targets, plus the concrete work remaining.
   const weekCards = [
-    { title: "Stops / Route", value: fmt1(stats.weekKpis.stopsPerRoute), target: `≥ ${STOPS_PER_ROUTE_TARGET}`, ok: meetsTarget(stats.weekKpis.stopsPerRoute, STOPS_PER_ROUTE_TARGET) },
-    { title: "Stops / Hour", value: fmt1(stats.weekKpis.stopsPerHour), target: `≥ ${STOPS_PER_HOUR_TARGET.toFixed(1)}`, ok: meetsTarget(stats.weekKpis.stopsPerHour, STOPS_PER_HOUR_TARGET) },
-    { title: "Avg Drive Time", value: stats.weekKpis.avgDriveTime === null ? "—" : `${Math.round(stats.weekKpis.avgDriveTime)}m`, target: `< ${DRIVE_TIME_TARGET}m`, ok: meetsTarget(stats.weekKpis.avgDriveTime, DRIVE_TIME_TARGET, true) },
+    { title: "Stops Left on Routes", value: String(stats.stopsLeftWeek), target: null as string | null, subtitle: `of ${stats.weekStopsBooked.toLocaleString()} booked this week`, ok: null as boolean | null },
+    { title: "Stops / Route", value: fmt1(stats.weekKpis.stopsPerRoute), target: `≥ ${STOPS_PER_ROUTE_TARGET}`, subtitle: "", ok: meetsTarget(stats.weekKpis.stopsPerRoute, STOPS_PER_ROUTE_TARGET) },
+    { title: "Stops / Hour", value: fmt1(stats.weekKpis.stopsPerHour), target: `≥ ${STOPS_PER_HOUR_TARGET.toFixed(1)}`, subtitle: "", ok: meetsTarget(stats.weekKpis.stopsPerHour, STOPS_PER_HOUR_TARGET) },
+    { title: "Avg Drive Time", value: stats.weekKpis.avgDriveTime === null ? "—" : `${Math.round(stats.weekKpis.avgDriveTime)}m`, target: `< ${DRIVE_TIME_TARGET}m`, subtitle: "", ok: meetsTarget(stats.weekKpis.avgDriveTime, DRIVE_TIME_TARGET, true) },
   ];
 
   const weekDonePct = Math.round(stats.weekPace.donePct * 100);
@@ -613,7 +679,7 @@ export default function DashboardPage() {
 
             {/* TODAY — operational snapshot (route-derived; respects filters) */}
             <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{routeWindowLabel}</p>
-            <div className="grid grid-cols-2 lg:grid-cols-6 gap-4">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               {todayCards.map((stat, i) => {
                 const Icon = stat.icon;
                 return (
@@ -656,15 +722,17 @@ export default function DashboardPage() {
               <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">{kpiWindowLabel}</p>
               <p className="text-xs text-muted-foreground/50">{stats.weekKpis.routeCount} routes</p>
             </div>
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               {weekCards.map((kpi) => {
-                const color = kpi.ok === null ? "text-muted-foreground/50" : kpi.ok ? "text-emerald-400" : "text-red-400";
+                const color = kpi.target === null
+                  ? "text-foreground"
+                  : kpi.ok === null ? "text-muted-foreground/50" : kpi.ok ? "text-emerald-400" : "text-red-400";
                 return (
                   <Card key={kpi.title} className="border-border/40 animate-fade-in">
                     <CardContent className="p-5">
                       <p className="text-[13px] text-muted-foreground font-medium">{kpi.title}</p>
                       <p className={`text-2xl font-bold tracking-tight ${color}`}>{kpi.value}</p>
-                      <p className="text-xs text-muted-foreground/70">Target {kpi.target}</p>
+                      <p className="text-xs text-muted-foreground/70">{kpi.target === null ? kpi.subtitle : `Target ${kpi.target}`}</p>
                     </CardContent>
                   </Card>
                 );
@@ -738,6 +806,15 @@ export default function DashboardPage() {
                   const donePct = Math.round(lt.pace.donePct * 100);
                   const progressPct = Math.round(lt.pace.progressPct * 100);
                   const isTotal = lt.line === "total";
+                  // Forecast: what's already on the books for the rest of the
+                  // month. done + booked vs target answers "is the schedule as
+                  // it stands enough, or do we need to book more?"
+                  const booked = isTotal ? stats.monthScheduledTotal : (stats.monthScheduledByLine[lt.line] || 0);
+                  const projected = lt.pace.done + booked;
+                  const projPct = lt.target > 0 ? Math.round((projected / lt.target) * 100) : 0;
+                  const shortBy = Math.max(0, lt.target - projected);
+                  const doneW = lt.target > 0 ? Math.min(100, (lt.pace.done / lt.target) * 100) : 0;
+                  const bookedW = lt.target > 0 ? Math.min(100 - doneW, (booked / lt.target) * 100) : 0;
                   return (
                     <Card key={lt.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
                       <CardContent className="p-5 space-y-3">
@@ -745,14 +822,23 @@ export default function DashboardPage() {
                           <div>
                             <p className="text-[13px] text-muted-foreground font-medium">{isTotal ? "Total (All)" : lt.label}</p>
                             <p className="text-3xl font-bold text-foreground tracking-tight">{lt.target.toLocaleString()}</p>
-                            <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {lt.pace.remaining.toLocaleString()} left</p>
+                            <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {booked.toLocaleString()} booked · {lt.pace.remaining.toLocaleString()} left</p>
                           </div>
                           <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
                         </div>
                         <div className="space-y-1">
-                          <Progress value={Math.min(100, donePct)} className="h-2" />
+                          {/* Stacked: solid = done, faded = booked on the schedule */}
+                          <div className="h-2 w-full rounded-full bg-secondary overflow-hidden flex">
+                            <div className="h-full bg-primary" style={{ width: `${doneW}%` }} />
+                            <div className="h-full bg-primary/35" style={{ width: `${bookedW}%` }} />
+                          </div>
                           <p className={`text-xs ${lt.pace.ahead ? "text-emerald-400" : "text-red-400"}`}>
                             {donePct}% of target · {progressPct}% through month · {lt.pace.ahead ? "on/ahead of pace" : "behind pace"}
+                          </p>
+                          <p className={`text-xs ${shortBy === 0 ? "text-emerald-400" : "text-amber-400"}`}>
+                            {shortBy === 0
+                              ? `Schedule covers target · ${projected.toLocaleString()} done + booked`
+                              : `Projected ${projPct}% with schedule · book ${shortBy.toLocaleString()} more`}
                           </p>
                         </div>
                       </CardContent>
@@ -772,14 +858,26 @@ export default function DashboardPage() {
                     <div>
                       <p className="text-[13px] text-muted-foreground font-medium">Weekly Target</p>
                       <p className="text-3xl font-bold text-foreground tracking-tight">{stats.weeklyTarget.toLocaleString()}</p>
-                      <p className="text-xs text-muted-foreground/70">{stats.weekPace.done.toLocaleString()} done · {stats.weekPace.remaining.toLocaleString()} left</p>
+                      <p className="text-xs text-muted-foreground/70">{stats.weekPace.done.toLocaleString()} done · {stats.weekScheduled.toLocaleString()} booked · {stats.weekPace.remaining.toLocaleString()} left</p>
                     </div>
                     <div className="p-2 rounded-lg bg-purple-500/10 text-purple-400"><Gauge className="w-4 h-4" /></div>
                   </div>
                   <div className="space-y-1">
-                    <Progress value={Math.min(100, weekDonePct)} className="h-2" />
+                    {/* Stacked: solid = done, faded = booked through end of week */}
+                    <div className="h-2 w-full rounded-full bg-secondary overflow-hidden flex">
+                      <div className="h-full bg-primary" style={{ width: `${Math.min(100, weekDonePct)}%` }} />
+                      <div
+                        className="h-full bg-primary/35"
+                        style={{ width: `${stats.weeklyTarget > 0 ? Math.min(100 - Math.min(100, weekDonePct), (stats.weekScheduled / stats.weeklyTarget) * 100) : 0}%` }}
+                      />
+                    </div>
                     <p className={`text-xs ${stats.weekPace.ahead ? "text-emerald-400" : "text-red-400"}`}>
                       {weekDonePct}% of target · {weekProgressPct}% through week · {stats.weekPace.ahead ? "on/ahead of pace" : "behind pace"}
+                    </p>
+                    <p className={`text-xs ${stats.weekPace.done + stats.weekScheduled >= stats.weeklyTarget ? "text-emerald-400" : "text-amber-400"}`}>
+                      {stats.weekPace.done + stats.weekScheduled >= stats.weeklyTarget
+                        ? `Schedule covers target · ${(stats.weekPace.done + stats.weekScheduled).toLocaleString()} done + booked`
+                        : `Projected ${(stats.weekPace.done + stats.weekScheduled).toLocaleString()} with schedule · book ${(stats.weeklyTarget - stats.weekPace.done - stats.weekScheduled).toLocaleString()} more`}
                     </p>
                   </div>
                 </CardContent>
@@ -793,6 +891,9 @@ export default function DashboardPage() {
                       <p className="text-[13px] text-muted-foreground font-medium">Daily Target</p>
                       <p className="text-3xl font-bold text-foreground tracking-tight">{stats.dailyTarget.toLocaleString()}</p>
                       <p className="text-xs text-muted-foreground/70">Monthly ÷ {MONTH_WORKING_DAYS} working days</p>
+                      <p className={`text-xs ${stats.todayScheduled >= stats.dailyTarget ? "text-emerald-400" : "text-amber-400"}`}>
+                        {stats.todayScheduled.toLocaleString()} booked today vs {stats.dailyTarget.toLocaleString()} target
+                      </p>
                     </div>
                     <div className="p-2 rounded-lg bg-teal-500/10 text-teal-400"><CalendarDays className="w-4 h-4" /></div>
                   </div>
