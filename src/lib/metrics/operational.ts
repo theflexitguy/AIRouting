@@ -27,6 +27,8 @@ export interface JobLike {
   seasonalStartMonth?: number | null; // 1–12
   seasonalEndMonth?: number | null;
   serviceLine?: string; // general | gr | termite | lawn | mosquito | commercial | wildlife
+  alreadyScheduled?: boolean; // has a FieldRoutes appointment on the books
+  fieldRoutesScheduledDate?: string; // that appointment's date (YYYY-MM-DD)
 }
 
 // Assume 20 working days in a service month (owner's standard).
@@ -193,6 +195,34 @@ export function monthlyServiceTarget(jobs: JobLike[], month: number): number {
     total += AVG_DAYS_PER_MONTH / days;
   }
   return Math.round(total);
+}
+
+/**
+ * Per-line count of subscriptions with a FieldRoutes appointment already ON THE
+ * BOOKS inside [start, end]. This is the forward-looking half of pace: done
+ * tells you what happened, booked tells you whether the schedule as it stands
+ * is enough to hit the target. An appointment on/before the sub's last
+ * completion is finished work, not booked work, so it doesn't count (this also
+ * keeps a stop completed earlier today from being both "done" and "booked").
+ */
+export function scheduledCountByLine(jobs: JobLike[], start: string, end: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const j of jobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    if (j.alreadyScheduled !== true) continue;
+    const d = j.fieldRoutesScheduledDate;
+    if (!d || d < start || d > end) continue;
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && d <= lc) continue;
+    const line = lineOf(j);
+    out[line] = (out[line] || 0) + 1;
+  }
+  return out;
+}
+
+/** Sum a scheduledCountByLine result over the tracked target lines. */
+export function scheduledTrackedTotal(byLine: Record<string, number>): number {
+  return TARGET_SERVICE_LINES.reduce((s, l) => s + (byLine[l] || 0), 0);
 }
 
 /** Distinct customers serviced (last-completed) within [monthStart, today]. */
