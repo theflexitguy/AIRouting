@@ -720,10 +720,21 @@ async function reconcileScheduledRoutes(
     const prevFr: string[] = Array.isArray(existing.data.fieldRoutesStopIds)
       ? existing.data.fieldRoutesStopIds.map(String)
       : [];
-    if (prevFr.length === 0) continue; // not FieldRoutes-managed — leave it alone
     const prevSeq: string[] = Array.isArray(existing.data.stopSequence)
       ? existing.data.stopSequence.map(String)
       : [];
+    if (prevFr.length === 0) {
+      // Not FieldRoutes-managed. Leave real routes alone, but an already-empty
+      // doc is meaningless (a phantom route the dashboard would still count) —
+      // sweep it regardless of source so it can't linger.
+      if (prevSeq.length === 0) {
+        batch.delete(existing.ref);
+        routesDeleted++;
+        ops++;
+        if (ops >= 450) await commit();
+      }
+      continue;
+    }
     const preserved = prevSeq.filter((id) => !prevFr.includes(id));
     if (preserved.length === 0) {
       batch.delete(existing.ref);
@@ -1322,13 +1333,21 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const serviceLine = deriveServiceLine(serviceType);
       const isLawnPlan = serviceLine === "lawn";
 
+      // A scheduled appointment (today-or-later, non-cancelled) means this stop is
+      // on a real FieldRoutes route. Look it up BEFORE the recurring gate so a
+      // One-Time job with a future appointment (wildlife exclusion, bed bug,
+      // one-time GP, an Initial service) is kept and materialized as a route —
+      // otherwise the delete guard drops it and its route never appears.
+      const appt = apptMap[subscriptionId];
+      const alreadyScheduled = Boolean(appt);
+
       // The app is recurring + ACTIVE only. Drop a subscription doc when it is no
       // longer active (cancelled/frozen → active != 1) or not genuinely recurring
-      // (One-Time -1 / As Needed 0). This is how a sub that was deactivated in
-      // FieldRoutes stops showing stale past-dues: the incremental sync re-pulls
-      // it via dateUpdated, sees active != 1, and deletes the doc. (Pure Firestore
-      // op; the full-set sweep in reconcileActiveSubscriptions catches the rest.)
-      if (active !== 1 || (!isRecurringFrequency(frequency) && !isLawnPlan)) {
+      // (One-Time -1 / As Needed 0) — UNLESS it has a future appointment, so
+      // scheduled one-time work still shows on its route. This is how a sub that
+      // was deactivated in FieldRoutes stops showing stale past-dues: the
+      // incremental sync re-pulls it, sees active != 1, and deletes the doc.
+      if (active !== 1 || (!isRecurringFrequency(frequency) && !isLawnPlan && !alreadyScheduled)) {
         const stale = db.doc(`companies/${companyId}/jobs/sub_${subscriptionId}`);
         batch.delete(stale);
         subsProcessed++;
@@ -1363,8 +1382,6 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         continue;
       }
 
-      const appt = apptMap[subscriptionId];
-      const alreadyScheduled = Boolean(appt);
       // Coerce with str() so a missing field on a rehydrated appt entry (Firestore
       // strips undefined on persist) can never propagate undefined into the doc write.
       const scheduledFor = appt ? str(appt.date) : "";
@@ -1421,8 +1438,14 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const serviceDueAlreadyCompleted =
         Boolean(lastCompleted) && Boolean(serviceDue) && lastCompleted >= serviceDue;
 
+      // A One-Time / As-Needed sub can have a past completion AND a fresh future
+      // appointment (e.g. a repeat wildlife job). For non-recurring subs the
+      // future appointment wins so it still materializes as a scheduled route;
+      // recurring precedence (completion rolls the date forward) is unchanged.
+      const nonRecurring = !isRecurringFrequency(frequency) && !isLawnPlan;
       let status: string;
-      if (serviceDueAlreadyCompleted) status = "completed";
+      if (alreadyScheduled && nonRecurring) status = "scheduled";
+      else if (serviceDueAlreadyCompleted) status = "completed";
       else if (alreadyScheduled) status = "scheduled";
       else if (flags.autoRoutable) status = "pending";
       else if (flags.needsReview) status = "review";
@@ -1822,25 +1845,22 @@ export async function reconcileActiveSubscriptions(): Promise<{
     return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "api cap reached" };
   }
 
+  // Pull EVERY active subscription (no frequency filter): a frequency>0 filter
+  // would drop One-Time subs, and this sweep would then delete the job docs of
+  // scheduled one-time work (wildlife/initials/etc.) that the main loop keeps.
+  // The main loop is the sole recurring-vs-one-time gatekeeper; this sweep only
+  // removes docs whose subscription is no longer active at all.
   let activeIds: string[];
   try {
-    activeIds = await client.searchIds("subscription", {
-      active: 1,
-      frequency: { operator: ">", value: 0 },
-    });
+    activeIds = await client.searchIds("subscription", { active: 1 });
   } catch (err) {
     if (err instanceof FieldRoutesBudgetError) {
       await recordApiUsage(db, companyId, { reads: client.readCount });
       return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "api cap reached" };
     }
-    // Filter unsupported → fall back to active-only (still excludes cancelled/frozen).
-    try {
-      activeIds = await client.searchIds("subscription", { active: 1 });
-    } catch (err2) {
-      await recordApiUsage(db, companyId, { reads: client.readCount });
-      console.warn("[fieldroutes/reconcile] active subscription search failed; skipping sweep:", String(err2));
-      return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "search failed" };
-    }
+    await recordApiUsage(db, companyId, { reads: client.readCount });
+    console.warn("[fieldroutes/reconcile] active subscription search failed; skipping sweep:", String(err));
+    return { companyId, activeCount: 0, scanned: 0, deleted: 0, skipped: true, reason: "search failed" };
   }
   await recordApiUsage(db, companyId, { reads: client.readCount });
 
@@ -1888,6 +1908,7 @@ export async function purgeNonRecurring(): Promise<{ companyId: string; scanned:
   const db = adminDb();
 
   const snap = await db.collection(`companies/${companyId}/jobs`).where("source", "==", "api").get();
+  const today = centralTodayISO();
   let batch = db.batch();
   let ops = 0;
   let deleted = 0;
@@ -1897,6 +1918,11 @@ export async function purgeNonRecurring(): Promise<{ companyId: string; scanned:
     // Lawn rounds are recurring revenue carried with a placeholder frequency —
     // never purge them as "non-recurring".
     if (deriveServiceLine(d.serviceType) === "lawn") continue;
+    // A one-time doc with a future FieldRoutes appointment is real scheduled work
+    // (wildlife exclusion, bed bug, Initial, etc.). The main sync loop keeps these
+    // with status "scheduled" so they materialize as routes — don't let this purge
+    // undo that. Only exempt future dates; a past scheduled appointment is done.
+    if (d.alreadyScheduled && str(d.fieldRoutesScheduledDate) >= today) continue;
     const hasRawFrequency = typeof d.frequency === "number";
     const label = str(d.recurringFrequency);
     const nonRecurring = hasRawFrequency

@@ -379,6 +379,9 @@ export default function DashboardPage() {
   // Apply technician + route-group filters to a set of routes.
   const filterRoutes = useMemo(() => {
     return (routes: RouteRec[]) => routes.filter(r => {
+      // A route with no stops is a phantom (its underlying job docs were purged
+      // out from under it) — never count or display it as a route.
+      if ((r.totalStops || 0) <= 0) return false;
       // Match on the canonical bucket so every FieldRoutes spelling variant of a
       // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
       if (filterGroup !== "all" && canonicalRouteGroup(String(r.routeGroupTitle || "")) !== filterGroup) return false;
