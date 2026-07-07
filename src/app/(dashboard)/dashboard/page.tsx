@@ -28,7 +28,9 @@ import {
   scheduledTrackedTotal,
   targetsByLineForMonths,
   monthKeysForPeriod,
+  trailingMonthKeys,
   technicianForecast,
+  deriveForecastGrowth,
   TECH_CATEGORIES,
   type MonthlyDoneLike,
   DASHBOARD_PERIODS,
@@ -60,6 +62,9 @@ import {
   CheckCircle2,
   ListTodo,
   RotateCcw,
+  Repeat,
+  UserPlus,
+  FilePlus2,
 } from "lucide-react";
 import {
   BarChart,
@@ -190,8 +195,11 @@ export default function DashboardPage() {
     initials: number;
     initialsByLine: Record<string, number>;
     reservices: number;
+    followups: number;
     specialty: number;
     wildlife: number;
+    newCustomers: number;
+    newSubscriptions: number;
     completedAppointments: number;
     monthsAvailable: number;
     monthsTotal: number;
@@ -277,12 +285,15 @@ export default function DashboardPage() {
       const g = companySnap.exists() ? Number(companySnap.data().forecastMonthlyGrowthPct) : 0;
       setGrowthPct(Number.isFinite(g) && g !== 0 ? String(g) : "0");
 
-      // Last 3 months of cached completed-appointment aggregates — the one-time
-      // run rates for the Technicians Needed forecast. Missing docs just mean a
-      // 0 run rate until history is backfilled.
-      const last3 = monthKeysForPeriod("last_3_months", today);
+      // Trailing 15 months of cached completed-appointment aggregates — the
+      // Technicians Needed forecast reads them two ways: recent run rates AND
+      // year-over-year seasonality (same calendar month a year ago for each of
+      // the next 12 forecast months, plus the year-ago comparison for the recent
+      // trend). Missing docs just mean a fallback to flat recent-3mo until the
+      // history is backfilled via Refresh.
+      const histKeys = trailingMonthKeys(today, 15);
       const doneSnaps = await Promise.all(
-        last3.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
+        histKeys.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
       );
       setRecentDone(doneSnaps.filter((s2) => s2.exists()).map((s2) => s2.data() as MonthlyDoneLike));
     } catch (error) {
@@ -309,7 +320,8 @@ export default function DashboardPage() {
       const byLine: Record<string, number> = {};
       const initialsByLine: Record<string, number> = {};
       for (const l of TARGET_SERVICE_LINES) { byLine[l] = 0; initialsByLine[l] = 0; }
-      let initials = 0, reservices = 0, specialty = 0, wildlife = 0, completedAppointments = 0, monthsAvailable = 0;
+      let initials = 0, reservices = 0, followups = 0, specialty = 0, wildlife = 0;
+      let newCustomers = 0, newSubscriptions = 0, completedAppointments = 0, monthsAvailable = 0;
       for (const s of snaps) {
         if (!s.exists()) continue;
         monthsAvailable++;
@@ -318,11 +330,14 @@ export default function DashboardPage() {
         for (const k of Object.keys(d.initialsByLine || {})) initialsByLine[k] = (initialsByLine[k] || 0) + Number(d.initialsByLine[k] || 0);
         initials += Number(d.initialsTotal || 0);
         reservices += Number(d.reserviceDone || 0);
+        followups += Number(d.followupDone || 0);
         specialty += Number(d.specialtyDone || 0);
         wildlife += Number(d.wildlifeDone || 0);
+        newCustomers += Number(d.newCustomers || 0);
+        newSubscriptions += Number(d.newSubscriptions || 0);
         completedAppointments += Number(d.completedAppointments || 0);
       }
-      setRangeDone({ byLine, initials, initialsByLine, reservices, specialty, wildlife, completedAppointments, monthsAvailable, monthsTotal: months.length });
+      setRangeDone({ byLine, initials, initialsByLine, reservices, followups, specialty, wildlife, newCustomers, newSubscriptions, completedAppointments, monthsAvailable, monthsTotal: months.length });
     } catch (e) {
       console.error("Range done load error:", e);
       setRangeDone(null);
@@ -564,11 +579,19 @@ export default function DashboardPage() {
     return { months, rows, total, label };
   }, [period, today, rawJobs, rangeDone]);
 
-  // Technicians Needed: 12-month forecast from targets + one-time run rates.
+  // Technicians Needed: 12-month forecast. `recentDone` holds the trailing 15
+  // months of aggregates, used for both YoY seasonality and the recent trend.
   const techForecast = useMemo(() => {
     if (rawJobs.length === 0) return [];
     return technicianForecast(rawJobs, recentDone, today, Number(growthPct) || 0);
   }, [rawJobs, recentDone, today, growthPct]);
+
+  // Resolved growth driver for display: "auto" (from new-subscription YoY trend)
+  // or "manual" (the growth % input) when there's not enough history.
+  const forecastGrowth = useMemo(
+    () => deriveForecastGrowth(recentDone, today, Number(growthPct) || 0),
+    [recentDone, today, growthPct],
+  );
 
   const saveGrowthPct = useCallback(async () => {
     const companyId = userProfile?.companyId;
@@ -915,8 +938,11 @@ export default function DashboardPage() {
                         initialsTotal: rangeDone.initials,
                         initialsByLine: rangeDone.initialsByLine,
                         reserviceDone: rangeDone.reservices,
+                        followupDone: rangeDone.followups,
                         specialtyDone: rangeDone.specialty,
                         wildlifeDone: rangeDone.wildlife,
+                        newCustomers: rangeDone.newCustomers,
+                        newSubscriptions: rangeDone.newSubscriptions,
                         completedAppointments: rangeDone.completedAppointments,
                       }
                     : null)
@@ -952,16 +978,30 @@ export default function DashboardPage() {
                   </CardContent>
                 </Card>
 
-                {/* Reservices / follow-ups — free callbacks; feeds the tech forecast as GPC workload */}
+                {/* Reservices — unscheduled returns/callbacks; feeds the forecast as GPC workload */}
                 <Card className="border-border/40 animate-fade-in">
                   <CardContent className="p-5">
                     <div className="flex items-start justify-between">
                       <div className="space-y-1">
                         <p className="text-[13px] text-muted-foreground font-medium">Reservices</p>
                         <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.reserviceDone ?? 0).toLocaleString()}</p>
-                        <p className="text-xs text-muted-foreground/70">reservices &amp; follow-ups</p>
+                        <p className="text-xs text-muted-foreground/70">reservices / retreats / callbacks</p>
                       </div>
                       <div className="p-2 rounded-lg bg-sky-500/10 text-sky-400"><RotateCcw className="w-4 h-4" /></div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Follow-ups — own bucket; also feeds the forecast as GPC workload */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[13px] text-muted-foreground font-medium">Follow-ups</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.followupDone ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">scheduled follow-up visits</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-indigo-500/10 text-indigo-400"><Repeat className="w-4 h-4" /></div>
                     </div>
                   </CardContent>
                 </Card>
@@ -997,13 +1037,51 @@ export default function DashboardPage() {
             ) : (
               <Card className="border-border/40">
                 <CardContent className="p-4 text-xs text-muted-foreground/70">
-                  Initials, Reservices, Specialty, and Wildlife counts come from completed appointments.{" "}
+                  Initials, Reservices, Follow-ups, Specialty, and Wildlife counts come from completed appointments.{" "}
                   {periodView
                     ? "This period hasn't been computed yet — hit Refresh above to pull it."
                     : "Run a Sync (or the monthly aggregate) to populate this section."}
                 </CardContent>
               </Card>
             )}
+
+            {/* NEW BUSINESS — customers & subscriptions added in the period; drives the forecast growth rate */}
+            {cd ? (
+              <>
+                <div className="flex items-center justify-between pt-2">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">
+                    {periodView ? `New Business · ${periodView.label}` : "New Business This Month"}
+                  </p>
+                  <p className="text-xs text-muted-foreground/50">records created this period · drives the forecast growth rate</p>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <Card className="border-border/40 animate-fade-in">
+                    <CardContent className="p-5">
+                      <div className="flex items-start justify-between">
+                        <div className="space-y-1">
+                          <p className="text-[13px] text-muted-foreground font-medium">New Customers</p>
+                          <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.newCustomers ?? 0).toLocaleString()}</p>
+                          <p className="text-xs text-muted-foreground/70">first-time accounts added</p>
+                        </div>
+                        <div className="p-2 rounded-lg bg-green-500/10 text-green-400"><UserPlus className="w-4 h-4" /></div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                  <Card className="border-border/40 animate-fade-in">
+                    <CardContent className="p-5">
+                      <div className="flex items-start justify-between">
+                        <div className="space-y-1">
+                          <p className="text-[13px] text-muted-foreground font-medium">New Subscriptions</p>
+                          <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.newSubscriptions ?? 0).toLocaleString()}</p>
+                          <p className="text-xs text-muted-foreground/70">recurring plans sold</p>
+                        </div>
+                        <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400"><FilePlus2 className="w-4 h-4" /></div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              </>
+            ) : null}
                 </>
               );
             })()}
@@ -1012,14 +1090,24 @@ export default function DashboardPage() {
             <div className="flex items-center justify-between pt-2 gap-3 flex-wrap">
               <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Technicians Needed — 12-Month Forecast</p>
               <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground/50">Monthly growth</span>
+                <span
+                  className={`text-xs ${forecastGrowth.source === "auto" ? "text-emerald-400" : "text-muted-foreground/50"}`}
+                  title={forecastGrowth.source === "auto"
+                    ? "Growth is derived from your new-subscription trend vs. the same period last year. Type a monthly % to override."
+                    : "Not enough year-over-year history for an auto rate — using your manual monthly growth %."}
+                >
+                  {forecastGrowth.source === "auto"
+                    ? `Auto ${forecastGrowth.annualPct >= 0 ? "+" : ""}${forecastGrowth.annualPct}%/yr`
+                    : "Manual growth"}
+                </span>
+                <span className="text-xs text-muted-foreground/40">·</span>
+                <span className="text-xs text-muted-foreground/50" title="Override the auto rate. 0 = auto.">override %/mo</span>
                 <input
                   value={growthPct}
                   onChange={(e) => setGrowthPct(e.target.value.replace(/[^0-9.\-]/g, ""))}
                   inputMode="decimal"
                   className="w-16 text-xs bg-card border border-border/50 rounded-md px-2 py-1.5 text-foreground text-right focus:outline-none focus:ring-1 focus:ring-blue-500/40"
                 />
-                <span className="text-xs text-muted-foreground/50">%</span>
                 <button
                   onClick={saveGrowthPct}
                   disabled={savingGrowth}
@@ -1081,8 +1169,12 @@ export default function DashboardPage() {
                   spare days cover GPC — so a partial tech&apos;s remainder offsets headcount elsewhere. Current book projected onto each
                   month&apos;s seasonality · {MONTH_WORKING_DAYS} working days/month · capacities: GPC 14, Specialty 8, Lawn 12, Termite 5,
                   Wildlife 4 per day · Specialty includes Commercial, German Roach, and one-time/initial work; GPC includes
-                  reservices/follow-ups. One-time, reservice &amp; wildlife volume uses a 3-month run rate of completed
-                  appointments{recentDone.length === 0 ? " (no history cached yet — run a Sync or backfill history to populate the run rates)" : ` (${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history)`}.
+                  reservices &amp; follow-ups. Reservice, follow-up, one-time &amp; wildlife volume is projected per month from
+                  last year&apos;s same month, scaled by the recent 3-month trend (falls back to a flat recent-3mo run rate when
+                  there&apos;s no year-over-year history). Book growth is {forecastGrowth.source === "auto"
+                    ? `auto-derived from your new-subscription trend (${forecastGrowth.annualPct >= 0 ? "+" : ""}${forecastGrowth.annualPct}%/yr)`
+                    : "your manual monthly growth % (not enough year-over-year new-subscription history for an auto rate)"}
+                  {recentDone.length === 0 ? " · no history cached yet — run a Sync or Refresh a 12+ month period to populate it" : ` · ${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history`}.
                 </p>
               </CardContent>
             </Card>

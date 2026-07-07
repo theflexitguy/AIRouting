@@ -7,9 +7,12 @@
 // by its own service type, and aggregates:
 //   - recurringDoneByLine: General Pest / Mosquito / Lawn / Termite / Commercial
 //   - initialsByLine:      new-signup Initials per line
-//   - reserviceDone:       reservices / follow-ups / callbacks (GPC workload)
+//   - reserviceDone:       reservices / retreats / callbacks (GPC workload)
+//   - followupDone:        follow-ups (own bucket; also GPC workload)
 //   - specialtyDone:       German Roach + one-time / flea / bed bug / etc.
 //   - wildlifeDone:        wildlife exclusion work
+//   - newCustomers / newSubscriptions: records created this month (drive the
+//     forecast growth rate via year-over-year trend)
 // Result is cached in companies/{id}/fieldRoutesState/monthlyDone for the dashboard.
 
 import { FieldRoutesClient } from "./client";
@@ -32,20 +35,22 @@ function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-// Reservice / follow-up work: callbacks between regular services. Tracked
-// separately (never in the recurring done counts) and fed into the Technicians
-// Needed forecast as GPC workload. "retreat" must not catch "Pre-Treatment" —
-// new-construction termite work normalizes to "pretreatment", which contains
+// Reservice / callback work: unscheduled returns between regular services.
+// Follow-ups are tracked as their OWN bucket (the owner treats them separately),
+// though both feed the Technicians Needed forecast as GPC workload. Neither is
+// counted in the recurring done totals. "retreat" must not catch "Pre-Treatment"
+// — new-construction termite work normalizes to "pretreatment", which contains
 // the substring "retreat".
+const isFollowupLabel = (n: string): boolean => n.includes("followup");
 const isReserviceLabel = (n: string): boolean =>
   n.includes("reservice") ||
   (n.includes("retreat") && !n.includes("pretreat")) ||
-  n.includes("followup") ||
   n.includes("callback");
 
 export interface TrackingClass {
   line: ServiceLine;
   isInitial: boolean;
+  isFollowup: boolean;
   isReservice: boolean;
   isWildlife: boolean;
   isSpecialty: boolean;
@@ -56,11 +61,12 @@ export function classifyServiceForTracking(description: string): TrackingClass {
   const line = deriveServiceLine(description);
   const n = normalize(description);
   const isInitial = isInitialLabel(description);
-  const isReservice = !isInitial && isReserviceLabel(n);
+  const isFollowup = !isInitial && isFollowupLabel(n);
+  const isReservice = !isInitial && !isFollowup && isReserviceLabel(n);
   const isWildlife = line === "wildlife";
   const isSpecialty =
-    !isWildlife && !isReservice && (line === "gr" || SPECIALTY_KEYWORDS.some((k) => n.includes(k)));
-  return { line, isInitial, isReservice, isWildlife, isSpecialty };
+    !isWildlife && !isFollowup && !isReservice && (line === "gr" || SPECIALTY_KEYWORDS.some((k) => n.includes(k)));
+  return { line, isInitial, isFollowup, isReservice, isWildlife, isSpecialty };
 }
 
 export interface MonthlyDone {
@@ -74,13 +80,18 @@ export interface MonthlyDone {
   recurringDoneTotal: number;
   initialsByLine: Record<string, number>;
   initialsTotal: number;
-  reserviceDone: number; // reservices / follow-ups / callbacks — kept OUT of the
+  reserviceDone: number; // reservices / retreats / callbacks — kept OUT of the
   // recurring done counts; feeds the tech forecast as GPC workload
+  followupDone: number; // follow-ups — own bucket (owner tracks separately); also GPC
   specialtyDone: number;
   grDone: number; // GR completions (also counted inside specialtyDone) — split out
   // so the tech forecast can use GR's recurring TARGET without double-counting
   // GR actuals in the one-time run rate.
   wildlifeDone: number;
+  // New-business counts, from customer/subscription records created in the month
+  // (not appointment-derived). Drive the forecast's growth rate via YoY trend.
+  newCustomers: number;
+  newSubscriptions: number;
   unclassified: number;
 }
 
@@ -161,6 +172,7 @@ export async function computeMonthlyDone(
     initialsByLine[l] = 0;
   }
   let reserviceDone = 0;
+  let followupDone = 0;
   let specialtyDone = 0;
   let grDone = 0;
   let wildlifeDone = 0;
@@ -186,6 +198,10 @@ export async function computeMonthlyDone(
       else initialsByLine[base] = (initialsByLine[base] || 0) + 1;
       continue;
     }
+    if (c.isFollowup) {
+      followupDone++;
+      continue;
+    }
     if (c.isReservice) {
       reserviceDone++;
       continue;
@@ -206,6 +222,25 @@ export async function computeMonthlyDone(
   const recurringDoneTotal = RECURRING_LINES.reduce((s, l) => s + recurringDoneByLine[l], 0);
   const initialsTotal = Object.values(initialsByLine).reduce((s, v) => s + v, 0);
 
+  // 3) New-business counts: customer / subscription records CREATED this month
+  // (dateAdded within the window). These aren't appointment-derived; they drive
+  // the tech forecast's growth rate via its year-over-year trend. Each search is
+  // isolated so a dropped filter (client throws on ignoredParams) or an API-cap
+  // stop leaves the count at 0 rather than failing the whole aggregate.
+  const countCreated = async (module: string): Promise<number> => {
+    try {
+      const ids = await client.searchIds(module, {
+        dateAdded: { operator: "BETWEEN", value: [`${monthStart} 00:00:00`, `${monthEnd} 23:59:59`] },
+      });
+      return ids.length;
+    } catch (err) {
+      console.warn(`[monthly-done] ${module} new-business count failed for ${month}:`, String(err));
+      return 0;
+    }
+  };
+  const newCustomers = await countCreated("customer");
+  const newSubscriptions = await countCreated("subscription");
+
   const done: MonthlyDone = {
     month,
     monthStart,
@@ -218,9 +253,12 @@ export async function computeMonthlyDone(
     initialsByLine,
     initialsTotal,
     reserviceDone,
+    followupDone,
     specialtyDone,
     grDone,
     wildlifeDone,
+    newCustomers,
+    newSubscriptions,
     unclassified,
   };
 

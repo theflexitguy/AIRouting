@@ -512,11 +512,94 @@ export const TECH_CATEGORIES: Array<{ key: TechCategory; label: string; perDay: 
 
 /** Minimal slice of a cached MonthlyDone doc the forecast needs. */
 export interface MonthlyDoneLike {
+  month?: string; // YYYY-MM — required for year-over-year mapping
   specialtyDone?: number;
   grDone?: number;
   initialsTotal?: number;
   wildlifeDone?: number;
   reserviceDone?: number;
+  followupDone?: number;
+  newCustomers?: number;
+  newSubscriptions?: number;
+}
+
+/** Shift a YYYY-MM month key by a whole number of years. */
+function shiftMonthKeyYears(mk: string, deltaYears: number): string {
+  const m = /^(\d{4})-(\d{2})$/.exec(mk);
+  if (!m) return mk;
+  return `${Number(m[1]) + deltaYears}-${m[2]}`;
+}
+
+export interface ForecastGrowth {
+  source: "auto" | "manual";
+  annualPct: number; // implied annual growth %, for display
+  monthlyFactor: (idx: number) => number; // compounding multiplier at month index idx
+}
+
+/**
+ * Growth multiplier for the recurring-book projection. Default is AUTO: when
+ * year-over-year new-subscription history exists (recent 3 complete months vs
+ * the same 3 a year earlier), the book grows at that observed rate — the owner's
+ * "new subscriptions drive the growth rate" call. A non-zero `manualPct` is an
+ * explicit override and always wins; `manualPct === 0` (or unset) means "auto".
+ * `manualPct` is a MONTHLY rate; the derived rate is ANNUAL (converted to a
+ * monthly factor). Falls back to flat when neither auto data nor a manual rate
+ * is available.
+ */
+export function deriveForecastGrowth(
+  history: MonthlyDoneLike[],
+  today: string,
+  manualPct: number,
+): ForecastGrowth {
+  const manual = Number.isFinite(manualPct) ? manualPct : 0;
+  // Auto only when the owner hasn't typed an explicit override.
+  if (manual === 0) {
+    const currentKey = today.slice(0, 7);
+    const byKey = new Map<string, MonthlyDoneLike>();
+    for (const d of history) if (d.month) byKey.set(d.month, d);
+    // Most recent up to 3 COMPLETE months (exclude the partial current month so
+    // its half-count can't skew the trend); fall back to whatever exists if brand new.
+    const completeKeys = history.map((d) => d.month).filter((k): k is string => !!k && k < currentKey).sort();
+    let recentKeys = completeKeys.slice(-3);
+    if (recentKeys.length === 0) {
+      recentKeys = history.map((d) => d.month).filter((k): k is string => !!k).sort().slice(-3);
+    }
+    const avgSubs = (keys: string[]): number => {
+      const vals = keys.map((k) => byKey.get(k)).filter(Boolean).map((d) => Number((d as MonthlyDoneLike).newSubscriptions || 0));
+      return vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : 0;
+    };
+    const recentSubs = avgSubs(recentKeys);
+    const yoySubs = avgSubs(recentKeys.map((k) => shiftMonthKeyYears(k, -1)));
+    if (recentSubs > 0 && yoySubs > 0) {
+      const annualRatio = Math.max(0.5, Math.min(1.5, recentSubs / yoySubs));
+      return {
+        source: "auto",
+        annualPct: Math.round((annualRatio - 1) * 100),
+        monthlyFactor: (idx) => Math.pow(annualRatio, idx / 12),
+      };
+    }
+  }
+  const g = Math.max(-50, Math.min(50, manual));
+  return {
+    source: "manual",
+    annualPct: Math.round((Math.pow(1 + g / 100, 12) - 1) * 100),
+    monthlyFactor: (idx) => Math.pow(1 + g / 100, idx),
+  };
+}
+
+/** The trailing `n` month keys (YYYY-MM) ending with `today`'s month, ascending. */
+export function trailingMonthKeys(today: string, n: number): string[] {
+  const mm = /^(\d{4})-(\d{2})/.exec(today);
+  if (!mm) return [today.slice(0, 7)];
+  let year = Number(mm[1]);
+  let month = Number(mm[2]);
+  const keys: string[] = [];
+  for (let i = 0; i < n; i++) {
+    keys.unshift(monthKey(year, month));
+    month--;
+    if (month === 0) { month = 12; year--; }
+  }
+  return keys;
 }
 
 /** The next `n` month keys (YYYY-MM) starting with `today`'s month, ascending. */
@@ -581,31 +664,64 @@ function hirePlanWithCoverage(need: Record<TechCategory, number>): Record<TechCa
 }
 
 /**
- * 12-month technicians-needed forecast. `recentDone` = the last ≤3 cached
- * monthly aggregates (for the one-time run rates); `growthPct` compounds
- * monthly (0 = flat book). Old cached docs without grDone are treated as 0
- * (slight run-rate overcount that self-corrects as syncs recompute months).
+ * Per-metric projector: for a future month, use LAST YEAR's same calendar month
+ * as the seasonal shape, scaled by how the recent 3 complete months compare to
+ * that same stretch a year earlier (the trend). Falls back to the recent-3-month
+ * average when no year-over-year doc exists for that month — so with < ~13
+ * months of history the whole thing degrades to a flat recent-3mo run rate
+ * (today's behavior). `pick` selects the metric off a cached month doc.
+ */
+function makeYoyProjector(
+  history: MonthlyDoneLike[],
+  today: string,
+  pick: (d: MonthlyDoneLike) => number,
+): (monthKey: string) => number {
+  const currentKey = today.slice(0, 7);
+  const byKey = new Map<string, MonthlyDoneLike>();
+  for (const d of history) if (d.month) byKey.set(d.month, d);
+  const completeKeys = history.map((d) => d.month).filter((k): k is string => !!k && k < currentKey).sort();
+  let recentKeys = completeKeys.slice(-3);
+  if (recentKeys.length === 0) {
+    recentKeys = history.map((d) => d.month).filter((k): k is string => !!k).sort().slice(-3);
+  }
+  const avgOver = (keys: string[]): number => {
+    const vals = keys.map((k) => byKey.get(k)).filter(Boolean).map((d) => pick(d as MonthlyDoneLike));
+    return vals.length ? vals.reduce((s, v) => s + v, 0) / vals.length : 0;
+  };
+  const recentAvg = avgOver(recentKeys);
+  const recentYoyAvg = avgOver(recentKeys.map((k) => shiftMonthKeyYears(k, -1)));
+  const trendScale = recentYoyAvg > 0 ? Math.max(0.5, Math.min(2, recentAvg / recentYoyAvg)) : 1;
+  return (mk: string): number => {
+    const yoyDoc = byKey.get(shiftMonthKeyYears(mk, -1));
+    return yoyDoc ? pick(yoyDoc) * trendScale : recentAvg;
+  };
+}
+
+/**
+ * 12-month technicians-needed forecast. `history` = trailing cached monthly
+ * aggregates (~15 months) used two ways: (a) run-rate work (reservices +
+ * follow-ups → GPC, one-time+initials → Specialty, wildlife) is projected per
+ * month via year-over-year seasonality scaled by the recent trend
+ * (makeYoyProjector); (b) recurring-book demand (from the live `jobs` snapshot,
+ * seasonality-aware) is grown by deriveForecastGrowth — the new-subscription YoY
+ * trend when available, else the manual `growthPct`. Growth multiplies ONLY the
+ * recurring book; run-rate growth is already inside the YoY trend scale.
  */
 export function technicianForecast(
   jobs: JobLike[],
-  recentDone: MonthlyDoneLike[],
+  history: MonthlyDoneLike[],
   today: string,
   growthPct: number,
   months = 12,
 ): TechForecastRow[] {
   const keys = nextMonthKeys(today, months);
-  const avg = (values: number[]) =>
-    values.length ? values.reduce((s, v) => s + v, 0) / values.length : 0;
-  // One-time run rates from actual completed appointments (new-sales work that
-  // never appears in the recurring book): specialty minus its GR portion plus
-  // initials; wildlife on its own.
-  const oneTimeSpecialtyRate = avg(
-    recentDone.map((d) => Math.max(0, Number(d.specialtyDone || 0) - Number(d.grDone || 0)) + Number(d.initialsTotal || 0)),
+
+  // Run-rate projectors (year-over-year shape × recent trend):
+  const gpcRunRate = makeYoyProjector(history, today, (d) => Number(d.reserviceDone || 0) + Number(d.followupDone || 0));
+  const specialtyRunRate = makeYoyProjector(history, today, (d) =>
+    Math.max(0, Number(d.specialtyDone || 0) - Number(d.grDone || 0)) + Number(d.initialsTotal || 0),
   );
-  const wildlifeRate = avg(recentDone.map((d) => Number(d.wildlifeDone || 0)));
-  // Reservices / follow-ups: free callbacks that never appear in the recurring
-  // book but consume real capacity. Owner's call: all of it rides GPC.
-  const reserviceRate = avg(recentDone.map((d) => Number(d.reserviceDone || 0)));
+  const wildlifeRunRate = makeYoyProjector(history, today, (d) => Number(d.wildlifeDone || 0));
 
   const jobsByLine = new Map<string, JobLike[]>();
   for (const line of ["general", "mosquito", "lawn", "termite", "commercial", "gr"]) {
@@ -614,18 +730,17 @@ export function technicianForecast(
   const lineTarget = (line: string, month: number) =>
     monthlyServiceTarget(jobsByLine.get(line) || [], month);
 
-  const growth = Number.isFinite(growthPct) ? Math.max(-50, Math.min(50, growthPct)) : 0;
+  const growth = deriveForecastGrowth(history, today, growthPct);
 
   return keys.map((mk, idx) => {
     const month = Number(mk.slice(5, 7));
-    const factor = Math.pow(1 + growth / 100, idx);
+    const bookFactor = growth.monthlyFactor(idx);
     const workloads: Record<TechCategory, number> = {
-      gpc: (lineTarget("general", month) + lineTarget("mosquito", month) + reserviceRate) * factor,
-      specialty:
-        (lineTarget("commercial", month) + lineTarget("gr", month) + oneTimeSpecialtyRate) * factor,
-      lawn: lineTarget("lawn", month) * factor,
-      termite: lineTarget("termite", month) * factor,
-      wildlife: wildlifeRate * factor,
+      gpc: (lineTarget("general", month) + lineTarget("mosquito", month)) * bookFactor + gpcRunRate(mk),
+      specialty: (lineTarget("commercial", month) + lineTarget("gr", month)) * bookFactor + specialtyRunRate(mk),
+      lawn: lineTarget("lawn", month) * bookFactor,
+      termite: lineTarget("termite", month) * bookFactor,
+      wildlife: wildlifeRunRate(mk),
     };
     const need = {} as Record<TechCategory, number>;
     let totalWorkload = 0;
