@@ -22,7 +22,19 @@ function collectRefs(value: unknown, out: Set<string>): void {
   if (typeof value === "object") {
     const obj = value as Record<string, unknown>;
     const label = obj.name ?? obj.skillName ?? obj.description ?? obj.title ?? obj.skillID ?? obj.id ?? obj.skillId;
-    if (label !== undefined) collectRefs(label, out);
+    if (label !== undefined) {
+      collectRefs(label, out);
+      return;
+    }
+    // No recognized label field. FieldRoutes returns a populated employee.skills
+    // as an ID->name MAP ({"3":"Termite"}) — not an array or {skillID,name} object
+    // — so collect both the keys (skill IDs, resolvable via the catalog) and the
+    // values (already-human names). Empty skills come back as [] and hit the
+    // array branch above, never here.
+    for (const [k, v] of Object.entries(obj)) {
+      collectRefs(k, out);
+      collectRefs(v, out);
+    }
     return;
   }
   const s = String(value).trim();

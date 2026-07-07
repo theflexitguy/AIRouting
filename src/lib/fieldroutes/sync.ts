@@ -329,6 +329,26 @@ async function syncTechnicians(
     }
   }
 
+  // Refresh skills on EXISTING technician docs that aren't serving this pass (no
+  // scheduled work in the window) — the loop above only touches serving techs, so
+  // without this a skilled but currently-idle tech would keep stale/empty skills.
+  // Only skillNames is written (never active/maxStops), and only for docs that map
+  // to a known roster employee, so nothing is created or pruned here.
+  for (const d of existingSnap.docs) {
+    const data = d.data();
+    const empId = str(data.fieldRoutesEmployeeId || data.fieldRoutesTechId || data.employeeId);
+    if (!empId || servingEmployeeIds.has(empId)) continue;
+    const info = empInfo[empId];
+    if (!info) continue;
+    batch.set(d.ref, { skillNames: info.skillNames || [], updatedAt: now }, { merge: true });
+    ops++;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+
   // Prune phantom auto-created techs: any `fr_` doc we made before that isn't
   // backed by a real serving tech this run. We only touch `fr_`-prefixed docs
   // (which only this sync creates), so user-created or linked-existing techs are
