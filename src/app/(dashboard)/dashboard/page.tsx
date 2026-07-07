@@ -59,6 +59,7 @@ import {
   CalendarDays,
   CheckCircle2,
   ListTodo,
+  RotateCcw,
 } from "lucide-react";
 import {
   BarChart,
@@ -188,6 +189,7 @@ export default function DashboardPage() {
     byLine: Record<string, number>;
     initials: number;
     initialsByLine: Record<string, number>;
+    reservices: number;
     specialty: number;
     wildlife: number;
     completedAppointments: number;
@@ -307,7 +309,7 @@ export default function DashboardPage() {
       const byLine: Record<string, number> = {};
       const initialsByLine: Record<string, number> = {};
       for (const l of TARGET_SERVICE_LINES) { byLine[l] = 0; initialsByLine[l] = 0; }
-      let initials = 0, specialty = 0, wildlife = 0, completedAppointments = 0, monthsAvailable = 0;
+      let initials = 0, reservices = 0, specialty = 0, wildlife = 0, completedAppointments = 0, monthsAvailable = 0;
       for (const s of snaps) {
         if (!s.exists()) continue;
         monthsAvailable++;
@@ -315,11 +317,12 @@ export default function DashboardPage() {
         for (const l of TARGET_SERVICE_LINES) byLine[l] += Number(d.recurringDoneByLine?.[l] || 0);
         for (const k of Object.keys(d.initialsByLine || {})) initialsByLine[k] = (initialsByLine[k] || 0) + Number(d.initialsByLine[k] || 0);
         initials += Number(d.initialsTotal || 0);
+        reservices += Number(d.reserviceDone || 0);
         specialty += Number(d.specialtyDone || 0);
         wildlife += Number(d.wildlifeDone || 0);
         completedAppointments += Number(d.completedAppointments || 0);
       }
-      setRangeDone({ byLine, initials, initialsByLine, specialty, wildlife, completedAppointments, monthsAvailable, monthsTotal: months.length });
+      setRangeDone({ byLine, initials, initialsByLine, reservices, specialty, wildlife, completedAppointments, monthsAvailable, monthsTotal: months.length });
     } catch (e) {
       console.error("Range done load error:", e);
       setRangeDone(null);
@@ -902,7 +905,7 @@ export default function DashboardPage() {
             </div>
             )}
 
-            {/* COMPLETED — Initials / Specialty / Wildlife (from completed appointments) */}
+            {/* COMPLETED — Initials / Reservices / Specialty / Wildlife (from completed appointments) */}
             {(() => {
               // Period-aware: current month uses the live monthlyDone doc; a
               // historical period uses the summed cached aggregates.
@@ -911,6 +914,7 @@ export default function DashboardPage() {
                     ? {
                         initialsTotal: rangeDone.initials,
                         initialsByLine: rangeDone.initialsByLine,
+                        reserviceDone: rangeDone.reservices,
                         specialtyDone: rangeDone.specialty,
                         wildlifeDone: rangeDone.wildlife,
                         completedAppointments: rangeDone.completedAppointments,
@@ -928,7 +932,7 @@ export default function DashboardPage() {
               <p className="text-xs text-muted-foreground/50">{caption}</p>
             </div>
             {cd ? (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                 {/* Initials with per-line breakdown */}
                 <Card className="border-border/40 animate-fade-in">
                   <CardContent className="p-5 space-y-2">
@@ -944,6 +948,20 @@ export default function DashboardPage() {
                       {INITIAL_LINE_LABELS.map(({ key, label }) => (
                         <span key={key}>{label} <span className="text-foreground font-medium tabular-nums">{cd.initialsByLine?.[key] ?? 0}</span></span>
                       ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Reservices / follow-ups — free callbacks; feeds the tech forecast as GPC workload */}
+                <Card className="border-border/40 animate-fade-in">
+                  <CardContent className="p-5">
+                    <div className="flex items-start justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[13px] text-muted-foreground font-medium">Reservices</p>
+                        <p className="text-3xl font-bold text-foreground tracking-tight">{(cd.reserviceDone ?? 0).toLocaleString()}</p>
+                        <p className="text-xs text-muted-foreground/70">reservices &amp; follow-ups</p>
+                      </div>
+                      <div className="p-2 rounded-lg bg-sky-500/10 text-sky-400"><RotateCcw className="w-4 h-4" /></div>
                     </div>
                   </CardContent>
                 </Card>
@@ -979,7 +997,7 @@ export default function DashboardPage() {
             ) : (
               <Card className="border-border/40">
                 <CardContent className="p-4 text-xs text-muted-foreground/70">
-                  Initials, Specialty, and Wildlife counts come from completed appointments.{" "}
+                  Initials, Reservices, Specialty, and Wildlife counts come from completed appointments.{" "}
                   {periodView
                     ? "This period hasn't been computed yet — hit Refresh above to pull it."
                     : "Run a Sync (or the monthly aggregate) to populate this section."}
@@ -1062,8 +1080,9 @@ export default function DashboardPage() {
                   are whole people AFTER cross-coverage: a Termite tech&apos;s spare days cover Specialty; Specialty, Lawn &amp; Wildlife
                   spare days cover GPC — so a partial tech&apos;s remainder offsets headcount elsewhere. Current book projected onto each
                   month&apos;s seasonality · {MONTH_WORKING_DAYS} working days/month · capacities: GPC 14, Specialty 8, Lawn 12, Termite 5,
-                  Wildlife 4 per day · Specialty includes Commercial, German Roach, and one-time/initial work; one-time &amp; wildlife
-                  volume uses a 3-month run rate of completed appointments{recentDone.length === 0 ? " (no history cached yet — run a Sync or backfill history to populate the run rates)" : ` (${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history)`}.
+                  Wildlife 4 per day · Specialty includes Commercial, German Roach, and one-time/initial work; GPC includes
+                  reservices/follow-ups. One-time, reservice &amp; wildlife volume uses a 3-month run rate of completed
+                  appointments{recentDone.length === 0 ? " (no history cached yet — run a Sync or backfill history to populate the run rates)" : ` (${recentDone.length} month${recentDone.length !== 1 ? "s" : ""} of history)`}.
                 </p>
               </CardContent>
             </Card>

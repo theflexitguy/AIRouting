@@ -7,6 +7,7 @@
 // by its own service type, and aggregates:
 //   - recurringDoneByLine: General Pest / Mosquito / Lawn / Termite / Commercial
 //   - initialsByLine:      new-signup Initials per line
+//   - reserviceDone:       reservices / follow-ups / callbacks (GPC workload)
 //   - specialtyDone:       German Roach + one-time / flea / bed bug / etc.
 //   - wildlifeDone:        wildlife exclusion work
 // Result is cached in companies/{id}/fieldRoutesState/monthlyDone for the dashboard.
@@ -31,9 +32,21 @@ function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+// Reservice / follow-up work: callbacks between regular services. Tracked
+// separately (never in the recurring done counts) and fed into the Technicians
+// Needed forecast as GPC workload. "retreat" must not catch "Pre-Treatment" —
+// new-construction termite work normalizes to "pretreatment", which contains
+// the substring "retreat".
+const isReserviceLabel = (n: string): boolean =>
+  n.includes("reservice") ||
+  (n.includes("retreat") && !n.includes("pretreat")) ||
+  n.includes("followup") ||
+  n.includes("callback");
+
 export interface TrackingClass {
   line: ServiceLine;
   isInitial: boolean;
+  isReservice: boolean;
   isWildlife: boolean;
   isSpecialty: boolean;
 }
@@ -43,10 +56,11 @@ export function classifyServiceForTracking(description: string): TrackingClass {
   const line = deriveServiceLine(description);
   const n = normalize(description);
   const isInitial = isInitialLabel(description);
+  const isReservice = !isInitial && isReserviceLabel(n);
   const isWildlife = line === "wildlife";
   const isSpecialty =
-    !isWildlife && (line === "gr" || SPECIALTY_KEYWORDS.some((k) => n.includes(k)));
-  return { line, isInitial, isWildlife, isSpecialty };
+    !isWildlife && !isReservice && (line === "gr" || SPECIALTY_KEYWORDS.some((k) => n.includes(k)));
+  return { line, isInitial, isReservice, isWildlife, isSpecialty };
 }
 
 export interface MonthlyDone {
@@ -60,6 +74,8 @@ export interface MonthlyDone {
   recurringDoneTotal: number;
   initialsByLine: Record<string, number>;
   initialsTotal: number;
+  reserviceDone: number; // reservices / follow-ups / callbacks — kept OUT of the
+  // recurring done counts; feeds the tech forecast as GPC workload
   specialtyDone: number;
   grDone: number; // GR completions (also counted inside specialtyDone) — split out
   // so the tech forecast can use GR's recurring TARGET without double-counting
@@ -144,6 +160,7 @@ export async function computeMonthlyDone(
     recurringDoneByLine[l] = 0;
     initialsByLine[l] = 0;
   }
+  let reserviceDone = 0;
   let specialtyDone = 0;
   let grDone = 0;
   let wildlifeDone = 0;
@@ -167,6 +184,10 @@ export async function computeMonthlyDone(
       const base = c.line === "wildlife" ? "wildlife" : c.line;
       if (base in initialsByLine) initialsByLine[base]++;
       else initialsByLine[base] = (initialsByLine[base] || 0) + 1;
+      continue;
+    }
+    if (c.isReservice) {
+      reserviceDone++;
       continue;
     }
     if (c.isWildlife) {
@@ -196,6 +217,7 @@ export async function computeMonthlyDone(
     recurringDoneTotal,
     initialsByLine,
     initialsTotal,
+    reserviceDone,
     specialtyDone,
     grDone,
     wildlifeDone,
