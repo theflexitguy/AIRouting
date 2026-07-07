@@ -1954,7 +1954,11 @@ export async function POST(request: NextRequest) {
 
     const selectedByTech = new Map<string, JobDoc[]>();
     const deferredByTech = new Map<string, JobDoc[]>();
-    const partitionedByTech = partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId);
+    // partitionJobsAmongTechs returns { byTech, skillBlocked } — take the Map for
+    // the capacity split, and keep the skill-blocked jobs so they surface as a
+    // warning instead of silently vanishing (no selected tech carries their skill).
+    const { byTech: partitionedByTech, skillBlocked: skillBlockedByTech } =
+      partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId);
     for (const tech of selectedTechs) {
       const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
       // Pinned (already-routed / FieldRoutes-scheduled) jobs always make the cut;
@@ -2467,6 +2471,11 @@ export async function POST(request: NextRequest) {
         ...(backendDeferred.size > 0
           ? [
               `${backendDeferred.size} stop(s) dropped to stay within ${maxDriveTime}-min drive-time cap.`,
+            ]
+          : []),
+        ...(skillBlockedByTech.length > 0
+          ? [
+              `${skillBlockedByTech.length} job(s) skipped — their service requires a skill no selected technician has. Select a qualified tech to route them.`,
             ]
           : []),
         ...(routeOptimizationShadow.status === "failed"
