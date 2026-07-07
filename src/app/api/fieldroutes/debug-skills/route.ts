@@ -38,7 +38,7 @@ function skillView(e: Record<string, unknown>, idKeys: string[]): Record<string,
   return view;
 }
 
-async function handle(companyIdParam: string | undefined) {
+async function handle(companyIdParam: string | undefined, lookupEmployeeId?: string) {
   try {
     const db = adminDb();
 
@@ -87,24 +87,37 @@ async function handle(companyIdParam: string | undefined) {
     const skillCatalogRows = await fetchSkillCatalogRows(client);
     const skillCatalogMap = skillCatalogIdToName(skillCatalogRows);
 
-    // --- Employees (sample up to 8) ---
+    // --- Employees: scan ALL, surface any with a non-empty skill field, plus an
+    // optional single-employee lookup (?employeeId=) so we can confirm a specific
+    // tech (e.g. one the FieldRoutes UI shows a skill for) against the raw API. ---
     const employeeKeys = new Set<string>();
     const employeeSkillSamples: Record<string, unknown>[] = [];
     const employeeResolved: Array<{ employeeId: string; name: string; refs: string[]; resolvedSkillNames: string[] }> = [];
+    const employeesWithSkills: Array<{ employeeId: string; name: string; rawSkills: unknown; refs: string[]; resolvedSkillNames: string[] }> = [];
+    let employeeCount = 0;
+    let lookupEmployee: Record<string, unknown> | null = null;
     try {
-      const empIds = (await client.searchIds("employee", {})).slice(0, 8);
-      const employees = empIds.length ? await client.getEntities("employee", empIds) : [];
+      const allEmpIds = await client.searchIds("employee", {});
+      employeeCount = allEmpIds.length;
+      const employees = allEmpIds.length ? await client.getEntities("employee", allEmpIds) : [];
       for (const e of employees) {
         Object.keys(e).forEach((k) => employeeKeys.add(k));
-        employeeSkillSamples.push(skillView(e, ["employeeID", "employeeId", "fname", "lname"]));
+        const eid = String(e.employeeID ?? e.employeeId ?? "");
+        const nm = [e.fname, e.lname].filter(Boolean).join(" ") || String(e.name ?? "");
         const refs = extractSkillRefs(e);
-        employeeResolved.push({
-          employeeId: String(e.employeeID ?? e.employeeId ?? ""),
-          name: [e.fname, e.lname].filter(Boolean).join(" ") || String(e.name ?? ""),
-          refs,
-          resolvedSkillNames: resolveSkillNames(refs, skillCatalogMap),
-        });
+        const resolved = resolveSkillNames(refs, skillCatalogMap);
+        if (employeeSkillSamples.length < 8) {
+          employeeSkillSamples.push(skillView(e, ["employeeID", "employeeId", "fname", "lname"]));
+          employeeResolved.push({ employeeId: eid, name: nm, refs, resolvedSkillNames: resolved });
+        }
+        if (refs.length > 0) {
+          employeesWithSkills.push({ employeeId: eid, name: nm, rawSkills: (e as Record<string, unknown>).skills, refs, resolvedSkillNames: resolved });
+        }
+        if (lookupEmployeeId && eid === lookupEmployeeId) {
+          lookupEmployee = skillView(e, ["employeeID", "employeeId", "fname", "lname", "type", "active"]);
+        }
       }
+      notes.push(`Scanned ${employeeCount} employees; ${employeesWithSkills.length} have a non-empty skill field.`);
     } catch (err) {
       notes.push(`employee pull failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -135,6 +148,9 @@ async function handle(companyIdParam: string | undefined) {
     }
 
     return NextResponse.json({
+      employeeCount,
+      employeesWithSkills, // every employee whose raw API record carries a non-empty skill field
+      lookupEmployee, // the ?employeeId= record's skill view, if requested
       employeeKeys: Array.from(employeeKeys).sort(),
       employeeSkillSamples,
       employeeResolved, // what production sync.ts will actually stamp on technician docs (skillNames)
@@ -152,11 +168,13 @@ async function handle(companyIdParam: string | undefined) {
 }
 
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as { companyId?: string };
-  return handle(body.companyId);
+  const body = (await request.json().catch(() => ({}))) as { companyId?: string; employeeId?: string };
+  return handle(body.companyId, body.employeeId);
 }
 
 export async function GET(request: NextRequest) {
-  const companyId = new URL(request.url).searchParams.get("companyId") || undefined;
-  return handle(companyId);
+  const url = new URL(request.url);
+  const companyId = url.searchParams.get("companyId") || undefined;
+  const employeeId = url.searchParams.get("employeeId") || undefined;
+  return handle(companyId, employeeId);
 }
