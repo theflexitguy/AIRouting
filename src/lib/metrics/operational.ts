@@ -503,7 +503,7 @@ export function targetsByLineForMonths(jobs: JobLike[], monthKeys: string[]): Re
 export type TechCategory = "gpc" | "specialty" | "lawn" | "termite" | "wildlife";
 
 export const TECH_CATEGORIES: Array<{ key: TechCategory; label: string; perDay: number; handles: string }> = [
-  { key: "gpc", label: "GPC", perDay: 14, handles: "General Pest + Mosquito" },
+  { key: "gpc", label: "GPC", perDay: 14, handles: "General Pest + Mosquito + reservices/follow-ups" },
   { key: "specialty", label: "Specialty", perDay: 8, handles: "Commercial + GR + one-time + initials" },
   { key: "lawn", label: "Lawn", perDay: 12, handles: "Lawn rounds" },
   { key: "termite", label: "Termite", perDay: 5, handles: "Termite work" },
@@ -516,6 +516,7 @@ export interface MonthlyDoneLike {
   grDone?: number;
   initialsTotal?: number;
   wildlifeDone?: number;
+  reserviceDone?: number;
 }
 
 /** The next `n` month keys (YYYY-MM) starting with `today`'s month, ascending. */
@@ -602,6 +603,9 @@ export function technicianForecast(
     recentDone.map((d) => Math.max(0, Number(d.specialtyDone || 0) - Number(d.grDone || 0)) + Number(d.initialsTotal || 0)),
   );
   const wildlifeRate = avg(recentDone.map((d) => Number(d.wildlifeDone || 0)));
+  // Reservices / follow-ups: free callbacks that never appear in the recurring
+  // book but consume real capacity. Owner's call: all of it rides GPC.
+  const reserviceRate = avg(recentDone.map((d) => Number(d.reserviceDone || 0)));
 
   const jobsByLine = new Map<string, JobLike[]>();
   for (const line of ["general", "mosquito", "lawn", "termite", "commercial", "gr"]) {
@@ -616,7 +620,7 @@ export function technicianForecast(
     const month = Number(mk.slice(5, 7));
     const factor = Math.pow(1 + growth / 100, idx);
     const workloads: Record<TechCategory, number> = {
-      gpc: (lineTarget("general", month) + lineTarget("mosquito", month)) * factor,
+      gpc: (lineTarget("general", month) + lineTarget("mosquito", month) + reserviceRate) * factor,
       specialty:
         (lineTarget("commercial", month) + lineTarget("gr", month) + oneTimeSpecialtyRate) * factor,
       lawn: lineTarget("lawn", month) * factor,
