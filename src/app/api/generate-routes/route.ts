@@ -182,7 +182,7 @@ function partitionJobsAmongTechs(
   jobs: JobDoc[],
   techs: Array<Record<string, unknown> & { id: string }>,
   pinnedSlotByJobId: Map<string, string>,
-  opts: { softAssignments?: boolean } = {},
+  opts: { softAssignments?: boolean; perTechCapacity?: number } = {},
 ) {
   const byTech = new Map<string, JobDoc[]>();
   techs.forEach((tech) => byTech.set(tech.id, []));
@@ -216,6 +216,19 @@ function partitionJobsAmongTechs(
     unassigned.push(job);
   }
 
+  // Hard per-tech stop budget (route stop target × days). Without it a dense
+  // area snowballs onto one tech: nearest-stop scoring keeps piling stops onto
+  // whoever is already working the cluster, the per-slot limit then rejects the
+  // overflow, and the rebalance guardrail dumps it all back on the original
+  // tech — the exact 43-stop/22-hour route this guards against. A tech at
+  // capacity stops receiving while any qualified tech has room; if every
+  // qualified tech is full, least-loaded takes it (over-cap surfaces as a
+  // route warning rather than a dropped stop).
+  const perTechCapacity =
+    Number.isFinite(opts.perTechCapacity) && (opts.perTechCapacity as number) > 0
+      ? Math.floor(opts.perTechCapacity as number)
+      : Number.POSITIVE_INFINITY;
+
   for (const job of unassigned) {
     const qualified = techs.filter((tech) => techHasRequiredSkills(tech, job));
     if (qualified.length === 0) {
@@ -225,9 +238,13 @@ function partitionJobsAmongTechs(
       });
       continue;
     }
-    let bestTechId = qualified[0]?.id || "";
+    const withRoom = qualified.filter(
+      (tech) => (byTech.get(tech.id) || []).length < perTechCapacity,
+    );
+    const candidates = withRoom.length > 0 ? withRoom : qualified;
+    let bestTechId = candidates[0]?.id || "";
     let bestScore = Number.POSITIVE_INFINITY;
-    for (const tech of qualified) {
+    for (const tech of candidates) {
       const current = byTech.get(tech.id) || [];
       const nearestMinutes = current.length
         ? Math.min(...current.map((existing) => estimateDriveMinutes(job, existing)))
@@ -1446,6 +1463,9 @@ async function buildFastFallbackRoutes({
   let slotIndex = 0;
   const partition = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId, {
     softAssignments: rebalance,
+    perTechCapacity: rebalance
+      ? dates.reduce((sum, routeDate) => sum + maxStopsForRouteDate(maxStops, routeDate), 0)
+      : undefined,
   });
   const partitionedByTech = partition.byTech;
   // Jobs whose required skills no selected technician carries: defer with the
@@ -2029,6 +2049,7 @@ export async function POST(request: NextRequest) {
     const { byTech: partitionedByTech, skillBlocked: skillBlockedByTech } =
       partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId, {
         softAssignments: rebalance,
+        perTechCapacity: rebalance ? perTechCapacity : undefined,
       });
     for (const tech of selectedTechs) {
       const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
@@ -2234,23 +2255,41 @@ export async function POST(request: NextRequest) {
 
     // Rebalance guardrail: a previously scheduled stop must NEVER fall off the
     // day. Anything the solver couldn't place (skill-blocked, bundle over the
-    // slot limit, etc.) goes back to its ORIGINAL tech/slot, appended to that
-    // route (or a minimal route is created), and comes off the deferred list.
+    // slot limit, etc.) first tries any same-day route with spare capacity that
+    // is skill- and service-line-compatible; only when none has room does it go
+    // back to its ORIGINAL tech/slot. Either way it comes off the deferred list.
     if (rebalance && mustRouteJobIds.size > 0) {
       const placedIds = new Set(
         routes.flatMap((r) => (r.stops || []).map((s) => String(s.id || s.customerID || ""))),
       );
       const deferredSet = new Set(result.deferredJobIds || []);
+      const jobFor = (id: string) => jobDocMap.get(id) || releasedJobDocMap.get(id);
       let restored = 0;
       for (const jobId of mustRouteJobIds) {
         if (placedIds.has(jobId)) continue;
-        const job = jobDocMap.get(jobId) || releasedJobDocMap.get(jobId);
+        const job = jobFor(jobId);
         const slotKey = fallbackSlotByJobId.get(jobId);
         if (!job || !slotKey) continue;
         const [slotDate, slotTechId] = slotKey.split("::");
-        let target = routes.find(
-          (r) => String(r.date || "") === slotDate && String(r.techId || "") === slotTechId,
-        );
+        // Best home first: least-loaded same-day route with room whose tech is
+        // qualified and whose stops share a compatible service line.
+        const candidate = routes
+          .filter((r) => {
+            if (String(r.date || "") !== slotDate) return false;
+            const cap = Number(r.maxStopsParam) || maxStopsForRouteDate(maxStops, slotDate);
+            if ((r.stops || []).length >= cap) return false;
+            const tech = selectedTechs.find((t) => t.id === String(r.techId || ""));
+            if (!tech || !techHasRequiredSkills(tech, job)) return false;
+            const routeJobs = (r.stops || [])
+              .map((s) => jobFor(String(s.id || s.customerID || "")))
+              .filter((j): j is JobDoc => Boolean(j));
+            return unitCompatibleWithSlotJobs([job], routeJobs);
+          })
+          .sort((a, b) => (a.stops || []).length - (b.stops || []).length)[0];
+        let target = candidate ||
+          routes.find(
+            (r) => String(r.date || "") === slotDate && String(r.techId || "") === slotTechId,
+          );
         if (!target) {
           const tech = selectedTechs.find((t) => t.id === slotTechId);
           target = {
