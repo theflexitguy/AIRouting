@@ -2503,13 +2503,19 @@ export default function RoutesPage() {
 
   // Routes are now loaded via onSnapshot listener in the useEffect above
 
-  const generateRoutes = async () => {
+  const generateRoutes = async (rebalanceScheduled = false) => {
     if (!userProfile?.companyId) return;
+    if (rebalanceScheduled) {
+      const ok = window.confirm(
+        `Optimize This Day re-proposes ${startDate}'s routes: scheduled stops keep their day but may move between the selected technicians, balanced to ${maxStops} stops and ${maxDriveTime} min drive per route. Nothing changes in FieldRoutes until you Approve.`,
+      );
+      if (!ok) return;
+    }
     setGenerating(true);
     setGenResult(null);
     setGenError(null);
 
-    setGenStage("Fetching jobs and technicians...");
+    setGenStage(rebalanceScheduled ? "Rebalancing the day's scheduled stops..." : "Fetching jobs and technicians...");
 
     // Progress stages on a timer to show activity
     const stages = [
@@ -2537,6 +2543,7 @@ export default function RoutesPage() {
           maxStops,
           maxDriveTime,
           requestedBy: userProfile.email,
+          ...(rebalanceScheduled ? { rebalanceScheduled: true } : {}),
         }),
       });
       timers.forEach(clearTimeout);
@@ -3085,12 +3092,25 @@ export default function RoutesPage() {
               {editMode ? "Editing" : "Edit Routes"}
             </Button>
             <Button
-              onClick={generateRoutes}
+              onClick={() => generateRoutes()}
               disabled={generating || selectedTechIds.length === 0}
               className="bg-blue-500 hover:bg-blue-600 text-white h-9 text-sm"
             >
               {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
               Generate Routes
+            </Button>
+            <Button
+              onClick={() => generateRoutes(true)}
+              disabled={generating || selectedTechIds.length === 0 || startDate !== endDate}
+              title={
+                startDate !== endDate
+                  ? "Pick a single day to optimize (scheduled stops keep their date)"
+                  : "Re-propose this day's routes: scheduled stops may move between the selected technicians, balanced to your stop/drive targets. Approval required before anything reaches FieldRoutes."
+              }
+              className="bg-emerald-600 hover:bg-emerald-700 text-white h-9 text-sm"
+            >
+              {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+              Optimize Day
             </Button>
           </div>
         </div>
