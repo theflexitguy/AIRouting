@@ -279,19 +279,25 @@ function pinnedFieldRoutesSlotKey(
   rangeEnd: string,
 ) {
   if (!isFieldRoutesScheduledJob(job)) return "";
-  // Only pin stops FieldRoutes actually ASSIGNED to a tech. jobAssignedToTech
-  // matches EVERY tech for an unassigned job ("can go to anyone" pool
-  // semantics), so without this guard .find() pins every scheduled-but-
-  // unassigned appointment to whichever tech sorts first in the roster —
-  // forced past every stop/drive cap (this built the 43-stop, 22-hour route).
-  // Unassigned scheduled stops still route first (priority comparator) on
-  // their scheduled date (date penalty), but through capacity-checked
-  // placement like any other stop.
-  if (!jobHasExplicitAssignment(job)) return "";
   const scheduledDate = String(job.fieldRoutesScheduledDate || job.scheduledDate || "");
   if (scheduledDate < rangeStart || scheduledDate > rangeEnd) return "";
-  const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
-  return tech ? routeSlotKey(scheduledDate, tech.id) : "";
+  // Stops FieldRoutes actually ASSIGNED to a tech pin to that tech. The lookup
+  // must be gated on an explicit assignment: jobAssignedToTech matches EVERY
+  // tech for an unassigned job ("can go to anyone" pool semantics), so an
+  // unguarded .find() pins every scheduled-but-unassigned appointment to
+  // whichever tech sorts first in the roster — forced past every stop/drive
+  // cap (this built the 43-stop, 22-hour route).
+  if (jobHasExplicitAssignment(job)) {
+    const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
+    return tech ? routeSlotKey(scheduledDate, tech.id) : "";
+  }
+  // Stop on an UNASSIGNED FieldRoutes route: owner's rule — the account's
+  // PREFERRED TECHNICIAN takes it. If that tech already has a route that day
+  // the stop joins it; if not, this pin seeds the day's route as THEIRS and
+  // the generator builds it out normally. No preferred tech (or preferred
+  // tech not selected) → capacity-checked placement like any other stop.
+  const preferred = techs.find((candidate) => techIsPreferredForJob(job, candidate));
+  return preferred ? routeSlotKey(scheduledDate, preferred.id) : "";
 }
 
 function serviceFrequencyDays(job: JobDoc) {
