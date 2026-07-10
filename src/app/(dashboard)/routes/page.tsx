@@ -532,15 +532,15 @@ function getRouteProductionValue(stopSequence: string[], jobsById: Record<string
 }
 
 function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
-  const routeWithMetrics = route as RouteWithMetrics;
   const estimated = estimateRouteMetrics(route.stopSequence, jobsById);
   const driveMinutes = Number.isFinite(Number(route.totalDriveTimeMinutes))
     ? Math.round(Number(route.totalDriveTimeMinutes))
     : estimated.totalDriveTimeMinutes;
   const serviceMinutes = getRouteServiceMinutes(route.stopSequence, jobsById);
-  const workMinutes = Number.isFinite(Number(routeWithMetrics.totalWorkMinutes))
-    ? Math.round(Number(routeWithMetrics.totalWorkMinutes))
-    : driveMinutes + serviceMinutes;
+  // DAY = drive + service over the CURRENT stop list. Never trust the persisted
+  // totalWorkMinutes: on a mixed/merged route it was computed over a subset of
+  // stops, which produced the impossible "DAY < SERVICE" the dispatcher saw.
+  const workMinutes = driveMinutes + serviceMinutes;
 
   return {
     stops: route.stopSequence.length,
@@ -3159,7 +3159,7 @@ export default function RoutesPage() {
                 allLabel={`All days (${routeDates.length})`}
               />
               <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap pl-4">
-                {visibleRoutes.length} routes · {visibleRoutes.reduce((s, r) => s + r.route.totalStops, 0)} stops · {formatCurrency(visibleRoutes.reduce((total, r) => total + getRouteProductionValue(r.route.stopSequence, allJobs), 0))}
+                {visibleRoutes.length} routes · {visibleRoutes.reduce((s, r) => s + (r.route.stopSequence?.length || 0), 0)} stops · {formatCurrency(visibleRoutes.reduce((total, r) => total + getRouteProductionValue(r.route.stopSequence, allJobs), 0))}
               </span>
             </div>
 

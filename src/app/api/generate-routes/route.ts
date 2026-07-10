@@ -2292,15 +2292,30 @@ export async function POST(request: NextRequest) {
 
         console.log(`[generate-routes] Merging ${newStops.length} new stops into approved route for ${techName} ${routeDate} (${existingStopIds.length} existing)`);
 
+        // Metrics must cover the FULL merged sequence, not just the newly
+        // generated stops — otherwise totalStops (merged) and the time fields
+        // (new-only) desync, which surfaced as "full day < service" in the UI.
+        // Add the existing route's stored metrics (stop-count fallback at 25m/stop
+        // when a field is missing) to the new stops' metrics.
+        const exData = existingApproved.data as Record<string, unknown>;
+        const exSvc = Number(exData.totalServiceMinutes);
+        const exDrive = Number(exData.totalDriveTimeMinutes);
+        const existingService = Number.isFinite(exSvc) && exSvc > 0 ? Math.round(exSvc) : existingStopIds.length * 25;
+        const existingDrive = Number.isFinite(exDrive) && exDrive > 0 ? Math.round(exDrive) : 0;
+        const newService = Math.round(Number(route.totalServiceMinutes) || newStops.length * 25);
+        const newDrive = Math.round(Number(route.totalDriveMinutes) || 0);
+        const mergedService = existingService + newService;
+        const mergedDrive = existingDrive + newDrive;
+
         routeWrites.push({
           routeRef: existingApproved.ref,
           isUpdate: true,
           data: {
             stopSequence: mergedStopIds,
             totalStops: mergedStopIds.length,
-            totalDriveTimeMinutes: Math.round(Number(route.totalDriveMinutes) || 0),
-            totalWorkMinutes: Math.round(Number(route.totalWorkMinutes) || Number(route.totalDriveMinutes) || 0),
-            totalServiceMinutes: Math.round(Number(route.totalServiceMinutes) || 0),
+            totalDriveTimeMinutes: mergedDrive,
+            totalWorkMinutes: mergedDrive + mergedService,
+            totalServiceMinutes: mergedService,
             driveTimeSource: String(route.driveTimeSource || "haversine_fallback"),
             polylineSource: String(route.polylineSource || "haversine_fallback"),
             encodedPolyline: String(route.encodedPolyline || ""),
