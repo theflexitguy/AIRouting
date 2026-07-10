@@ -697,6 +697,21 @@ async function reconcileScheduledRoutes(
           routeGroupTitle,
           routeValue,
           ...metrics,
+          // `metrics` covers only the FieldRoutes jobs. On a MIXED slot the doc
+          // also keeps `preserved` generated stops (counted in totalStops), so add
+          // their service time (default 25m each — their job docs aren't loaded
+          // here) to keep service/work consistent with the stop count. Without
+          // this the doc showed a "full day" for a subset of its stops, which the
+          // UI surfaced as the impossible DAY < SERVICE.
+          ...(preserved.length > 0
+            ? {
+                totalServiceMinutes: (metrics.totalServiceMinutes as number) + preserved.length * 25,
+                totalWorkMinutes:
+                  (metrics.totalDriveTimeMinutes as number) +
+                  (metrics.totalServiceMinutes as number) +
+                  preserved.length * 25,
+              }
+            : {}),
           // A pure-FieldRoutes slot is locked. A slot that also holds generated
           // stops keeps its existing approval so we don't surprise-lock an AI
           // route — its FieldRoutes stops are still protected by pinning.
