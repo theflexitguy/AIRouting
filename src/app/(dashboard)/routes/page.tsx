@@ -531,11 +531,16 @@ function getRouteProductionValue(stopSequence: string[], jobsById: Record<string
   }, 0);
 }
 
-function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>) {
+function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roadDriveMinutes?: number) {
   const estimated = estimateRouteMetrics(route.stopSequence, jobsById);
-  const driveMinutes = Number.isFinite(Number(route.totalDriveTimeMinutes))
-    ? Math.round(Number(route.totalDriveTimeMinutes))
-    : estimated.totalDriveTimeMinutes;
+  // Prefer a freshly-fetched real Google road drive time when available (synced
+  // routes otherwise carry only a straight-line haversine estimate). Fall back to
+  // the stored value, then to the estimate.
+  const driveMinutes = Number.isFinite(roadDriveMinutes)
+    ? Math.round(Number(roadDriveMinutes))
+    : Number.isFinite(Number(route.totalDriveTimeMinutes))
+      ? Math.round(Number(route.totalDriveTimeMinutes))
+      : estimated.totalDriveTimeMinutes;
   const serviceMinutes = getRouteServiceMinutes(route.stopSequence, jobsById);
   // DAY = drive + service over the CURRENT stop list. Never trust the persisted
   // totalWorkMinutes: on a mixed/merged route it was computed over a subset of
@@ -617,8 +622,8 @@ function escapeHtml(value: unknown) {
     .replace(/'/g, "&#39;");
 }
 
-function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>) {
-  const stats = getRouteDisplayMetrics(tr.route, jobsById);
+function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>, roadDriveMinutes?: number) {
+  const stats = getRouteDisplayMetrics(tr.route, jobsById, roadDriveMinutes);
   return `<div style="color:#111;padding:8px;min-width:220px;max-width:280px">
     <div style="font-weight:700;margin-bottom:2px">${escapeHtml(tr.tech.name)}</div>
     <div style="color:#666;font-size:12px;margin-bottom:8px">${escapeHtml(tr.route.date)} · ${stats.stops} stops</div>
@@ -660,11 +665,12 @@ interface TechRoute {
 
 interface StopMenuTarget { routeId: string; techName: string; color: string; date: string; }
 
-function RoutePanelStats({ route, jobsById }: {
+function RoutePanelStats({ route, jobsById, roadDriveMinutes }: {
   route: Route;
   jobsById: Record<string, Job>;
+  roadDriveMinutes?: number;
 }) {
-  const stats = getRouteDisplayMetrics(route, jobsById);
+  const stats = getRouteDisplayMetrics(route, jobsById, roadDriveMinutes);
   const routeWithMetrics = route as RouteWithMetrics;
   const sync = routeWithMetrics.fieldRoutesSync;
 
@@ -884,6 +890,10 @@ export default function RoutesPage() {
   const [routeGroupOptions, setRouteGroupOptions] = useState<string[]>([]);
   const [allRoutes, setAllRoutes] = useState<TechRoute[]>([]); // all routes in date range
   const [allJobs, setAllJobs] = useState<{ [jobId: string]: Job }>({});
+  // Real Google road drive time per visible route, fetched on demand (reuses the
+  // same cached geometry the map polylines use — no extra API calls). Overrides
+  // the stored straight-line estimate in the DRIVE/DAY stats.
+  const [roadDriveByRouteId, setRoadDriveByRouteId] = useState<Record<string, number>>({});
   const [generating, setGenerating] = useState(false);
   const [genStage, setGenStage] = useState("");
   const [genResult, setGenResult] = useState<string | null>(null);
@@ -1120,6 +1130,29 @@ export default function RoutesPage() {
     }
     return true;
   });
+  // Fetch real Google road drive time for each visible route that still carries
+  // only the straight-line estimate. Reuses getRoadRouteForJobs' cache (the same
+  // fetch the map polylines use), so this adds no extra API calls; it just
+  // surfaces the real drive into the DRIVE/DAY stats. Uses the route's CURRENT
+  // stop order (re-sequencing to reduce drive is a separate, approval-gated step).
+  useEffect(() => {
+    let cancelled = false;
+    for (const tr of visibleRoutes) {
+      if (tr.route.driveTimeSource === "routes_api_polyline") continue; // stored value already real
+      const jobs = getOrderedJobsWithCoordinates(tr.route.stopSequence, allJobs);
+      if (!jobs || jobs.length < 2) continue;
+      const routeId = tr.route.id;
+      void getRoadRouteForJobs(jobs, tr.route.date).then((rr) => {
+        if (cancelled) return;
+        if (rr.polylineSource !== "routes_api_polyline" || rr.failedLegs > 0) return;
+        const drive = Math.round(rr.totalDriveMinutes);
+        setRoadDriveByRouteId((prev) => (prev[routeId] === drive ? prev : { ...prev, [routeId]: drive }));
+      });
+    }
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleRoutes, allJobs]);
+
   // Unassigned FieldRoutes routes within the selected dates, for the toggle badge.
   const unassignedRouteCount = displayRoutes.filter(
     (tr) => isUnassignedRoute(tr) && (selectedDates.length === 0 || selectedDates.includes(tr.route.date)),
@@ -2160,7 +2193,7 @@ export default function RoutesPage() {
             ? clickReorderSequence.indexOf(job.id) + 1
             : 0;
         const clickOrderActive = clickReorderRouteId === routeId;
-        const routeStats = getRouteDisplayMetrics(tr.route, allJobs);
+        const routeStats = getRouteDisplayMetrics(tr.route, allJobs, roadDriveByRouteId[tr.route.id]);
         const stopProduction = calculateStopProductionValue(job);
         const lastServiced = getSubscriptionLastServiced(job);
 
@@ -2298,7 +2331,7 @@ export default function RoutesPage() {
           map,
         });
         const routeInfoWindow = new window.google.maps.InfoWindow({
-          content: routeStatsHtml(tr, allJobs),
+          content: routeStatsHtml(tr, allJobs, roadDriveByRouteId[tr.route.id]),
           disableAutoPan: true,
         });
         polyline.addListener("click", (event: google.maps.MapMouseEvent) => {
@@ -2385,7 +2418,7 @@ export default function RoutesPage() {
     return () => {
       cancelled = true;
     };
-  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
+  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, roadDriveByRouteId, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
 
   // Job Pool markers — viewport-aware, NOT clustered. Re-renders on pan/zoom
   // (viewportTick) and draws ONLY the stops in the current map bounds as small,
@@ -3265,7 +3298,7 @@ export default function RoutesPage() {
                     <Calendar className="w-2.5 h-2.5" /> Already scheduled in FieldRoutes
                   </div>
                 )}
-                <RoutePanelStats route={tr.route} jobsById={allJobs} />
+                <RoutePanelStats route={tr.route} jobsById={allJobs} roadDriveMinutes={roadDriveByRouteId[tr.route.id]} />
                 <DroppableStopList routeId={tr.route.id} enabled={editMode && !routeReadOnly}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {
@@ -3406,7 +3439,7 @@ export default function RoutesPage() {
                     <Calendar className="w-2.5 h-2.5" /> Already scheduled in FieldRoutes
                   </div>
                 )}
-                <RoutePanelStats route={tr.route} jobsById={allJobs} />
+                <RoutePanelStats route={tr.route} jobsById={allJobs} roadDriveMinutes={roadDriveByRouteId[tr.route.id]} />
                 <DroppableStopList routeId={tr.route.id} enabled={editMode && !routeReadOnly}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {
