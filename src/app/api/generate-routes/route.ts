@@ -279,6 +279,15 @@ function pinnedFieldRoutesSlotKey(
   rangeEnd: string,
 ) {
   if (!isFieldRoutesScheduledJob(job)) return "";
+  // Only pin stops FieldRoutes actually ASSIGNED to a tech. jobAssignedToTech
+  // matches EVERY tech for an unassigned job ("can go to anyone" pool
+  // semantics), so without this guard .find() pins every scheduled-but-
+  // unassigned appointment to whichever tech sorts first in the roster —
+  // forced past every stop/drive cap (this built the 43-stop, 22-hour route).
+  // Unassigned scheduled stops still route first (priority comparator) on
+  // their scheduled date (date penalty), but through capacity-checked
+  // placement like any other stop.
+  if (!jobHasExplicitAssignment(job)) return "";
   const scheduledDate = String(job.fieldRoutesScheduledDate || job.scheduledDate || "");
   if (scheduledDate < rangeStart || scheduledDate > rangeEnd) return "";
   const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
@@ -1463,9 +1472,13 @@ async function buildFastFallbackRoutes({
   let slotIndex = 0;
   const partition = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId, {
     softAssignments: rebalance,
-    perTechCapacity: rebalance
-      ? dates.reduce((sum, routeDate) => sum + maxStopsForRouteDate(maxStops, routeDate), 0)
-      : undefined,
+    // Capacity-aware in every mode: without it, nearest-stop scoring clusters
+    // pool jobs onto one tech and the per-slot limit then defers the overflow
+    // as "no route capacity" even when other techs had room.
+    perTechCapacity: dates.reduce(
+      (sum, routeDate) => sum + maxStopsForRouteDate(maxStops, routeDate),
+      0,
+    ),
   });
   const partitionedByTech = partition.byTech;
   // Jobs whose required skills no selected technician carries: defer with the
@@ -2049,7 +2062,7 @@ export async function POST(request: NextRequest) {
     const { byTech: partitionedByTech, skillBlocked: skillBlockedByTech } =
       partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId, {
         softAssignments: rebalance,
-        perTechCapacity: rebalance ? perTechCapacity : undefined,
+        perTechCapacity,
       });
     for (const tech of selectedTechs) {
       const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
