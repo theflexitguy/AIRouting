@@ -182,6 +182,7 @@ function partitionJobsAmongTechs(
   jobs: JobDoc[],
   techs: Array<Record<string, unknown> & { id: string }>,
   pinnedSlotByJobId: Map<string, string>,
+  opts: { softAssignments?: boolean } = {},
 ) {
   const byTech = new Map<string, JobDoc[]>();
   techs.forEach((tech) => byTech.set(tech.id, []));
@@ -204,8 +205,10 @@ function partitionJobsAmongTechs(
     }
     // Explicit assignments (FieldRoutes / dispatcher) are honored as committed
     // decisions even when the skill matrix disagrees — mirroring FieldRoutes,
-    // which warns on a mismatch but lets the office schedule anyway.
-    if (jobHasExplicitAssignment(job)) {
+    // which warns on a mismatch but lets the office schedule anyway. In
+    // rebalance mode (softAssignments) the current assignment is a PREFERENCE,
+    // not a commitment — the whole point is letting stops move between techs.
+    if (!opts.softAssignments && jobHasExplicitAssignment(job)) {
       const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
       if (tech) byTech.get(tech.id)!.push(job);
       continue;
@@ -232,6 +235,11 @@ function partitionJobsAmongTechs(
       let score = nearestMinutes + current.length * 4;
       // Preferred technician wins unless they are far away or heavily loaded.
       if (techIsPreferredForJob(job, tech)) score -= PREFERRED_TECH_BONUS_MINUTES;
+      // Rebalance: the tech who already has the stop keeps a home-field bonus,
+      // so stops only move when the move genuinely improves the day.
+      if (opts.softAssignments && jobHasExplicitAssignment(job) && jobAssignedToTech(job, tech)) {
+        score -= PREFERRED_TECH_BONUS_MINUTES;
+      }
       if (score < bestScore) {
         bestScore = score;
         bestTechId = tech.id;
@@ -825,6 +833,7 @@ function chooseDriveCapRemoval({
   matrixById,
   matrix,
   pinnedSlotByJobId = new Map<string, string>(),
+  protectedJobIds = new Set<string>(),
 }: {
   ordered: JobDoc[];
   slot: RouteSlot;
@@ -834,6 +843,7 @@ function chooseDriveCapRemoval({
   matrixById: Map<string, number>;
   matrix: number[][];
   pinnedSlotByJobId?: Map<string, string>;
+  protectedJobIds?: Set<string>;
 }) {
   if (ordered.length <= 1) return null;
   const currentDrive = driveMinutesForOrderedSubset(ordered, matrixById, matrix);
@@ -844,6 +854,9 @@ function chooseDriveCapRemoval({
     // Never remove a stop that's already committed to this route.
     if (pinnedSlotByJobId.get(job.docId) === slotKey) continue;
     if (pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd) === slotKey) continue;
+    // Rebalance guardrail: previously scheduled stops may move techs, but
+    // trimming must never drop them from the day entirely.
+    if (protectedJobIds.has(job.docId)) continue;
 
     const without = ordered.filter((candidate) => candidate.docId !== job.docId);
     const reducedDrive = driveMinutesForOrderedSubset(without, matrixById, matrix);
@@ -1287,6 +1300,7 @@ function assignJobsToTechSlots({
   rangeEnd,
   selectedTechs,
   pinnedSlotByJobId = new Map<string, string>(),
+  ignoreFieldRoutesLocks = false,
 }: {
   jobs: JobDoc[];
   slots: RouteSlot[];
@@ -1294,6 +1308,7 @@ function assignJobsToTechSlots({
   rangeEnd: string;
   selectedTechs: Array<Record<string, unknown> & { id: string }>;
   pinnedSlotByJobId?: Map<string, string>;
+  ignoreFieldRoutesLocks?: boolean;
 }) {
   const assignments: UnitAssignment[] = slots.map((slot) => ({ slot, units: [] }));
   const unassignedJobs: Array<{ job: JobDoc; reason: string }> = [];
@@ -1301,10 +1316,12 @@ function assignJobsToTechSlots({
     jobs
       .map((job) => {
         // A stop already committed to a route (pinned) wins; otherwise fall
-        // back to its FieldRoutes-scheduled slot.
+        // back to its FieldRoutes-scheduled slot. Rebalance mode drops the
+        // FieldRoutes fallback so scheduled stops can move between techs
+        // (the date is already fixed because the run is single-day).
         const locked =
           pinnedSlotByJobId.get(job.docId) ||
-          pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd);
+          (ignoreFieldRoutesLocks ? "" : pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd));
         return [job.docId, locked] as const;
       })
       .filter((entry) => entry[1]),
@@ -1404,6 +1421,8 @@ async function buildFastFallbackRoutes({
   rangeStart,
   rangeEnd,
   pinnedSlotByJobId = new Map<string, string>(),
+  rebalance = false,
+  protectedJobIds = new Set<string>(),
 }: {
   jobsToRoute: JobDoc[];
   selectedTechs: Array<Record<string, unknown> & { id: string }>;
@@ -1414,6 +1433,8 @@ async function buildFastFallbackRoutes({
   rangeStart: string;
   rangeEnd: string;
   pinnedSlotByJobId?: Map<string, string>;
+  rebalance?: boolean;
+  protectedJobIds?: Set<string>;
 }): Promise<FastRouteBuildResult> {
   const routes: BackendRoute[] = [];
   const deferredJobIds = new Set<string>();
@@ -1423,7 +1444,9 @@ async function buildFastFallbackRoutes({
   const polylineSources = new Set<string>();
   const driveCapDeferrals: Array<{ job: JobDoc; routeName: string; driveMinutes: number }> = [];
   let slotIndex = 0;
-  const partition = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId);
+  const partition = partitionJobsAmongTechs(jobsToRoute, selectedTechs, pinnedSlotByJobId, {
+    softAssignments: rebalance,
+  });
   const partitionedByTech = partition.byTech;
   // Jobs whose required skills no selected technician carries: defer with the
   // skill named, never assign to an unqualified tech.
@@ -1463,6 +1486,7 @@ async function buildFastFallbackRoutes({
       rangeEnd,
       selectedTechs,
       pinnedSlotByJobId,
+      ignoreFieldRoutesLocks: rebalance,
     });
     const assignments = assignmentResult.assignments;
     assignmentResult.unassignedJobs.forEach((entry) => {
@@ -1498,6 +1522,7 @@ async function buildFastFallbackRoutes({
           matrixById: orderedBuild.matrixById,
           matrix: orderedBuild.matrixResult.matrix,
           pinnedSlotByJobId,
+          protectedJobIds,
         });
         if (!removal) {
           routeWarnings.add(
@@ -1631,6 +1656,7 @@ export async function POST(request: NextRequest) {
       maxDayMinutes: rawMaxDayMinutes,
       requestedBy,
       runSettings,
+      rebalanceScheduled,
     } = body as {
       companyId: string;
       startDate?: string;
@@ -1642,6 +1668,7 @@ export async function POST(request: NextRequest) {
       maxDayMinutes?: number;
       requestedBy?: string;
       runSettings?: Record<string, unknown>;
+      rebalanceScheduled?: boolean;
     };
 
     if (!companyId) {
@@ -1656,6 +1683,16 @@ export async function POST(request: NextRequest) {
     if (!rangeStart || !rangeEnd) {
       return NextResponse.json(
         { error: "startDate and endDate (or date) are required" },
+        { status: 400 },
+      );
+    }
+
+    // Rebalance mode ("Optimize This Day"): scheduled stops keep their DATE but
+    // may move between technicians, so it only makes sense for a single day.
+    const rebalance = rebalanceScheduled === true;
+    if (rebalance && rangeStart !== rangeEnd) {
+      return NextResponse.json(
+        { error: "Optimize This Day requires a single-day date range" },
         { status: 400 },
       );
     }
@@ -1737,13 +1774,28 @@ export async function POST(request: NextRequest) {
     // Jobs already placed on a route must never be dropped — pin them to their
     // current (date::techId) slot so generation can only add stops, not remove.
     const pinnedSlotByJobId = new Map<string, string>();
+    // Rebalance mode: previously scheduled stops are freed from their tech but
+    // must still be routed SOMEWHERE on the day. mustRouteJobIds protects them
+    // from every defer/trim path; fallbackSlotByJobId remembers the original
+    // slot so an unplaceable stop stays with its original technician.
+    const mustRouteJobIds = new Set<string>();
+    const fallbackSlotByJobId = new Map<string, string>();
+
+    // The sync materializes FieldRoutes routes as approved+locked docs. For a
+    // rebalance those are exactly the routes being re-proposed, so they are
+    // staged as replaceable; only routes a HUMAN approved (generatedBy "ai",
+    // no fieldroutes source/lock) stay untouchable.
+    const isFieldRoutesManagedDoc = (route: FirebaseFirestore.DocumentData) =>
+      String(route.source || "") === "fieldroutes" ||
+      String(route.generatedBy || "") === "fieldroutes" ||
+      route.locked === true;
 
     for (const routeDoc of existingRoutesSnap.docs) {
       const route = routeDoc.data();
       if (!selectedTechIdSet.has(String(route.techId || ""))) continue;
 
       const slotKey = `${route.date}::${route.techId}`;
-      if (route.approved) {
+      if (route.approved && !(rebalance && isFieldRoutesManagedDoc(route))) {
         const stopSequence = Array.isArray(route.stopSequence) ? route.stopSequence : [];
         approvedRoutesBySlot.set(slotKey, { ref: routeDoc.ref, data: route, stopSequence });
         continue;
@@ -1757,7 +1809,12 @@ export async function POST(request: NextRequest) {
         if (!id) return;
         const jobId = String(id);
         releasedJobIds.add(jobId);
-        pinnedSlotByJobId.set(jobId, slotKey);
+        if (rebalance) {
+          mustRouteJobIds.add(jobId);
+          fallbackSlotByJobId.set(jobId, slotKey);
+        } else {
+          pinnedSlotByJobId.set(jobId, slotKey);
+        }
         generatedAssignmentByJobId.set(jobId, {
           techId: String(route.techId || ""),
           createdAt: String(route.createdAt || route.updatedAt || ""),
@@ -1765,7 +1822,7 @@ export async function POST(request: NextRequest) {
       });
     }
     const replacedRouteCount = routeDocsToReplace.length;
-    console.log(`[generate-routes] STEP 2 DONE: ${replacedRouteCount} routes to replace, ${releasedJobIds.size} released jobs`);
+    console.log(`[generate-routes] STEP 2 DONE: ${replacedRouteCount} routes to replace, ${releasedJobIds.size} released jobs${rebalance ? " (rebalance mode)" : ""}`);
 
     // --- 3. Fetch pending jobs for selected techs ---
     console.log(`[generate-routes] STEP 3: Fetching pending jobs`);
@@ -1831,11 +1888,23 @@ export async function POST(request: NextRequest) {
 
     // Pin FieldRoutes-scheduled stops to their scheduled slot too — these are
     // already committed in FieldRoutes and must never be dropped from a route.
+    // Rebalance mode frees them from the tech (they may move within the day)
+    // but records them as must-route with their original slot as the fallback.
     for (const job of allJobDocs) {
-      if (pinnedSlotByJobId.has(job.docId)) continue;
+      if (pinnedSlotByJobId.has(job.docId) || mustRouteJobIds.has(job.docId)) continue;
       const frSlot = pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd);
-      if (frSlot) pinnedSlotByJobId.set(job.docId, frSlot);
+      if (!frSlot) continue;
+      if (rebalance) {
+        mustRouteJobIds.add(job.docId);
+        fallbackSlotByJobId.set(job.docId, frSlot);
+      } else {
+        pinnedSlotByJobId.set(job.docId, frSlot);
+      }
     }
+    // Protected stops: pinned to a slot OR free-moving-but-mandatory (rebalance).
+    // Both classes always make the routing cut and are never trimmed away.
+    const isProtectedJob = (jobId: string) =>
+      pinnedSlotByJobId.has(jobId) || mustRouteJobIds.has(jobId);
 
     // Eligibility: auto-routing draws from the SAME routable pool the dashboard
     // counts — overdue stops and balance-ok / unconstrained pending. Always keep
@@ -1844,7 +1913,7 @@ export async function POST(request: NextRequest) {
     // scheduling constraint) for API jobs so it never auto-routes. CSV/manual
     // jobs (no `source: "api"`) are unaffected.
     const isRoutingEligible = (job: JobDoc): boolean => {
-      if (pinnedSlotByJobId.has(job.docId)) return true;
+      if (isProtectedJob(job.docId)) return true;
       if (isFieldRoutesScheduledJob(job)) return true;
       if (job.overdueActionable === true) return true;
       if (job.serviceDueAlreadyCompleted === true) return false;
@@ -1853,7 +1922,7 @@ export async function POST(request: NextRequest) {
     };
     const eligibleCountBefore = allJobDocs.length;
     allJobDocs = allJobDocs.filter(isRoutingEligible);
-    console.log(`[generate-routes] STEP 3 DONE: ${allJobDocs.length} routable job docs (of ${eligibleCountBefore}), ${releasedJobDocMap.size} released job docs, ${pinnedSlotByJobId.size} pinned stops`);
+    console.log(`[generate-routes] STEP 3 DONE: ${allJobDocs.length} routable job docs (of ${eligibleCountBefore}), ${releasedJobDocMap.size} released job docs, ${pinnedSlotByJobId.size} pinned stops, ${mustRouteJobIds.size} must-route stops`);
 
     if (allJobDocs.length === 0) {
       await lockRef.delete().catch(() => {});
@@ -1927,7 +1996,7 @@ export async function POST(request: NextRequest) {
     const noDate: JobDoc[] = [];
 
     for (const j of allJobDocs) {
-      if (pinnedSlotByJobId.has(j.docId) || isFieldRoutesScheduledJob(j)) continue;
+      if (isProtectedJob(j.docId) || isFieldRoutesScheduledJob(j)) continue;
       if (j.overdueActionable === true) {
         overdue.push(j);
         continue;
@@ -1958,13 +2027,16 @@ export async function POST(request: NextRequest) {
     // the capacity split, and keep the skill-blocked jobs so they surface as a
     // warning instead of silently vanishing (no selected tech carries their skill).
     const { byTech: partitionedByTech, skillBlocked: skillBlockedByTech } =
-      partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId);
+      partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId, {
+        softAssignments: rebalance,
+      });
     for (const tech of selectedTechs) {
       const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
-      // Pinned (already-routed / FieldRoutes-scheduled) jobs always make the cut;
-      // remaining capacity is filled with the highest-priority unpinned jobs.
-      const pinned = techJobs.filter((job) => pinnedSlotByJobId.has(job.docId));
-      const unpinned = techJobs.filter((job) => !pinnedSlotByJobId.has(job.docId));
+      // Protected (already-routed / FieldRoutes-scheduled / rebalanced) jobs
+      // always make the cut; remaining capacity fills with the highest-priority
+      // unprotected jobs.
+      const pinned = techJobs.filter((job) => isProtectedJob(job.docId));
+      const unpinned = techJobs.filter((job) => !isProtectedJob(job.docId));
       const fillCount = Math.max(0, perTechCapacity - pinned.length);
       selectedByTech.set(tech.id, [...pinned, ...unpinned.slice(0, fillCount)]);
       deferredByTech.set(tech.id, unpinned.slice(fillCount));
@@ -1973,10 +2045,10 @@ export async function POST(request: NextRequest) {
     let jobsToRoute = selectedTechs.flatMap((tech) => selectedByTech.get(tech.id) || []);
     let capacityDeferred = selectedTechs.flatMap((tech) => deferredByTech.get(tech.id) || []);
     if (jobsToRoute.length > capacity) {
-      // Never defer pinned jobs for global capacity — only trim unpinned overflow.
-      const pinnedJobs = jobsToRoute.filter((job) => pinnedSlotByJobId.has(job.docId));
+      // Never defer protected jobs for global capacity — only trim the overflow.
+      const pinnedJobs = jobsToRoute.filter((job) => isProtectedJob(job.docId));
       const unpinnedJobs = jobsToRoute
-        .filter((job) => !pinnedSlotByJobId.has(job.docId))
+        .filter((job) => !isProtectedJob(job.docId))
         .sort(prioritySort);
       const unpinnedFill = Math.max(0, capacity - pinnedJobs.length);
       capacityDeferred = [...unpinnedJobs.slice(unpinnedFill), ...capacityDeferred];
@@ -1995,7 +2067,7 @@ export async function POST(request: NextRequest) {
     // Counts mirror the new tiers (FieldRoutes-pinned stops excluded): overdue =
     // overdueActionable; inWindow = pending within ±30d; future = pending beyond.
     const selectableSelected = jobsToRoute.filter(
-      (j) => !pinnedSlotByJobId.has(j.docId) && !isFieldRoutesScheduledJob(j),
+      (j) => !isProtectedJob(j.docId) && !isFieldRoutesScheduledJob(j),
     );
     const selectedOverdueCount = selectableSelected.filter((j) => j.overdueActionable === true).length;
     const selectedInWindowCount = selectableSelected.filter((j) => {
@@ -2089,6 +2161,8 @@ export async function POST(request: NextRequest) {
         rangeStart,
         rangeEnd,
         pinnedSlotByJobId,
+        rebalance,
+        protectedJobIds: mustRouteJobIds,
       });
       result = {
         runId: `fast-${Date.now()}`,
@@ -2127,6 +2201,8 @@ export async function POST(request: NextRequest) {
           rangeStart,
           rangeEnd,
           pinnedSlotByJobId,
+          rebalance,
+          protectedJobIds: mustRouteJobIds,
         });
         result = {
           runId: `fast-${Date.now()}`,
@@ -2155,6 +2231,77 @@ export async function POST(request: NextRequest) {
     }
 
     const routes = result.routes || [];
+
+    // Rebalance guardrail: a previously scheduled stop must NEVER fall off the
+    // day. Anything the solver couldn't place (skill-blocked, bundle over the
+    // slot limit, etc.) goes back to its ORIGINAL tech/slot, appended to that
+    // route (or a minimal route is created), and comes off the deferred list.
+    if (rebalance && mustRouteJobIds.size > 0) {
+      const placedIds = new Set(
+        routes.flatMap((r) => (r.stops || []).map((s) => String(s.id || s.customerID || ""))),
+      );
+      const deferredSet = new Set(result.deferredJobIds || []);
+      let restored = 0;
+      for (const jobId of mustRouteJobIds) {
+        if (placedIds.has(jobId)) continue;
+        const job = jobDocMap.get(jobId) || releasedJobDocMap.get(jobId);
+        const slotKey = fallbackSlotByJobId.get(jobId);
+        if (!job || !slotKey) continue;
+        const [slotDate, slotTechId] = slotKey.split("::");
+        let target = routes.find(
+          (r) => String(r.date || "") === slotDate && String(r.techId || "") === slotTechId,
+        );
+        if (!target) {
+          const tech = selectedTechs.find((t) => t.id === slotTechId);
+          target = {
+            routeName: `${String((tech as Record<string, unknown>)?.name || slotTechId)} ${slotDate}`,
+            totalDriveMinutes: 0,
+            totalServiceMinutes: 0,
+            totalWorkMinutes: 0,
+            stops: [],
+            date: slotDate,
+            techId: slotTechId,
+            techName: String((tech as Record<string, unknown>)?.name || slotTechId),
+            driveTimeSource: "haversine_fallback",
+            polylineSource: "haversine_fallback",
+            polylineStatus: "ESTIMATE_ONLY",
+            encodedPolyline: "",
+            routePolyline: [],
+            failedRouteSegments: 0,
+          };
+          routes.push(target);
+        }
+        const stops = target.stops || (target.stops = []);
+        const duration = Number(job.duration || 25);
+        stops.push({
+          id: job.docId,
+          customerID: job.docId,
+          subscriptionID: String(job.subscriptionId || job.subscriptionID || job.docId),
+          sequence: stops.length + 1,
+          duration,
+          lat: job.lat,
+          lng: job.lng,
+          customerName: String(job.customerName || ""),
+          address: String(job.address || ""),
+          serviceType: String(job.serviceType || ""),
+          serviceDue: String(job.scheduledDate || slotDate),
+          recurringFrequency: String(job.recurringFrequency || ""),
+          billingFrequency: String(job.billingFrequency || ""),
+          subscriptionLastServiced: String(job.subscriptionLastServiced || ""),
+        });
+        target.totalServiceMinutes = Math.round(Number(target.totalServiceMinutes || 0) + duration);
+        target.totalWorkMinutes = Math.round(Number(target.totalWorkMinutes || 0) + duration);
+        deferredSet.delete(jobId);
+        restored++;
+      }
+      if (restored > 0) {
+        result.deferredJobIds = Array.from(deferredSet);
+        result.warnings = [
+          ...(result.warnings || []),
+          `${restored} scheduled stop(s) couldn't be re-placed under the current constraints and stayed with their original technician.`,
+        ];
+      }
+    }
 
     if (routes.length === 0) {
       await lockRef.delete().catch(() => {});
