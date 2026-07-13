@@ -880,15 +880,19 @@ function chooseDriveCapRemoval({
   if (ordered.length <= 1) return null;
   const currentDrive = driveMinutesForOrderedSubset(ordered, matrixById, matrix);
   const slotKey = routeSlotKey(slot.date, slot.tech.id);
-  let best: { job: JobDoc; score: number } | null = null;
+  // The drive/day caps are HARD: pinned/protected stops are trimmed last (they
+  // outrank pool stops), but they ARE trimmable — a trimmed protected stop is
+  // never dropped, the post-build guardrail re-homes it on a same-day route
+  // with room. The old absolute exemption meant a route built from pinned
+  // stops could never be brought under the caps at all.
+  let bestUnprotected: { job: JobDoc; score: number } | null = null;
+  let bestProtected: { job: JobDoc; score: number } | null = null;
 
   for (const job of ordered) {
-    // Never remove a stop that's already committed to this route.
-    if (pinnedSlotByJobId.get(job.docId) === slotKey) continue;
-    if (pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd) === slotKey) continue;
-    // Rebalance guardrail: previously scheduled stops may move techs, but
-    // trimming must never drop them from the day entirely.
-    if (protectedJobIds.has(job.docId)) continue;
+    const isProtected =
+      pinnedSlotByJobId.get(job.docId) === slotKey ||
+      pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd) === slotKey ||
+      protectedJobIds.has(job.docId);
 
     const without = ordered.filter((candidate) => candidate.docId !== job.docId);
     const reducedDrive = driveMinutesForOrderedSubset(without, matrixById, matrix);
@@ -900,8 +904,13 @@ function chooseDriveCapRemoval({
     // priorityPenalty above.
     const valuePenalty = jobRouteValue(job) / VALUE_PER_DRIVE_MINUTE;
     const score = driveReduction - priorityPenalty - valuePenalty;
-    if (!best || score > best.score) best = { job, score };
+    if (isProtected) {
+      if (!bestProtected || score > bestProtected.score) bestProtected = { job, score };
+    } else {
+      if (!bestUnprotected || score > bestUnprotected.score) bestUnprotected = { job, score };
+    }
   }
+  const best = bestUnprotected || bestProtected;
 
   return best?.job || null;
 }
@@ -1366,8 +1375,13 @@ function assignJobsToTechSlots({
       ? slots.find((slot) => routeSlotKey(slot.date, slot.tech.id) === unit.lockedSlotKey)
       : null;
 
-    // Pinned units are already committed to a route: force them onto their
-    // locked slot regardless of capacity. They must never be dropped.
+    // Pinned units go to their locked slot UP TO the slot's stop cap. Units
+    // are processed in priority order, so the tech keeps their most important
+    // stops; overflow past the cap is NOT forced (the old behavior — "force
+    // regardless of capacity" — is what produced 24+-stop routes the caps
+    // could never touch). Overflow falls through to normal capacity-checked
+    // placement here, and anything still unplaced is re-homed by the
+    // post-build guardrail (never dropped).
     if (unit.lockedSlotKey) {
       if (!lockedSlot) {
         // Locked to a different technician's slot — handled in that tech's pass.
@@ -1377,8 +1391,13 @@ function assignJobsToTechSlots({
         (assignment) => assignment.slot === lockedSlot,
       );
       if (target) {
-        target.units.push(unit);
-        continue;
+        if (unitStopCount(target.units) + unit.jobs.length <= slotStopLimit(target.slot)) {
+          target.units.push(unit);
+          continue;
+        }
+        // Slot is at the stop target: the cap wins over the pin. Fall through
+        // to normal placement (another of this tech's dates, or deferral for
+        // the guardrail to re-home on a route with room).
       }
     }
 
@@ -1848,12 +1867,13 @@ export async function POST(request: NextRequest) {
         if (!id) return;
         const jobId = String(id);
         releasedJobIds.add(jobId);
-        if (rebalance) {
-          mustRouteJobIds.add(jobId);
-          fallbackSlotByJobId.set(jobId, slotKey);
-        } else {
-          pinnedSlotByJobId.set(jobId, slotKey);
-        }
+        // These routes are UNAPPROVED PROPOSALS being regenerated. Pinning
+        // their stops back to the old slot froze the previous run's
+        // distribution — an oversized route recreated itself on every
+        // Generate. Protect the stops from being dropped (must-route with the
+        // old slot as last-resort fallback) but let placement redo them.
+        mustRouteJobIds.add(jobId);
+        fallbackSlotByJobId.set(jobId, slotKey);
         generatedAssignmentByJobId.set(jobId, {
           techId: String(route.techId || ""),
           createdAt: String(route.createdAt || route.updatedAt || ""),
@@ -2272,22 +2292,27 @@ export async function POST(request: NextRequest) {
 
     const routes = result.routes || [];
 
-    // Rebalance guardrail: a previously scheduled stop must NEVER fall off the
-    // day. Anything the solver couldn't place (skill-blocked, bundle over the
-    // slot limit, etc.) first tries any same-day route with spare capacity that
+    // Guardrail (every mode): a protected stop — FieldRoutes-scheduled, pinned,
+    // or released from a proposal being regenerated — must NEVER fall off the
+    // day, but the stop/drive caps are hard, so anything the solver couldn't
+    // keep on its own route (cap overflow, drive trim, skill block, bundle over
+    // the slot limit) first tries any same-day route with spare capacity that
     // is skill- and service-line-compatible; only when none has room does it go
-    // back to its ORIGINAL tech/slot. Either way it comes off the deferred list.
-    if (rebalance && mustRouteJobIds.size > 0) {
+    // back to its ORIGINAL tech/slot (surfacing as an over-cap warning). Either
+    // way it comes off the deferred list.
+    const guardedJobIds = new Set<string>([...mustRouteJobIds, ...pinnedSlotByJobId.keys()]);
+    if (guardedJobIds.size > 0) {
       const placedIds = new Set(
         routes.flatMap((r) => (r.stops || []).map((s) => String(s.id || s.customerID || ""))),
       );
       const deferredSet = new Set(result.deferredJobIds || []);
       const jobFor = (id: string) => jobDocMap.get(id) || releasedJobDocMap.get(id);
       let restored = 0;
-      for (const jobId of mustRouteJobIds) {
+      let overCapFallbacks = 0;
+      for (const jobId of guardedJobIds) {
         if (placedIds.has(jobId)) continue;
         const job = jobFor(jobId);
-        const slotKey = fallbackSlotByJobId.get(jobId);
+        const slotKey = fallbackSlotByJobId.get(jobId) || pinnedSlotByJobId.get(jobId);
         if (!job || !slotKey) continue;
         const [slotDate, slotTechId] = slotKey.split("::");
         // Best home first: least-loaded same-day route with room whose tech is
@@ -2305,10 +2330,13 @@ export async function POST(request: NextRequest) {
             return unitCompatibleWithSlotJobs([job], routeJobs);
           })
           .sort((a, b) => (a.stops || []).length - (b.stops || []).length)[0];
-        let target = candidate ||
-          routes.find(
-            (r) => String(r.date || "") === slotDate && String(r.techId || "") === slotTechId,
-          );
+        const fallbackRoute = candidate
+          ? null
+          : routes.find(
+              (r) => String(r.date || "") === slotDate && String(r.techId || "") === slotTechId,
+            );
+        if (fallbackRoute) overCapFallbacks++;
+        let target = candidate || fallbackRoute;
         if (!target) {
           const tech = selectedTechs.find((t) => t.id === slotTechId);
           target = {
@@ -2356,7 +2384,12 @@ export async function POST(request: NextRequest) {
         result.deferredJobIds = Array.from(deferredSet);
         result.warnings = [
           ...(result.warnings || []),
-          `${restored} scheduled stop(s) couldn't be re-placed under the current constraints and stayed with their original technician.`,
+          `${restored} committed stop(s) overflowed their route's caps and were re-homed to same-day routes with room.`,
+          ...(overCapFallbacks > 0
+            ? [
+                `${overCapFallbacks} of them had NO same-day route with room and stayed with their original technician OVER the stop target — select more technicians or raise the target to fit the day's scheduled work.`,
+              ]
+            : []),
         ];
       }
     }
