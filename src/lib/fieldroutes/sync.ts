@@ -116,32 +116,30 @@ interface ApptInfo {
   routeGroup: string; // FieldRoutes route.groupTitle (e.g. "GPC", "Specialty")
 }
 
-interface RunProgress {
-  active: boolean;
-  mode: SyncMode;
-  ids: string[];
-  offset: number;
-  cursor: string;
-  apptMap: Record<string, ApptInfo>;
-  empNames: Record<string, string>;
-  technicianEmpIds: string[];
-  requiredSkillsByServiceType: Record<string, string[]>;
-  counts: {
-    inScope: number;
-    autoRoutable: number;
-    alreadyScheduled: number;
-    needsReview: number;
-    written: number;
-    subsProcessed: number;
-  };
-}
-
 function rec(value: unknown): Record<string, unknown> {
   return (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
 }
 
 function str(value: unknown): string {
   return String(value ?? "").trim();
+}
+
+// Write sync state so a named map field (`run`) is REPLACED, not deep-merged.
+// Firestore's set(merge:true) recursively merges nested maps, which would keep
+// a legacy bloated run.ids/apptMap alive; and because Firestore validates the
+// RESULTING document's index-entry count on every write, once the doc is over
+// the 40,000-entry limit even a scalar merge is rejected. update() overwrites
+// only the named fields (leaving other top-level fields intact); the set()
+// fallback creates the doc the first time it doesn't exist yet.
+async function writeSyncState(
+  ref: FirebaseFirestore.DocumentReference,
+  data: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await ref.update(data);
+  } catch {
+    await ref.set(data);
+  }
 }
 
 function maxDateString(a: string, b: string): string {
@@ -1091,8 +1089,26 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   let priorCursor = str(state.cursor);
 
   // Resume an in-progress run of the SAME mode; otherwise start a fresh run.
-  const prior = state.run as RunProgress | undefined;
-  const resuming = Boolean(prior?.active) && prior?.mode === mode && Array.isArray(prior?.ids);
+  // The heavy lookup fields (ids/apptMap/empNames/technicianEmpIds/
+  // requiredSkillsByServiceType) are persisted as a single JSON string ("blob")
+  // so Firestore stores ONE index entry instead of one per array element / map
+  // subfield — a large book blew past the 40,000-index-entries-per-document
+  // limit ("too many index entries for entity …/fieldRoutesState/sync"). Older
+  // paused runs stored those fields inline; parse whichever is present.
+  const prior = state.run as Record<string, unknown> | undefined;
+  const priorHeavy: Record<string, unknown> | null = (() => {
+    if (!prior) return null;
+    if (typeof prior.blob === "string") {
+      try {
+        return rec(JSON.parse(prior.blob));
+      } catch {
+        return null;
+      }
+    }
+    return Array.isArray(prior.ids) ? prior : null; // legacy inline shape
+  })();
+  const resuming =
+    Boolean(prior?.active) && prior?.mode === mode && Array.isArray(priorHeavy?.ids);
 
   // Auto-detect empty DB after a reset: if the job collection is empty but we
   // still have a stored cursor, an incremental sync would only pick up recently
@@ -1166,20 +1182,23 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   // Set true if the cap is hit mid-run; flips the response to a paused state.
   let capped = false;
 
-  if (resuming && prior) {
-    ids = prior.ids;
-    apptMap = rec(prior.apptMap) as Record<string, ApptInfo>;
-    empNames = rec(prior.empNames) as Record<string, string>;
-    technicianEmpIds = Array.isArray(prior.technicianEmpIds) ? prior.technicianEmpIds.map(String) : [];
-    requiredSkillsByServiceType = rec(prior.requiredSkillsByServiceType) as Record<string, string[]>;
+  if (resuming && prior && priorHeavy) {
+    ids = (priorHeavy.ids as unknown[]).map(String);
+    apptMap = rec(priorHeavy.apptMap) as Record<string, ApptInfo>;
+    empNames = rec(priorHeavy.empNames) as Record<string, string>;
+    technicianEmpIds = Array.isArray(priorHeavy.technicianEmpIds)
+      ? (priorHeavy.technicianEmpIds as unknown[]).map(String)
+      : [];
+    requiredSkillsByServiceType = rec(priorHeavy.requiredSkillsByServiceType) as Record<string, string[]>;
     offset = num(prior.offset);
     cursor = str(prior.cursor) || priorCursor;
-    inScopeCount = num(prior.counts?.inScope);
-    autoRoutableCount = num(prior.counts?.autoRoutable);
-    alreadyScheduledCount = num(prior.counts?.alreadyScheduled);
-    needsReviewCount = num(prior.counts?.needsReview);
-    written = num(prior.counts?.written);
-    subsProcessed = num(prior.counts?.subsProcessed);
+    const counts = rec(prior.counts);
+    inScopeCount = num(counts.inScope);
+    autoRoutableCount = num(counts.autoRoutable);
+    alreadyScheduledCount = num(counts.alreadyScheduled);
+    needsReviewCount = num(counts.needsReview);
+    written = num(counts.written);
+    subsProcessed = num(counts.subsProcessed);
   } else {
     try {
       const setup = await buildRunSetup(client, mode, priorCursor, today);
@@ -1652,29 +1671,30 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
     // Advance the top-level cursor only when the whole run completes, so an
     // interrupted incremental run re-resolves the same change set next time.
     if (!cursor) cursor = now;
-    await stateRef.set(
-      {
-        cursor,
-        lastRunMode: mode,
-        lastRunAt: finishedAt,
-        lastRunWritten: written,
-        lastInScopeCount: inScopeCount,
-        run: { active: false },
-        ...(mode === "full" ? { lastFullSyncAt: finishedAt } : { lastIncrementalAt: finishedAt }),
-      },
-      { merge: true },
-    );
+    // update() replaces `run` (clearing any legacy inline ids/apptMap) while
+    // leaving other top-level fields intact — must happen in the SAME write that
+    // shrinks the doc, since Firestore rejects any write whose result is still
+    // over the 40k index-entry limit.
+    await writeSyncState(stateRef, {
+      cursor,
+      lastRunMode: mode,
+      lastRunAt: finishedAt,
+      lastRunWritten: written,
+      lastInScopeCount: inScopeCount,
+      run: { active: false },
+      ...(mode === "full" ? { lastFullSyncAt: finishedAt } : { lastIncrementalAt: finishedAt }),
+    });
   } else {
-    const progress: RunProgress = {
+    // Heavy lookup fields go into a single JSON string so Firestore records ONE
+    // index entry for them instead of one per array element / map subfield —
+    // the native-map shape overran the 40,000-index-entries-per-document limit
+    // on large books. Scalars/counts stay inline (small, and cheap to read for
+    // status without parsing the blob).
+    const progress = {
       active: true,
       mode,
-      ids,
       offset,
       cursor,
-      apptMap,
-      empNames,
-      technicianEmpIds,
-      requiredSkillsByServiceType,
       counts: {
         inScope: inScopeCount,
         autoRoutable: autoRoutableCount,
@@ -1683,9 +1703,18 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         written,
         subsProcessed,
       },
+      blob: JSON.stringify({
+        ids,
+        apptMap,
+        empNames,
+        technicianEmpIds,
+        requiredSkillsByServiceType,
+      }),
     };
-    // Replace the whole run object (set without merge on the field) so stale keys don't linger.
-    await stateRef.set({ run: progress, lastRunMode: mode, lastRunAt: finishedAt }, { merge: true });
+    // update() replaces `run` outright (no legacy inline heavy fields survive)
+    // in the same write that sets the scalars, keeping the doc under the 40k
+    // index-entry limit.
+    await writeSyncState(stateRef, { run: progress, lastRunMode: mode, lastRunAt: finishedAt });
   }
 
   // Keep the "Completed This Month" aggregate fresh on every completed sync so it

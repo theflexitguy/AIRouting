@@ -32,7 +32,11 @@ async function resetSync(companyId: string | undefined, clearRun: boolean, clear
       const syncRef = db.doc(`companies/${companyId}/fieldRoutesState/sync`);
       const syncSnap = await syncRef.get();
       if (syncSnap.exists && syncSnap.data()?.run) {
-        await syncRef.set({ run: { active: false } }, { merge: true });
+        // update() REPLACES run (dropping any legacy inline ids/apptMap that
+        // blew past Firestore's 40k index-entry limit); set-merge would
+        // recursively preserve them and the write would be rejected on an
+        // already-bloated doc.
+        await syncRef.update({ run: { active: false } });
         results.run = "cleared";
       } else {
         results.run = "no active run";

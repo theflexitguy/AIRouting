@@ -66,11 +66,20 @@ async function handle(request: NextRequest) {
       }
     }
 
-    batch.set(db.doc(`companies/${companyId}/fieldRoutesState/sync`), { run: { active: false } }, { merge: true });
-    ops++;
     batch.set(db.doc(`companies/${companyId}/fieldRoutesState/manualSync`), { date: "", count: 0 }, { merge: true });
     ops++;
     await flush(true);
+
+    // Clear the run OUTSIDE the batch via update() so `run` is REPLACED, not
+    // deep-merged — a legacy bloated run.ids/apptMap would otherwise survive and
+    // keep the doc over Firestore's 40k index-entry limit (set-merge on an
+    // already-bloated doc is itself rejected). set() fallback creates it if absent.
+    const syncStateRef = db.doc(`companies/${companyId}/fieldRoutesState/sync`);
+    try {
+      await syncStateRef.update({ run: { active: false } });
+    } catch {
+      await syncStateRef.set({ run: { active: false } }, { merge: true });
+    }
 
     return NextResponse.json({
       success: true,
