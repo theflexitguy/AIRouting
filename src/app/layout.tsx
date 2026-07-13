@@ -5,13 +5,23 @@ import { Toaster } from "sonner";
 
 export const metadata: Metadata = {
   title: "RouteIQ — AI-Powered Routing",
+  applicationName: "RouteIQ",
   description: "Autonomous field service routing powered by AI. Optimize routes, reduce drive time, and learn from every dispatch.",
+  // icon.png / apple-icon.png in app/ are auto-detected by Next for favicon and
+  // the iOS home-screen icon; the manifest (app/manifest.ts) supplies the PWA
+  // install icons.
+  appleWebApp: {
+    capable: true,
+    title: "RouteIQ",
+    statusBarStyle: "black-translucent",
+  },
 };
 
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
+  themeColor: "#1a1a1a",
 };
 
 export default function RootLayout({
