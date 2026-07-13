@@ -12,9 +12,9 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  Zap,
   LogOut,
 } from "lucide-react";
+import Image from "next/image";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -48,9 +48,7 @@ export function Sidebar() {
           "flex items-center h-16 px-4 border-b border-border/60",
           collapsed ? "justify-center" : "gap-3"
         )}>
-          <div className="flex items-center justify-center w-8 h-8 bg-blue-500 rounded-lg shrink-0 shadow-lg shadow-blue-500/20">
-            <Zap className="w-4 h-4 text-white" />
-          </div>
+          <Image src="/icons/icon-512.png" alt="routiq" width={32} height={32} className="w-8 h-8 rounded-lg shrink-0 shadow-lg shadow-black/30" />
           <span className={cn(
             "font-bold text-lg text-white tracking-tight transition-all duration-300",
             collapsed ? "opacity-0 w-0 overflow-hidden" : "opacity-100"

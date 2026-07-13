@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Zap, Eye, EyeOff, Loader2 } from "lucide-react";
+import { Eye, EyeOff, Loader2 } from "lucide-react";
+import Image from "next/image";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -52,9 +53,7 @@ export default function LoginPage() {
       <div className="w-full max-w-[400px] relative">
         {/* Logo */}
         <div className="flex flex-col items-center mb-8 animate-fade-in">
-          <div className="flex items-center justify-center w-12 h-12 bg-blue-500 rounded-2xl shadow-lg shadow-blue-500/20 mb-4">
-            <Zap className="w-6 h-6 text-white" />
-          </div>
+          <Image src="/icons/icon-512.png" alt="routiq" width={48} height={48} priority className="w-12 h-12 rounded-2xl shadow-lg shadow-black/30 mb-4" />
           <h1 className="text-2xl font-bold text-white tracking-tight">routiq</h1>
           <p className="text-muted-foreground/70 mt-1 text-sm">AI-Powered Field Service Routing</p>
         </div>

@@ -6,7 +6,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { SidebarContext } from "@/contexts/SidebarContext";
 import { CommandPalette } from "@/components/CommandPalette";
-import { Zap } from "lucide-react";
+import Image from "next/image";
 
 const isDemoMode = !process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ||
   process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID === "your-firebase-project-id";
@@ -30,9 +30,7 @@ export default function DashboardLayout({
     return (
       <div className="flex items-center justify-center h-screen bg-background">
         <div className="flex flex-col items-center gap-4 animate-fade-in">
-          <div className="w-10 h-10 bg-blue-500 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20">
-            <Zap className="w-5 h-5 text-white" />
-          </div>
+          <Image src="/icons/icon-512.png" alt="routiq" width={40} height={40} priority className="w-10 h-10 rounded-xl shadow-lg shadow-black/30" />
           <div className="flex items-center gap-2">
             <div className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse-soft" style={{ animationDelay: "0ms" }} />
             <div className="w-1.5 h-1.5 bg-blue-500 rounded-full animate-pulse-soft" style={{ animationDelay: "200ms" }} />
