@@ -5,7 +5,8 @@ import { doc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { MapPin, Clock, Zap, CheckCircle, AlertTriangle } from "lucide-react";
+import { MapPin, Clock, CheckCircle, AlertTriangle } from "lucide-react";
+import Image from "next/image";
 import { useParams } from "next/navigation";
 
 interface SharedRoute {
@@ -97,9 +98,7 @@ export default function SharedRoutePage() {
       {/* Header */}
       <div className="bg-card border-b border-border/60 px-4 py-4">
         <div className="max-w-lg mx-auto flex items-center gap-2.5">
-          <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center">
-            <Zap className="w-4 h-4 text-white" />
-          </div>
+          <Image src="/icons/icon-512.png" alt="routiq" width={32} height={32} className="w-8 h-8 rounded-lg shadow-lg shadow-black/30" />
           <span className="font-bold text-lg text-foreground">routiq</span>
         </div>
       </div>

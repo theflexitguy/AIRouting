@@ -10,7 +10,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Zap, Building2, Plug, Users, RefreshCw, CheckCircle, Loader2, ChevronRight, Plus, Trash2 } from "lucide-react";
+import { Building2, Plug, Users, RefreshCw, CheckCircle, Loader2, ChevronRight, Plus, Trash2 } from "lucide-react";
+import Image from "next/image";
 import { generateId } from "@/lib/utils";
 
 interface TechEntry { id: string; name: string; employeeId: string; maxStopsPerDay: number; }
@@ -147,9 +148,7 @@ export default function OnboardingPage() {
       <div className="w-full max-w-lg relative">
         {/* Logo */}
         <div className="flex items-center gap-2.5 mb-8 animate-fade-in">
-          <div className="w-9 h-9 bg-blue-500 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20">
-            <Zap className="w-5 h-5 text-white" />
-          </div>
+          <Image src="/icons/icon-512.png" alt="routiq" width={36} height={36} className="w-9 h-9 rounded-xl shadow-lg shadow-black/30" />
           <span className="font-bold text-xl text-white tracking-tight">routiq</span>
         </div>
 
