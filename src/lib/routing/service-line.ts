@@ -59,7 +59,12 @@ const RULES: Array<{ line: ServiceLine; test: (n: string) => boolean }> = [
   { line: "lawn",       test: (n) => n.includes("lawn") || /^round\d/.test(n) || n.includes("emergent") || n.includes("fertiliz") || n.includes("broadleaf") || n.includes("weedcontrol") || n.includes("winteriz") || n.includes("rootstrength") || n.includes("growthcontrol") || n.includes("stressmanagement") },
   { line: "mosquito",   test: (n) => n.includes("mosquit") || n.includes("boatdock") || n.includes("outdoorpackage") || n.includes("odp") || n.includes("outdoor") },
   { line: "wildlife",   test: (n) => n.includes("wild") },
-  { line: "commercial", test: (n) => n.includes("commercial") || n.includes("gpc") || n.startsWith("comm") || n === "wei" },
+  // NOTE: "gpc" must NOT map to commercial — at Flex, GPC = General Pest
+  // Control (it's the general-pest route group and the tech forecast's GPC
+  // category). When it did, every GP sub booked onto the GPC route group
+  // flapped to the Commercial card: GP's target slid all month while
+  // Commercial's "booked" ballooned past its own target.
+  { line: "commercial", test: (n) => n.includes("commercial") || n.startsWith("comm") || n === "wei" },
 ];
 
 // Canonical route-group → service line, used only as a fallback when the
@@ -70,7 +75,7 @@ const GROUP_TO_LINE: Record<string, ServiceLine> = {
   Lawn: "lawn",
   Mosquito: "mosquito",
   Wildlife: "wildlife",
-  GPC: "commercial",
+  GPC: "general",
 };
 
 function normalize(value: unknown): string {
