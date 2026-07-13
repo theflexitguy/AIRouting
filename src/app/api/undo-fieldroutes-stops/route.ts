@@ -123,7 +123,7 @@ function cancellationConfig(company: FirebaseFirestore.DocumentData, route: Fire
       company.fieldRoutesCancelReason ||
         company.fieldRoutesRouteIqCancelReason ||
         process.env.FIELDROUTES_CANCEL_REASON ||
-        "RouteIQ rollback",
+        "routiq rollback",
     ),
     cancelledBy: clean(
       company.fieldRoutesCancelledByEmployeeId ||
@@ -192,7 +192,7 @@ export async function POST(request: NextRequest) {
       : [];
     if (uploadedAppointments.length === 0) {
       return NextResponse.json(
-        { error: "This RouteIQ route does not have logged FieldRoutes appointment IDs to undo." },
+        { error: "This routiq route does not have logged FieldRoutes appointment IDs to undo." },
         { status: 400 },
       );
     }

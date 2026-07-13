@@ -2,8 +2,8 @@
 //
 // FieldRoutes enforces a hard quota of 3,000 reads/day for the WHOLE account —
 // shared across every piece of software that touches the API. This module lets
-// RouteIQ (a) record how many reads/writes it has spent today and (b) refuse to
-// start new work once it crosses a company-configured cap, so RouteIQ never eats
+// routiq (a) record how many reads/writes it has spent today and (b) refuse to
+// start new work once it crosses a company-configured cap, so routiq never eats
 // the entire account quota on its own.
 //
 // Storage:

@@ -4,8 +4,8 @@ import type { MetadataRoute } from "next";
 // and injects the <link rel="manifest"> automatically.
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "RouteIQ",
-    short_name: "RouteIQ",
+    name: "routiq",
+    short_name: "routiq",
     description: "AI-powered field service routing.",
     start_url: "/",
     display: "standalone",

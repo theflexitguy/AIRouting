@@ -100,7 +100,7 @@ export default function SharedRoutePage() {
           <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center">
             <Zap className="w-4 h-4 text-white" />
           </div>
-          <span className="font-bold text-lg text-foreground">RouteIQ</span>
+          <span className="font-bold text-lg text-foreground">routiq</span>
         </div>
       </div>
 
@@ -171,7 +171,7 @@ export default function SharedRoutePage() {
         {/* Footer */}
         <p className="text-center text-xs text-muted-foreground/40 pb-6">
           <CheckCircle className="w-3 h-3 inline mr-1" />
-          Shared via RouteIQ
+          Shared via routiq
         </p>
       </div>
     </div>
