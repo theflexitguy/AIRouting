@@ -150,7 +150,7 @@ export default function OnboardingPage() {
           <div className="w-9 h-9 bg-blue-500 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20">
             <Zap className="w-5 h-5 text-white" />
           </div>
-          <span className="font-bold text-xl text-white tracking-tight">RouteIQ</span>
+          <span className="font-bold text-xl text-white tracking-tight">routiq</span>
         </div>
 
         {/* Step indicator */}
@@ -173,7 +173,7 @@ export default function OnboardingPage() {
           <Card className="border-border/40 bg-card/60 backdrop-blur-sm animate-fade-in-up">
             <CardHeader>
               <CardTitle className="text-lg">Create your account</CardTitle>
-              <CardDescription>Set up RouteIQ for your company</CardDescription>
+              <CardDescription>Set up routiq for your company</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-2">
@@ -304,7 +304,7 @@ export default function OnboardingPage() {
               </div>
               <div>
                 <h2 className="text-2xl font-bold tracking-tight">You&apos;re all set!</h2>
-                <p className="text-muted-foreground text-sm mt-2 max-w-xs mx-auto">RouteIQ is ready. Head to your dashboard to generate your first AI-optimized routes.</p>
+                <p className="text-muted-foreground text-sm mt-2 max-w-xs mx-auto">routiq is ready. Head to your dashboard to generate your first AI-optimized routes.</p>
               </div>
               <Button onClick={() => router.push("/dashboard")} className="bg-blue-500 hover:bg-blue-600 text-white w-full h-11 font-medium">
                 Go to Dashboard <ChevronRight className="w-4 h-4" />

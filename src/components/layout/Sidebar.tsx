@@ -55,7 +55,7 @@ export function Sidebar() {
             "font-bold text-lg text-white tracking-tight transition-all duration-300",
             collapsed ? "opacity-0 w-0 overflow-hidden" : "opacity-100"
           )}>
-            RouteIQ
+            routiq
           </span>
         </div>
 

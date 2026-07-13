@@ -53,7 +53,7 @@ export async function POST(request: NextRequest) {
       fieldRoutesClearedSync: {
         clearedAt: now,
         requestedBy: clean(requestedBy),
-        reason: "RouteIQ local unschedule only; FieldRoutes was not changed.",
+        reason: "routiq local unschedule only; FieldRoutes was not changed.",
         ...syncDetails,
       },
       updatedAt: now,
@@ -78,7 +78,7 @@ export async function POST(request: NextRequest) {
       fieldRoutes: syncDetails,
     });
   } catch (error) {
-    console.error("Unschedule RouteIQ route error:", error);
-    return NextResponse.json({ error: "Failed to unschedule RouteIQ route", details: String(error) }, { status: 500 });
+    console.error("Unschedule routiq route error:", error);
+    return NextResponse.json({ error: "Failed to unschedule routiq route", details: String(error) }, { status: 500 });
   }
 }

@@ -1129,7 +1129,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   }
 
   // Enforce the daily API cap. Reads are metered against the company's combined
-  // reads+writes budget so RouteIQ never consumes the whole FieldRoutes account
+  // reads+writes budget so routiq never consumes the whole FieldRoutes account
   // quota (3,000/day, shared with every other tool).
   const budget = await loadBudget(db, companyId);
   client.setMaxReads(budget.remaining);

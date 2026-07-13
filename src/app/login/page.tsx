@@ -55,7 +55,7 @@ export default function LoginPage() {
           <div className="flex items-center justify-center w-12 h-12 bg-blue-500 rounded-2xl shadow-lg shadow-blue-500/20 mb-4">
             <Zap className="w-6 h-6 text-white" />
           </div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">RouteIQ</h1>
+          <h1 className="text-2xl font-bold text-white tracking-tight">routiq</h1>
           <p className="text-muted-foreground/70 mt-1 text-sm">AI-Powered Field Service Routing</p>
         </div>
 
@@ -122,7 +122,7 @@ export default function LoginPage() {
             </form>
 
             <div className="mt-5 text-center text-sm text-muted-foreground/70">
-              New to RouteIQ?{" "}
+              New to routiq?{" "}
               <a href="/onboarding" className="text-blue-400 hover:text-blue-300 font-medium transition-colors">
                 Get started free
               </a>
@@ -131,7 +131,7 @@ export default function LoginPage() {
         </Card>
 
         <p className="text-center text-xs text-muted-foreground/40 mt-6">
-          RouteIQ Inc. Enterprise field service automation.
+          routiq Inc. Enterprise field service automation.
         </p>
       </div>
     </div>

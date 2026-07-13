@@ -160,7 +160,7 @@ export async function POST(request: NextRequest) {
     const fieldRoutesRouteId = fieldRoutesRouteIdFromRoute(route) || await routeIdFromStopMarkers(db, companyId, stopSequence);
     const fieldRoutesRouteStatus = fieldRoutesRouteStatusFromRoute(route);
     if (!fieldRoutesRouteId) {
-      return NextResponse.json({ error: "This RouteIQ route has no logged FieldRoutes route ID to delete." }, { status: 400 });
+      return NextResponse.json({ error: "This routiq route has no logged FieldRoutes route ID to delete." }, { status: 400 });
     }
     if (!/^\d+$/.test(fieldRoutesRouteId)) {
       return NextResponse.json({ error: `Logged FieldRoutes route ID is invalid: ${fieldRoutesRouteId}` }, { status: 400 });

@@ -811,7 +811,7 @@ export default function SettingsPage() {
             <Card className="border-border/40">
               <CardHeader>
                 <CardTitle className="text-sm font-semibold">Route Editing</CardTitle>
-                <CardDescription className="text-xs">Control how strictly RouteIQ enforces technician assignment while manually editing routes.</CardDescription>
+                <CardDescription className="text-xs">Control how strictly routiq enforces technician assignment while manually editing routes.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="flex items-center justify-between gap-4 rounded-lg bg-accent/15 p-4">
@@ -839,7 +839,7 @@ export default function SettingsPage() {
             <Card className="border-border/40">
               <CardHeader>
                 <CardTitle className="text-sm font-semibold">Current Plan</CardTitle>
-                <CardDescription className="text-xs">Manage your RouteIQ subscription</CardDescription>
+                <CardDescription className="text-xs">Manage your routiq subscription</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="flex items-center justify-between p-4 bg-accent/20 rounded-lg">
@@ -918,7 +918,7 @@ function ApiUsageCard({
         </CardTitle>
         <CardDescription className="text-xs">
           FieldRoutes allows 3,000 API reads per day across <span className="font-medium">all</span> software on your account.
-          Set a hard cap for RouteIQ so it leaves room for everything else — once it&apos;s hit, RouteIQ stops calling the API
+          Set a hard cap for routiq so it leaves room for everything else — once it&apos;s hit, routiq stops calling the API
           until midnight Central.
         </CardDescription>
       </CardHeader>
@@ -949,7 +949,7 @@ function ApiUsageCard({
         <div className="space-y-2 pt-1 border-t border-border/30">
           <Label className="text-sm pt-3 block">Daily API cap (reads + writes)</Label>
           <p className="text-xs text-muted-foreground/50">
-            Maximum FieldRoutes calls RouteIQ may make per day. Must be 3,000 or less.
+            Maximum FieldRoutes calls routiq may make per day. Must be 3,000 or less.
             {usingDefaultCap && ` Defaults to ${DEFAULT_API_DAILY_CAP.toLocaleString()} when unset.`}
           </p>
           <div className="flex gap-2">

@@ -2654,7 +2654,7 @@ export default function RoutesPage() {
           : item
       ));
       await loadJobsForRange(userProfile.companyId);
-      toast.success(`Deleted FieldRoutes route ${result.fieldRoutesRouteId} and unscheduled this RouteIQ route`);
+      toast.success(`Deleted FieldRoutes route ${result.fieldRoutesRouteId} and unscheduled this routiq route`);
     } catch (error) {
       console.error("Delete FieldRoutes route error:", error);
       toast.error(error instanceof Error ? error.message : "Failed to delete FieldRoutes route");
@@ -2703,7 +2703,7 @@ export default function RoutesPage() {
       });
       const result = await res.json().catch(() => ({}));
       if (!res.ok || !result.success) {
-        throw new Error(result.error || "Failed to unschedule RouteIQ route");
+        throw new Error(result.error || "Failed to unschedule routiq route");
       }
       setAllRoutes(prev => prev.map(item =>
         item.route.id === tr.route.id
@@ -2721,10 +2721,10 @@ export default function RoutesPage() {
           : item
       ));
       await loadJobsForRange(userProfile.companyId);
-      toast.success(`Unscheduled ${result.stopCount || tr.route.stopSequence.length} stop(s) in RouteIQ. FieldRoutes was not changed.`);
+      toast.success(`Unscheduled ${result.stopCount || tr.route.stopSequence.length} stop(s) in routiq. FieldRoutes was not changed.`);
     } catch (error) {
-      console.error("Unschedule RouteIQ route error:", error);
-      toast.error(error instanceof Error ? error.message : "Failed to unschedule RouteIQ route");
+      console.error("Unschedule routiq route error:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to unschedule routiq route");
     } finally {
       setApproving(null);
     }
@@ -2766,7 +2766,7 @@ export default function RoutesPage() {
           : item
       ));
       await loadJobsForRange(userProfile.companyId);
-      toast.success(`Undid ${result.undone?.length || 0} FieldRoutes appointment(s) and unscheduled the RouteIQ route`);
+      toast.success(`Undid ${result.undone?.length || 0} FieldRoutes appointment(s) and unscheduled the routiq route`);
     } catch (error) {
       console.error("Undo FieldRoutes stops error:", error);
       toast.error(error instanceof Error ? error.message : "Failed to undo FieldRoutes stops");
@@ -2940,14 +2940,14 @@ export default function RoutesPage() {
     if (!w) return;
     w.document.write(`<html><head><title>Route - ${tr.tech.name} - ${tr.route.date}</title>
       <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a1a;padding:32px;max-width:800px;margin:0 auto}.header{border-bottom:2px solid #2563eb;padding-bottom:16px;margin-bottom:24px}.header h1{font-size:24px;font-weight:700;color:#2563eb}.meta{display:flex;gap:24px;margin-top:8px;color:#6b7280;font-size:14px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}.stat{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px}.stat .label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}.stat .value{font-size:20px;font-weight:700;margin-top:2px}.stop{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #e5e7eb}.stop:last-child{border-bottom:none}.stop-num{width:28px;height:28px;border-radius:50%;background:#2563eb;color:white;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}.stop-details{flex:1}.stop-name{font-weight:600;font-size:14px}.stop-address{color:#6b7280;font-size:13px;margin-top:2px}.stop-meta{color:#9ca3af;font-size:12px;margin-top:4px}.footer{margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px;text-align:center}</style></head><body>
-      <div class="header"><h1>RouteIQ</h1><div class="meta"><span><strong>Technician:</strong> ${tr.tech.name}</span><span><strong>Date:</strong> ${tr.route.date}</span><span><strong>Status:</strong> ${tr.route.approved ? "Approved" : "Pending"}</span></div></div>
+      <div class="header"><h1>routiq</h1><div class="meta"><span><strong>Technician:</strong> ${tr.tech.name}</span><span><strong>Date:</strong> ${tr.route.date}</span><span><strong>Status:</strong> ${tr.route.approved ? "Approved" : "Pending"}</span></div></div>
       <div class="stats"><div class="stat"><div class="label">Total Stops</div><div class="value">${stats.stops}</div></div><div class="stat"><div class="label">Drive Time</div><div class="value">${formatTime(stats.driveMinutes)}</div></div><div class="stat"><div class="label">Working Day</div><div class="value">${formatTime(stats.workMinutes)}</div></div><div class="stat"><div class="label">Route Value</div><div class="value">${formatCurrency(stats.productionValue)}</div></div></div>
       <h2 style="font-size:16px;font-weight:600;margin-bottom:8px">Stop Sequence</h2>
       ${jobs.map((job, i) => {
         const stopProduction = calculateStopProductionValue(job);
         return `<div class="stop"><div class="stop-num">${i + 1}</div><div class="stop-details"><div class="stop-name">${job.customerName}</div><div class="stop-address">${job.address}</div><div class="stop-meta">${job.serviceType || ""} ${job.duration ? `· ${job.duration} min` : ""} · ${formatCurrency(stopProduction.value)} stop value</div></div></div>`;
       }).join("")}
-      <div class="footer">Generated by RouteIQ · ${new Date().toLocaleDateString()}</div></body></html>`);
+      <div class="footer">Generated by routiq · ${new Date().toLocaleDateString()}</div></body></html>`);
     w.document.close();
     w.print();
   };
@@ -3375,7 +3375,7 @@ export default function RoutesPage() {
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleUndoFieldRoutesStops(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Undo FR Stops</Button>
                   )}
                   {tr.route.approved && !routeReadOnly && (
-                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule routiq</Button>
                   )}
                 </div>
               </div>
@@ -3515,7 +3515,7 @@ export default function RoutesPage() {
                     <Button size="sm" variant="outline" className="h-6 text-[10px] text-red-400 border-red-500/20 hover:bg-red-500/10" onClick={() => handleUndoFieldRoutesStops(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Undo FR Stops</Button>
                   )}
                   {tr.route.approved && !routeReadOnly && (
-                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule RouteIQ</Button>
+                    <Button size="sm" variant="outline" className="h-6 text-[10px] text-amber-300 border-amber-500/20 hover:bg-amber-500/10" onClick={() => handleUnscheduleRouteIqRoute(tr)} disabled={approving === tr.route.id}><XCircle className="w-3 h-3" /> Unschedule routiq</Button>
                   )}
                 </div>
               </div>

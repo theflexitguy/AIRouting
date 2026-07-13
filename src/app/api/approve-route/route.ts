@@ -1065,7 +1065,7 @@ async function resolveFieldRoutesRoute(
       const verified = await findVerifiedRouteById(client, existingRouteId, assignedTech, routeDate);
       if (!verified || verified.assignedTech !== assignedTech || verified.routeDate !== routeDate) {
         throw new ApproveRouteError(
-          `FieldRoutes reported existing route ${existingRouteId}, but RouteIQ could not verify it belongs to employee ${assignedTech} on ${routeDate}.`,
+          `FieldRoutes reported existing route ${existingRouteId}, but routiq could not verify it belongs to employee ${assignedTech} on ${routeDate}.`,
           409,
           { routeId: existingRouteId, expectedAssignedTech: assignedTech, expectedDate: routeDate, found: verified },
         );
@@ -1270,7 +1270,7 @@ async function verifyUploadedAppointments({
 
   if (errors.length) {
     throw new ApproveRouteError(
-      "FieldRoutes upload verification failed. RouteIQ did not mark this route approved because FieldRoutes did not show the stops on the expected technician/date/route.",
+      "FieldRoutes upload verification failed. routiq did not mark this route approved because FieldRoutes did not show the stops on the expected technician/date/route.",
       409,
       { routeId, expectedAssignedTech: assignedTech, expectedDate: routeDate, errors },
     );
