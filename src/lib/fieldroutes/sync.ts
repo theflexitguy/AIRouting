@@ -116,6 +116,30 @@ interface ApptInfo {
   routeGroup: string; // FieldRoutes route.groupTitle (e.g. "GPC", "Specialty")
 }
 
+// How many trailing days of PAST routes each sync re-reconciles against actual
+// FieldRoutes appointments. Route docs used to freeze at whatever the schedule
+// looked like when the day was last synced — stops that were later cancelled,
+// rescheduled, or moved kept counting (e.g. dashboard showed 9 routes/113 stops
+// for a day FieldRoutes shows as 7 non-empty routes/84 stops).
+const ROUTE_HISTORY_DAYS = 14;
+
+/** ISO date shifted by `days` (negative = past). */
+function dateOffsetISO(iso: string, days: number): string {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// One PAST appointment (non-cancelled, non-rescheduled) — the ground truth used
+// to rewrite historical route docs so past days match FieldRoutes.
+interface PastAppt {
+  subId: string;
+  date: string;
+  techEmpId: string;
+  routeGroup: string;
+  duration: number;
+}
+
 function rec(value: unknown): Record<string, unknown> {
   return (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
 }
@@ -550,6 +574,7 @@ async function reconcileScheduledRoutes(
   today: string,
   now: string,
   empInfo: Record<string, EmpRoutingInfo> = {},
+  pastAppts: PastAppt[] = [],
 ): Promise<{ routesWritten: number; routesDeleted: number; techsLinked: number }> {
   interface SJob {
     id: string;
@@ -789,6 +814,139 @@ async function reconcileScheduledRoutes(
     ops++;
     if (ops >= 450) await commit();
   }
+
+  // ── Historical window: rewrite PAST route docs from actual appointments. ────
+  // A past day's docs used to freeze at whatever the schedule looked like when
+  // that day was last synced — stops later cancelled/rescheduled kept counting
+  // and emptied routes lingered, so the dashboard's history disagreed with
+  // FieldRoutes. pastAppts is the non-cancelled appointment truth for the
+  // trailing ROUTE_HISTORY_DAYS; rebuild each (date, tech) slot from it and
+  // remove window docs FieldRoutes no longer backs. Unchanged slots are left
+  // untouched so previously computed Google drive times/polylines survive.
+  if (pastAppts.length > 0) {
+    const historyStart = pastAppts.reduce((min, p) => (p.date < min ? p.date : min), today);
+
+    const pastSnap = await db
+      .collection(`companies/${companyId}/routes`)
+      .where("date", ">=", historyStart)
+      .where("date", "<", today)
+      .get();
+    const pastBySlot = new Map<string, { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData }>();
+    pastSnap.docs.forEach((rd) => {
+      const r = rd.data();
+      pastBySlot.set(`${str(r.date)}::${str(r.techId)}`, { ref: rd.ref, data: r });
+    });
+
+    // Group by (date :: technician doc id); appointments on unassigned routes
+    // (no tech) can't be attributed to a route card and are skipped.
+    const pastGroups = new Map<string, { date: string; techId: string; techName: string; appts: PastAppt[] }>();
+    for (const p of pastAppts) {
+      const techId =
+        empToTech.get(p.techEmpId) || nameToTech.get(normName(empNames[p.techEmpId] || "")) || "";
+      if (!techId) continue;
+      const key = `${p.date}::${techId}`;
+      if (!pastGroups.has(key)) {
+        pastGroups.set(key, { date: p.date, techId, techName: empNames[p.techEmpId] || p.techEmpId, appts: [] });
+      }
+      pastGroups.get(key)!.appts.push(p);
+    }
+
+    // Job docs (best effort) for stop value/coords/customer name. Purged docs
+    // (e.g. completed one-times) still count as stops, just without value/coords.
+    const subIds = Array.from(new Set(pastAppts.map((p) => p.subId)));
+    const jobBySub = new Map<string, FirebaseFirestore.DocumentData>();
+    for (let i = 0; i < subIds.length; i += 300) {
+      const refs = subIds.slice(i, i + 300).map((id) => db.doc(`companies/${companyId}/jobs/sub_${id}`));
+      const snaps = await db.getAll(...refs);
+      snaps.forEach((s) => {
+        if (s.exists) jobBySub.set(s.id.replace(/^sub_/, ""), s.data() as FirebaseFirestore.DocumentData);
+      });
+    }
+
+    const sameStopSet = (a: string[], b: string[]) =>
+      a.length === b.length && new Set(a).size === a.length && b.every((id) => a.includes(id));
+
+    const handledPast = new Set<string>();
+    for (const [key, group] of pastGroups) {
+      handledPast.add(key);
+      // Dedupe subs (a sub with two same-day appointments is still one stop doc)
+      // and order stably by customer name for a readable stop list.
+      const seen = new Set<string>();
+      const stops = group.appts
+        .filter((p) => (seen.has(p.subId) ? false : (seen.add(p.subId), true)))
+        .map((p) => {
+          const j = jobBySub.get(p.subId);
+          return {
+            id: `sub_${p.subId}`,
+            duration: Number(j?.duration) || p.duration || 25,
+            lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
+            lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
+            customerName: str(j?.customerName) || p.subId,
+            value: j
+              ? calculateStopProductionValue({
+                  recurringPrice: j.recurringPrice,
+                  billingPrice: j.billingPrice,
+                  recurringFrequency: j.recurringFrequency,
+                  billingFrequency: j.billingFrequency,
+                  revenue: j.revenue,
+                  productionValue: j.productionValue,
+                }).value || 0
+              : 0,
+            routeGroup: p.routeGroup,
+          };
+        })
+        .sort((a, b) => a.customerName.localeCompare(b.customerName));
+      const stopIds = stops.map((s) => s.id);
+
+      const existing = pastBySlot.get(key);
+      const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
+        ? (existing!.data.stopSequence as unknown[]).map(String)
+        : [];
+      if (existing && sameStopSet(prevSeq, stopIds)) continue; // already truthful — keep drive/polyline
+
+      const metrics = haversineRouteMetrics(stops);
+      const routeGroupTitle = stops.find((s) => s.routeGroup)?.routeGroup || "";
+      const routeValue = stops.reduce((sum, s) => sum + (Number(s.value) || 0), 0);
+      const ref = existing?.ref || db.doc(`companies/${companyId}/routes/${group.date}-${group.techId}`);
+      batch.set(
+        ref,
+        {
+          companyId,
+          date: group.date,
+          techId: group.techId,
+          techName: group.techName,
+          stopSequence: stopIds,
+          totalStops: stopIds.length,
+          fieldRoutesStopIds: stopIds,
+          hasFieldRoutesStops: true,
+          routeGroupTitle,
+          routeValue,
+          ...metrics,
+          approved: true,
+          locked: true,
+          source: "fieldroutes",
+          generatedBy: "fieldroutes",
+          updatedAt: now,
+          ...(existing ? {} : { createdAt: now }),
+        },
+        { merge: true },
+      );
+      routesWritten++;
+      ops++;
+      if (ops >= 450) await commit();
+    }
+
+    // Window docs with no backing appointments: the day per FieldRoutes has
+    // nothing for that tech (route emptied/deleted, or a stale local proposal
+    // for a day that already happened) — remove them.
+    for (const [key, existing] of pastBySlot) {
+      if (handledPast.has(key)) continue;
+      batch.delete(existing.ref);
+      routesDeleted++;
+      ops++;
+      if (ops >= 450) await commit();
+    }
+  }
   await commit();
 
   return { routesWritten, routesDeleted, techsLinked: empToTech.size };
@@ -897,6 +1055,7 @@ async function buildRunSetup(
 ): Promise<{
   ids: string[];
   apptMap: Record<string, ApptInfo>;
+  pastAppts: PastAppt[];
   empNames: Record<string, string>;
   technicianEmpIds: string[];
   employeeRoster: Array<RosterEmployee>;
@@ -977,9 +1136,13 @@ async function buildRunSetup(
   // tech starts or completes a stop in FieldRoutes, the appointment status
   // changes (1 = In Progress, 2 = Completed, etc.), but the route should still
   // appear on the dashboard and the subscription should still be marked as
-  // scheduled so routing doesn't double-book it.
+  // scheduled so routing doesn't double-book it. The window also reaches
+  // ROUTE_HISTORY_DAYS back so recent PAST route docs can be re-reconciled
+  // against what actually stayed on the schedule (cancellations/reschedules
+  // after the day was synced used to keep counting forever).
+  const historyStart = dateOffsetISO(today, -ROUTE_HISTORY_DAYS);
   const allApptIds = await client.searchIds("appointment", {
-    date: { operator: ">=", value: today },
+    date: { operator: ">=", value: historyStart },
   });
   const allAppts = allApptIds.length
     ? await client.getEntities("appointment", allApptIds)
@@ -1016,6 +1179,7 @@ async function buildRunSetup(
   }
 
   const apptMap: Record<string, ApptInfo> = {};
+  const pastAppts: PastAppt[] = [];
   for (const a of allAppts) {
     const ar = rec(a);
     const subId = str(ar.subscriptionID);
@@ -1028,10 +1192,25 @@ async function buildRunSetup(
     const apptStatus = num(ar.status);
     if (apptStatus === -1 || apptStatus === -2) continue;
     const date = toDateOnly(ar.date);
-    if (!date || date < today) continue;
-    const existing = apptMap[subId];
+    if (!date) continue;
     const routeId = str(ar.routeID);
     const techEmpId = routeTechMap.get(routeId) || "";
+    if (date < today) {
+      // Past window: ground truth for re-reconciling historical route docs.
+      // NOT added to apptMap — job docs' alreadyScheduled/scheduledFor must
+      // keep meaning "has a FUTURE appointment".
+      if (date >= historyStart) {
+        pastAppts.push({
+          subId,
+          date,
+          techEmpId,
+          routeGroup: routeGroupMap.get(routeId) || "",
+          duration: num(ar.duration) || 25,
+        });
+      }
+      continue;
+    }
+    const existing = apptMap[subId];
     if (!existing || date < existing.date) {
       apptMap[subId] = {
         date,
@@ -1067,6 +1246,7 @@ async function buildRunSetup(
   return {
     ids,
     apptMap,
+    pastAppts,
     empNames,
     technicianEmpIds: [...technicianEmpIds],
     employeeRoster,
@@ -1167,6 +1347,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
 
   let ids: string[];
   let apptMap: Record<string, ApptInfo>;
+  let pastAppts: PastAppt[];
   let empNames: Record<string, string>;
   let technicianEmpIds: string[];
   let requiredSkillsByServiceType: Record<string, string[]>;
@@ -1185,6 +1366,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   if (resuming && prior && priorHeavy) {
     ids = (priorHeavy.ids as unknown[]).map(String);
     apptMap = rec(priorHeavy.apptMap) as Record<string, ApptInfo>;
+    pastAppts = Array.isArray(priorHeavy.pastAppts) ? (priorHeavy.pastAppts as PastAppt[]) : [];
     empNames = rec(priorHeavy.empNames) as Record<string, string>;
     technicianEmpIds = Array.isArray(priorHeavy.technicianEmpIds)
       ? (priorHeavy.technicianEmpIds as unknown[]).map(String)
@@ -1204,6 +1386,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const setup = await buildRunSetup(client, mode, priorCursor, today);
       ids = setup.ids;
       apptMap = setup.apptMap;
+      pastAppts = setup.pastAppts;
       empNames = setup.empNames;
       technicianEmpIds = setup.technicianEmpIds;
       requiredSkillsByServiceType = setup.requiredSkillsByServiceType;
@@ -1658,7 +1841,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         };
       }
     }
-    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now, empInfo);
+    const reconciled = await reconcileScheduledRoutes(db, companyId, empNames, new Set(technicianEmpIds), today, now, empInfo, pastAppts);
     console.log(
       `[fieldroutes/sync] reconciled routes: ${reconciled.routesWritten} written, ` +
         `${reconciled.routesDeleted} removed, ${reconciled.techsLinked} techs linked`,
@@ -1706,6 +1889,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       blob: JSON.stringify({
         ids,
         apptMap,
+        pastAppts,
         empNames,
         technicianEmpIds,
         requiredSkillsByServiceType,
