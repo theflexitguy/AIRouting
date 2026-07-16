@@ -66,6 +66,11 @@ function isPerServiceBilling(value: unknown) {
 export function parseFrequencyDays(value: unknown): number | null {
   const text = toText(value).toLowerCase();
   if (!text || text.includes("custom")) return null;
+  // Negative placeholder frequencies are NOT day intervals: rounds-based
+  // service plans (e.g. Lawn, 7 rounds/year) carry sub.frequency values like
+  // -4, labeled "Every -4 Days". Without this guard the bare-number fallback
+  // reads that as "4 days" and collapses the value multiplier to ~0.13×.
+  if (/-\s*\d/.test(text)) return null;
 
   const everyMatch = text.match(/every\s+(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months|year|years)/);
   const bareMatch = text.match(/(\d+(?:\.\d+)?)\s*(day|days|week|weeks|month|months|year|years)/);
@@ -109,10 +114,18 @@ function formatMonths(months: number | null) {
 }
 
 export function calculateStopProductionValue(input: ProductionValueInput): StopProductionValue {
-  const price =
-    parseMoney(input.recurringPrice) ??
-    parseMoney(input.billingPrice) ??
-    parseMoney(input.revenue);
+  // Price source follows the billing model (owner's rule): billed after each
+  // service → the RECURRING price is the per-service amount; billed on a cycle
+  // → the BILLING price is the per-cycle amount that gets multiplied by the
+  // billings accrued per service interval. API-synced docs only carry
+  // recurringPrice (FieldRoutes recurringCharge = the amount per billing
+  // cycle), so the fallback chain keeps them working either way.
+  const recurringPrice = parseMoney(input.recurringPrice);
+  const billingPrice = parseMoney(input.billingPrice);
+  const revenue = parseMoney(input.revenue);
+  const price = isPerServiceBilling(input.billingFrequency)
+    ? recurringPrice ?? billingPrice ?? revenue
+    : billingPrice ?? recurringPrice ?? revenue;
   const csvValue = parseMoney(input.productionValue);
   const serviceCycleMonths = parseFrequencyMonths(input.recurringFrequency);
   const billingCycleMonths = isPerServiceBilling(input.billingFrequency)
