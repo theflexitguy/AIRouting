@@ -1331,6 +1331,9 @@ export default function DashboardPage() {
                             <p className="text-[13px] text-muted-foreground font-medium">{isTotal ? "Total (All)" : lt.label}</p>
                             <p className="text-3xl font-bold text-foreground tracking-tight">{lt.target.toLocaleString()}</p>
                             <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {booked.toLocaleString()} booked · {lt.pace.remaining.toLocaleString()} left</p>
+                            {lt.line === "lawn" && (
+                              <p className="text-[11px] text-muted-foreground/50">round visits in this month&apos;s cycle window (each round is its own sub)</p>
+                            )}
                           </div>
                           <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
                         </div>
