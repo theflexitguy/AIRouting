@@ -3,7 +3,14 @@
 // are AUTO-COMPUTED from data we already pull — there is no manual weekly logging.
 
 import { parseFrequencyDays } from "@/lib/production-value";
-import { serviceLineMeta, lawnRoundNumberForWindow, type ServiceLine } from "@/lib/routing/service-line";
+import {
+  serviceLineMeta,
+  lawnRoundNumberForWindow,
+  lawnRoundNumberFromServiceType,
+  lawnRoundsForMonth,
+  lawnRoundWindowByNumber,
+  type ServiceLine,
+} from "@/lib/routing/service-line";
 
 /** Minimal shape of a route doc this module needs. */
 export interface RouteLike {
@@ -20,6 +27,7 @@ export interface JobLike {
   subscriptionLastCompletedDate?: string; // last completed date (YYYY-MM-DD)
   customerId?: string;
   subscriptionId?: string; // fallback dedupe key when customerId is absent
+  serviceType?: string; // e.g. "Round 4 - Fertilizer" — the authoritative round label for lawn
   inScope?: boolean;
   pendingCancel?: boolean;
   frequency?: number; // raw service interval in days
@@ -361,62 +369,65 @@ function lawnMonthTargetDone(
   today: string,
 ): { target: number; done: number; rounds: LawnRoundBreakdown[] } {
   const planKey = (j: JobLike) => String(j.customerId || j.subscriptionId || "");
-  // Is this round sub a CURRENT round for this month? A stamped window must
-  // cover the month; a window-less sub can't be gated so it passes here and is
-  // constrained by the date rules in each pass instead. A STRADDLE month (a
-  // round ends mid-month and the next begins — e.g. April: R2 Mar–Apr and
-  // R3 Apr–May, or September: R5 and R6) legitimately has two active rounds;
-  // both pass and are reported separately.
-  const isCurrentRound = (j: JobLike) => {
-    const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
-    return !hasWindow || activeInMonth(j, month);
-  };
-  // Group by round so a straddle month shows each round on its own. Dedupe by
-  // plan WITHIN a round (a plan counts once per round), but a plan genuinely
-  // getting two visits this month — its ending round + its starting round —
-  // shows in both, which is real work.
-  const roundKeyOf = (j: JobLike): string => {
-    const n = lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
-    return n !== null ? `R${n}` : "R?";
-  };
-  const groups = new Map<string, { round: number | null; done: Set<string>; due: Set<string> }>();
-  const groupFor = (j: JobLike) => {
-    const k = roundKeyOf(j);
-    if (!groups.has(k)) {
-      const n = lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
-      groups.set(k, { round: n, done: new Set(), due: new Set() });
-    }
-    return groups.get(k)!;
+  const year = monthStart.slice(0, 4);
+  // Rounds the CALENDAR says are active this month — the ONLY rounds counted.
+  // July → [4]; a straddle month like April → [2,3] (R2 Mar–Apr ending +
+  // R3 Apr–May beginning), September → [5,6]. A sub that doesn't resolve to one
+  // of these is excluded (it belongs to another round), so drifted next-service
+  // dates and window-less/unstamped subs can't invent a phantom "Lawn" bucket.
+  const activeRounds = new Set(lawnRoundsForMonth(month));
+
+  // Resolve a sub's round: the "Round N" in its service type is authoritative
+  // and survives even when the seasonal window hasn't been (re)stamped yet;
+  // fall back to the stamped window. null = unattributable → not counted.
+  const roundOf = (j: JobLike): number | null =>
+    lawnRoundNumberFromServiceType(j.serviceType) ??
+    lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
+
+  // Earliest ISO date a round's visit can legitimately be due this cycle — the
+  // first of its window's start month, this year — so a stale prior-cycle due
+  // date can't count as overdue spillover.
+  const roundFloor = (round: number): string => {
+    const w = lawnRoundWindowByNumber(round);
+    const startMonth = w ? w.startMonth : month;
+    return `${year}-${String(startMonth).padStart(2, "0")}-01`;
   };
 
-  // Pass 1: plans whose current-round visit completed this month.
+  const groups = new Map<number, { done: Set<string>; due: Set<string> }>();
+  const groupFor = (round: number) => {
+    if (!groups.has(round)) groups.set(round, { done: new Set(), due: new Set() });
+    return groups.get(round)!;
+  };
+
+  // Pass 1: plans whose active-round visit completed this month.
   for (const j of lawnJobs) {
     if (j.inScope === false || j.pendingCancel === true) continue;
-    if (!isCurrentRound(j)) continue;
+    const round = roundOf(j);
+    if (round === null || !activeRounds.has(round)) continue;
     const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) groupFor(j).done.add(planKey(j));
+    if (lc && lc >= monthStart && lc <= today) groupFor(round).done.add(planKey(j));
   }
-  // Pass 2: plans (not already done for that round) whose current-round visit is still due this month.
+  // Pass 2: plans (not already done for that round) whose visit is still due this month.
   for (const j of lawnJobs) {
     if (j.inScope === false || j.pendingCancel === true) continue;
-    if (!isCurrentRound(j)) continue;
-    const g = groupFor(j);
+    const round = roundOf(j);
+    if (round === null || !activeRounds.has(round)) continue;
+    const g = groupFor(round);
     const key = planKey(j);
     if (g.done.has(key)) continue; // this plan already counted done for this round
     const lc = j.subscriptionLastCompletedDate;
     if (lc && lc >= monthStart && lc <= today) continue;
-    const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
     const sd = j.scheduledDate;
     if (!sd || sd > monthEnd) continue; // due by end of this month
-    if (!hasWindow && sd < monthStart) continue; // strict in-month for window-less rounds
+    if (sd < roundFloor(round)) continue; // ignore stale prior-cycle due dates
     if (lc && lc >= sd) continue; // this cycle already serviced (completed a prior month)
     g.due.add(key);
   }
 
-  const rounds: LawnRoundBreakdown[] = Array.from(groups.values())
-    .map((g) => ({
-      label: g.round !== null ? `Round ${g.round}` : "Lawn",
-      round: g.round,
+  const rounds: LawnRoundBreakdown[] = Array.from(groups.entries())
+    .map(([round, g]) => ({
+      label: `Round ${round}`,
+      round,
       done: g.done.size,
       target: g.done.size + g.due.size,
     }))
