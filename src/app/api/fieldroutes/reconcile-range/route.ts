@@ -25,9 +25,13 @@ export async function POST(request: Request) {
     const body = (await request.json().catch(() => ({}))) as {
       startDate?: string;
       endDate?: string;
+      force?: boolean;
     };
     const startDate = String(body.startDate || "");
     const endDate = String(body.endDate || "");
+    // Escape hatch: re-verify FINALIZED days too (late FieldRoutes edits) and
+    // bypass the TTL cache. Never set by the dashboard's automatic call.
+    const force = body.force === true;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate) || startDate > endDate) {
       return NextResponse.json({ error: "startDate and endDate (YYYY-MM-DD, start <= end) are required" }, { status: 400 });
     }
@@ -38,7 +42,7 @@ export async function POST(request: Request) {
     const companyId = companiesSnap.docs[0]?.id || "";
     const key = `${REBUILD_VERSION}_${startDate}_${endDate}`;
     const ttlRef = companyId ? db.doc(`companies/${companyId}/fieldRoutesState/rangeReconcile`) : null;
-    if (ttlRef) {
+    if (ttlRef && !force) {
       const ttlSnap = await ttlRef.get();
       const d = ttlSnap.exists ? ttlSnap.data() : undefined;
       const at = Date.parse(String(d?.at || "")) || 0;
@@ -47,7 +51,7 @@ export async function POST(request: Request) {
       }
     }
 
-    const result = await reconcileRouteRange(startDate, endDate);
+    const result = await reconcileRouteRange(startDate, endDate, { force });
 
     if (ttlRef && !result.skipped) {
       await ttlRef.set({ key, at: new Date().toISOString(), result }, { merge: true });
