@@ -16,6 +16,9 @@ import { reconcileRouteRange } from "@/lib/fieldroutes/sync";
 //   POST { startDate: "YYYY-MM-DD", endDate: "YYYY-MM-DD" }
 
 const TTL_MINUTES = 10;
+// Bump when the rebuild logic changes so a re-pick after a deploy re-verifies
+// instead of returning a result computed by the old logic.
+const REBUILD_VERSION = "v2";
 
 export async function POST(request: Request) {
   try {
@@ -33,7 +36,7 @@ export async function POST(request: Request) {
     const db = adminDb();
     const companiesSnap = await db.collection("companies").limit(2).get();
     const companyId = companiesSnap.docs[0]?.id || "";
-    const key = `${startDate}_${endDate}`;
+    const key = `${REBUILD_VERSION}_${startDate}_${endDate}`;
     const ttlRef = companyId ? db.doc(`companies/${companyId}/fieldRoutesState/rangeReconcile`) : null;
     if (ttlRef) {
       const ttlSnap = await ttlRef.get();

@@ -930,33 +930,47 @@ async function rebuildPastRouteWindow({
   const handledPast = new Set<string>();
   for (const [key, group] of pastGroups) {
     handledPast.add(key);
-    // Stop identity: the subscription's job doc when there is one, else the
-    // appointment itself (standalone reservices/one-offs count as stops in
-    // FieldRoutes too). Dedupe (a sub with two same-day appointments is one
-    // stop doc — completed if ANY of its appointments completed) and order
-    // stably by customer name for a readable stop list.
-    const stopIdOf = (p: PastAppt) => (p.subId ? `sub_${p.subId}` : `appt_${p.apptId}`);
-    const completedByStop = new Map<string, boolean>();
+    // EVERY appointment is a stop — FieldRoutes counts appointments, and a
+    // customer visited twice in one day (service + same-day reservice on the
+    // SAME subscription) is two stops on the route sheet. The first appointment
+    // of a subscription links to its job doc (sub_<id>, carrying value/coords);
+    // any further same-day appointment of that sub — and any standalone
+    // appointment with no subscription — is keyed by the appointment itself
+    // (appt_<id>), reusing the job doc's name/coords when the sub is known.
+    const seenSubs = new Set<string>();
+    const seenIds = new Set<string>();
+    const stops: Array<{
+      id: string;
+      duration: number;
+      lat?: number;
+      lng?: number;
+      customerName: string;
+      value: number;
+      routeGroup: string;
+      completed: boolean;
+    }> = [];
     for (const p of group.appts) {
-      const sid = stopIdOf(p);
-      if (p.status === 1) completedByStop.set(sid, true);
-      else if (!completedByStop.has(sid)) completedByStop.set(sid, false);
-    }
-    const seen = new Set<string>();
-    const stops = group.appts
-      .filter((p) => {
-        const sid = stopIdOf(p);
-        return seen.has(sid) ? false : (seen.add(sid), true);
-      })
-      .map((p) => {
-        const j = p.subId ? jobBySub.get(p.subId) : undefined;
-        return {
-          id: stopIdOf(p),
-          duration: Number(j?.duration) || p.duration || 25,
-          lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
-          lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
-          customerName: str(j?.customerName) || p.subId || p.apptId,
-          value: j
+      let id = "";
+      if (p.subId && !seenSubs.has(p.subId)) {
+        seenSubs.add(p.subId);
+        id = `sub_${p.subId}`;
+      } else if (p.apptId) {
+        id = `appt_${p.apptId}`;
+      }
+      if (!id || seenIds.has(id)) continue; // unkeyable or exact duplicate record
+      seenIds.add(id);
+      const j = p.subId ? jobBySub.get(p.subId) : undefined;
+      const firstOfSub = id.startsWith("sub_");
+      stops.push({
+        id,
+        duration: Number(j?.duration) || p.duration || 25,
+        lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
+        lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
+        customerName: str(j?.customerName) || p.subId || p.apptId,
+        // Only the sub-linked stop carries the production value so a twice-
+        // visited customer isn't double-counted in route value.
+        value:
+          firstOfSub && j
             ? calculateStopProductionValue({
                 recurringPrice: j.recurringPrice,
                 billingPrice: j.billingPrice,
@@ -966,12 +980,13 @@ async function rebuildPastRouteWindow({
                 productionValue: j.productionValue,
               }).value || 0
             : 0,
-          routeGroup: p.routeGroup,
-        };
-      })
-      .sort((a, b) => a.customerName.localeCompare(b.customerName));
+        routeGroup: p.routeGroup,
+        completed: p.status === 1,
+      });
+    }
+    stops.sort((a, b) => a.customerName.localeCompare(b.customerName));
     const stopIds = stops.map((s) => s.id);
-    const completedStops = stopIds.filter((id) => completedByStop.get(id)).length;
+    const completedStops = stops.filter((s) => s.completed).length;
 
     const existing = pastBySlot.get(key);
     const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
