@@ -143,6 +143,20 @@ export function lawnRoundsForMonth(month: number): number[] {
   return out.sort((a, b) => a - b);
 }
 
+/** Round number parsed from a "Round N - ..." service type, or null. */
+export function lawnRoundNumberFromServiceType(serviceType: unknown): number | null {
+  const m = /round\s*(\d)/i.exec(String(serviceType ?? ""));
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 1 && n <= 7 ? n : null;
+}
+
+/** Calendar window (start/end month) for a round number, or null. */
+export function lawnRoundWindowByNumber(round: unknown): { startMonth: number; endMonth: number } | null {
+  const n = Number(round);
+  return LAWN_ROUND_SEASONS[n] || null;
+}
+
 /**
  * Best-match round NUMBER for a stamped seasonal window, or null. Round subs
  * carry real per-cycle windows (servicePlanRound) that may not equal the

@@ -16,7 +16,12 @@ import { DatePicker } from "@/components/ui/date-picker";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { formatTime } from "@/lib/utils";
 import { formatCurrency, calculateStopProductionValue } from "@/lib/production-value";
-import { deriveServiceLine } from "@/lib/routing/service-line";
+import {
+  deriveServiceLine,
+  lawnRoundsForMonth,
+  lawnRoundNumberFromServiceType,
+  lawnRoundNumberForWindow,
+} from "@/lib/routing/service-line";
 import type { MonthlyDone } from "@/lib/fieldroutes/monthly-done";
 import {
   stopsPerRoute,
@@ -706,13 +711,16 @@ export default function DashboardPage() {
       // several round subs, so counting sub records — or other rounds — would
       // over-report like the monthly card did (113 vs 82 plans). Other lines
       // already count distinct customers.
+      // A lawn sub belongs to this month only if its round (from service type,
+      // else stamped window) is one the calendar marks active this month — the
+      // same rule the monthly card uses, so unattributable/other-round subs
+      // don't leak in.
+      const activeLawnRounds = new Set(lawnRoundsForMonth(bounds.monthIndex));
       const lawnCurrentRound = (j: JobRec) => {
-        const start = Number(j.seasonalStartMonth);
-        const end = Number(j.seasonalEndMonth);
-        if (!j.isSeasonal || !start || !end) return true; // window-less: date rules constrain it
-        return start <= end
-          ? bounds.monthIndex >= start && bounds.monthIndex <= end
-          : bounds.monthIndex >= start || bounds.monthIndex <= end;
+        const round =
+          lawnRoundNumberFromServiceType(j.serviceType) ??
+          lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
+        return round !== null && activeLawnRounds.has(round);
       };
       const doneIn = (start: string, end: string) =>
         lt.line === "lawn"
