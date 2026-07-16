@@ -114,6 +114,7 @@ interface ApptInfo {
   techName: string;
   routeId: string;
   routeGroup: string; // FieldRoutes route.groupTitle (e.g. "GPC", "Specialty")
+  routeTemplate: string; // FieldRoutes route.title — the route-template name ("Regular", "Rain Day", "Early Release", …)
 }
 
 // How many trailing days of PAST routes each sync re-reconciles against actual
@@ -141,6 +142,7 @@ interface PastAppt {
   date: string;
   techEmpId: string;
   routeGroup: string;
+  routeTemplate: string;
   duration: number;
   status: number;
 }
@@ -446,6 +448,7 @@ async function refreshScheduledAssignments(
       const techName = str(appt.techName);
       const routeId = str(appt.routeId);
       const routeGroup = str(appt.routeGroup);
+      const routeTemplate = str(appt.routeTemplate);
       const date = str(appt.date) || str(d.scheduledDate);
       // Never override a stop FieldRoutes already marked complete for this cycle.
       const completed = str(d.status) === "completed" || Boolean(d.serviceDueAlreadyCompleted);
@@ -460,6 +463,7 @@ async function refreshScheduledAssignments(
         str(d.assignedTechId) === techName &&
         str(d.fieldRoutesRouteId) === routeId &&
         str(d.fieldRoutesRouteGroup) === routeGroup &&
+        str(d.fieldRoutesRouteTemplate) === routeTemplate &&
         str(d.status) === desiredStatus;
       if (same) continue;
 
@@ -472,6 +476,7 @@ async function refreshScheduledAssignments(
         assignedTechId: techName,
         fieldRoutesRouteId: routeId,
         fieldRoutesRouteGroup: routeGroup,
+        fieldRoutesRouteTemplate: routeTemplate,
         fieldRoutesScheduleSource: "api_appointment",
         scheduledFor: date,
         scheduledTech: techName,
@@ -536,6 +541,7 @@ async function refreshScheduledAssignments(
       fieldRoutesServicedById: "",
       fieldRoutesRouteId: "",
       fieldRoutesRouteGroup: "",
+      fieldRoutesRouteTemplate: "",
       fieldRoutesScheduleSource: "",
       assignedTechId: "",
       scheduledTech: "",
@@ -587,6 +593,7 @@ async function reconcileScheduledRoutes(
     techEmpId: string;
     techName: string;
     routeGroup: string;
+    routeTemplate: string;
     value: number;
     lat?: number;
     lng?: number;
@@ -612,6 +619,7 @@ async function reconcileScheduledRoutes(
       techEmpId,
       techName,
       routeGroup: str(d.fieldRoutesRouteGroup),
+      routeTemplate: str(d.fieldRoutesRouteTemplate),
       value: calculateStopProductionValue({
         recurringPrice: d.recurringPrice,
         billingPrice: d.billingPrice,
@@ -697,7 +705,16 @@ async function reconcileScheduledRoutes(
     // A (date,tech) slot's stops share one FieldRoutes route → one group. Take
     // the first non-empty group label so the dashboard can filter by route group.
     const routeGroupTitle = orderedJobs.find((j) => j.routeGroup)?.routeGroup || "";
+    const routeTemplateTitle = orderedJobs.find((j) => j.routeTemplate)?.routeTemplate || "";
     const routeValue = orderedJobs.reduce((sum, j) => sum + (Number(j.value) || 0), 0);
+    // Light per-stop detail persisted on the route doc so the dashboard's
+    // metric drill-downs can show who each stop is without loading job docs
+    // (which may be out of scope or purged).
+    const stopDetails = orderedJobs.map((j) => ({
+      id: j.id,
+      customerName: j.customerName,
+      value: Number(j.value) || 0,
+    }));
     const existing = existingBySlot.get(key);
 
     if (existing) {
@@ -723,7 +740,9 @@ async function reconcileScheduledRoutes(
           fieldRoutesStopIds: frStopIds,
           hasFieldRoutesStops: true,
           routeGroupTitle,
+          routeTemplateTitle,
           routeValue,
+          stops: stopDetails,
           ...metrics,
           // `metrics` covers only the FieldRoutes jobs. On a MIXED slot the doc
           // also keeps `preserved` generated stops (counted in totalStops), so add
@@ -761,7 +780,9 @@ async function reconcileScheduledRoutes(
         fieldRoutesStopIds: frStopIds,
         hasFieldRoutesStops: true,
         routeGroupTitle,
+        routeTemplateTitle,
         routeValue,
+        stops: stopDetails,
         ...metrics,
         confidence: 1,
         approved: true,
@@ -947,6 +968,7 @@ async function rebuildPastRouteWindow({
       customerName: string;
       value: number;
       routeGroup: string;
+      routeTemplate: string;
       completed: boolean;
     }> = [];
     for (const p of group.appts) {
@@ -981,12 +1003,23 @@ async function rebuildPastRouteWindow({
               }).value || 0
             : 0,
         routeGroup: p.routeGroup,
+        routeTemplate: str(p.routeTemplate),
         completed: p.status === 1,
       });
     }
     stops.sort((a, b) => a.customerName.localeCompare(b.customerName));
     const stopIds = stops.map((s) => s.id);
     const completedStops = stops.filter((s) => s.completed).length;
+    const routeTemplateTitle = stops.find((s) => s.routeTemplate)?.routeTemplate || "";
+    // Light per-stop detail (name + did-it-happen) persisted for the dashboard
+    // metric drill-downs — the per-stop completion truth lives ONLY here (job
+    // docs roll forward to the next due date once serviced).
+    const stopDetails = stops.map((s) => ({
+      id: s.id,
+      customerName: s.customerName,
+      value: Number(s.value) || 0,
+      completed: s.completed,
+    }));
 
     const existing = pastBySlot.get(key);
     const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
@@ -994,9 +1027,20 @@ async function rebuildPastRouteWindow({
       : [];
     if (existing && sameStopSet(prevSeq, stopIds)) {
       // Already truthful — keep drive/polyline. Still true-up the completed
-      // count (older docs predate the field).
-      if (num(existing.data.completedStops) !== completedStops) {
-        batch.set(existing.ref, { completedStops, updatedAt: now }, { merge: true });
+      // count / per-stop details / template (older docs predate these fields).
+      // Never blank an already-stamped template: a resumed run can rehydrate
+      // pastAppts persisted before routeTemplate existed.
+      const keptTemplate = routeTemplateTitle || str(existing.data.routeTemplateTitle);
+      if (
+        num(existing.data.completedStops) !== completedStops ||
+        !Array.isArray(existing.data.stops) ||
+        str(existing.data.routeTemplateTitle) !== keptTemplate
+      ) {
+        batch.set(
+          existing.ref,
+          { completedStops, stops: stopDetails, routeTemplateTitle: keptTemplate, updatedAt: now },
+          { merge: true },
+        );
         written++;
         ops++;
         if (ops >= 450) await commit();
@@ -1018,9 +1062,11 @@ async function rebuildPastRouteWindow({
         stopSequence: stopIds,
         totalStops: stopIds.length,
         completedStops,
+        stops: stopDetails,
         fieldRoutesStopIds: stopIds,
         hasFieldRoutesStops: true,
         routeGroupTitle,
+        routeTemplateTitle: routeTemplateTitle || str(existing?.data.routeTemplateTitle),
         routeValue,
         ...metrics,
         approved: true,
@@ -1113,6 +1159,7 @@ export async function reconcileRouteRange(
     const routes = routeIdSet.size ? await client.getEntities("route", Array.from(routeIdSet)) : [];
     const routeTechMap = new Map<string, string>();
     const routeGroupMap = new Map<string, string>();
+    const routeTemplateMap = new Map<string, string>();
     for (const r of routes) {
       const rr = rec(r);
       const rid = str(rr.routeID);
@@ -1120,6 +1167,8 @@ export async function reconcileRouteRange(
       if (rid && techEmpId && techEmpId !== "0") routeTechMap.set(rid, techEmpId);
       const groupTitle = str(rr.groupTitle);
       if (rid && groupTitle) routeGroupMap.set(rid, groupTitle);
+      const templateTitle = str(rr.title);
+      if (rid && templateTitle) routeTemplateMap.set(rid, templateTitle);
     }
     for (const a of appts) {
       const ar = rec(a);
@@ -1137,6 +1186,7 @@ export async function reconcileRouteRange(
         date,
         techEmpId: routeTechMap.get(routeId) || "",
         routeGroup: routeGroupMap.get(routeId) || "",
+        routeTemplate: routeTemplateMap.get(routeId) || "",
         duration: num(ar.duration) || 25,
         status: apptStatus,
       });
@@ -1413,6 +1463,10 @@ async function buildRunSetup(
   // Captured here from routes we already fetch, so the dashboard can filter
   // route-derived KPIs by group with zero extra API calls.
   const routeGroupMap = new Map<string, string>();
+  // route.title is the route-template name the dispatcher built the day from
+  // ("Regular", "Rain Day", "Early Release", "Requested Off", …) — the context
+  // for WHY a day ran the number of stops it did. Same zero-extra-call capture.
+  const routeTemplateMap = new Map<string, string>();
   for (const r of routes) {
     const rr = rec(r);
     const rid = str(rr.routeID);
@@ -1420,6 +1474,8 @@ async function buildRunSetup(
     if (rid && techEmpId && techEmpId !== "0") routeTechMap.set(rid, techEmpId);
     const groupTitle = str(rr.groupTitle);
     if (rid && groupTitle) routeGroupMap.set(rid, groupTitle);
+    const templateTitle = str(rr.title);
+    if (rid && templateTitle) routeTemplateMap.set(rid, templateTitle);
   }
 
   const apptMap: Record<string, ApptInfo> = {};
@@ -1451,6 +1507,7 @@ async function buildRunSetup(
           date,
           techEmpId,
           routeGroup: routeGroupMap.get(routeId) || "",
+          routeTemplate: routeTemplateMap.get(routeId) || "",
           duration: num(ar.duration) || 25,
           status: apptStatus,
         });
@@ -1466,6 +1523,7 @@ async function buildRunSetup(
         techName: resolveEmpName(techEmpId),
         routeId: routeId && routeId !== "0" ? routeId : "",
         routeGroup: routeGroupMap.get(routeId) || "",
+        routeTemplate: routeTemplateMap.get(routeId) || "",
       };
     }
   }
@@ -1874,6 +1932,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const scheduledTech = appt ? str(appt.techName) : "";
       const scheduledTechId = appt ? str(appt.techId) : "";
       const scheduledRouteGroup = appt ? str(appt.routeGroup) : "";
+      const scheduledRouteTemplate = appt ? str(appt.routeTemplate) : "";
 
       // Pending cancel comes straight off the customer record (don't derive it
       // from dateCancelled — that field is "0000-00-00 00:00:00" when unset and
@@ -1982,6 +2041,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         fieldRoutesServicedById: alreadyScheduled ? scheduledTechId : "",
         fieldRoutesRouteId: alreadyScheduled ? scheduledRouteId : "",
         fieldRoutesRouteGroup: scheduledRouteGroup,
+        fieldRoutesRouteTemplate: scheduledRouteTemplate,
         fieldRoutesScheduleSource: alreadyScheduled ? "api_appointment" : "",
         schedulingRequest: specialScheduling,
         // Subscription / billing detail (labels match the FieldRoutes report):
