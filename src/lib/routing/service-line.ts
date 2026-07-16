@@ -131,6 +131,40 @@ export function lawnRoundSeasonalWindow(serviceType: unknown): { startMonth: num
   return LAWN_ROUND_SEASONS[Number(m[1])] || null;
 }
 
+/** Round numbers (1–7) whose window covers the given month (1–12), ascending. */
+export function lawnRoundsForMonth(month: number): number[] {
+  const out: number[] = [];
+  for (const [n, w] of Object.entries(LAWN_ROUND_SEASONS)) {
+    const inWindow = w.startMonth <= w.endMonth
+      ? month >= w.startMonth && month <= w.endMonth
+      : month >= w.startMonth || month <= w.endMonth;
+    if (inWindow) out.push(Number(n));
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/**
+ * Best-match round NUMBER for a stamped seasonal window, or null. Round subs
+ * carry real per-cycle windows (servicePlanRound) that may not equal the
+ * calendar table exactly, so match by nearest start/end month rather than a
+ * literal equality; ties break to the lower round number.
+ */
+export function lawnRoundNumberForWindow(startMonth: unknown, endMonth: unknown): number | null {
+  const s = Number(startMonth);
+  const e = Number(endMonth);
+  if (!(s >= 1 && s <= 12) || !(e >= 1 && e <= 12)) return null;
+  let best: number | null = null;
+  let bestDist = Infinity;
+  for (const [n, w] of Object.entries(LAWN_ROUND_SEASONS)) {
+    const dist = Math.abs(w.startMonth - s) + Math.abs(w.endMonth - e);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = Number(n);
+    }
+  }
+  return best;
+}
+
 export interface LineScopeInput {
   line: ServiceLine;
   onHold: unknown; // subscription.onHold (0/1)
