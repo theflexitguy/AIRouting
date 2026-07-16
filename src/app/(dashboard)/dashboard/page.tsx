@@ -13,7 +13,7 @@ import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { DatePicker } from "@/components/ui/date-picker";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { MultiSelect } from "@/components/ui/multi-select";
 import { formatTime } from "@/lib/utils";
 import { formatCurrency } from "@/lib/production-value";
 import { deriveServiceLine } from "@/lib/routing/service-line";
@@ -234,9 +234,10 @@ export default function DashboardPage() {
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
   const [dateFrom, setDateFrom] = useState(() => format(startOfWeek(new Date(), { weekStartsOn: 1 }), "yyyy-MM-dd"));
   const [dateTo, setDateTo] = useState(today);
-  const [filterTech, setFilterTech] = useState("all");
-  const [filterGroup, setFilterGroup] = useState("all");
-  const [filterTemplate, setFilterTemplate] = useState("all");
+  // Multi-select filters: empty array = no filter ("all").
+  const [filterTechs, setFilterTechs] = useState<string[]>([]);
+  const [filterGroups, setFilterGroups] = useState<string[]>([]);
+  const [filterTemplates, setFilterTemplates] = useState<string[]>([]);
   const [rangeRoutes, setRangeRoutes] = useState<RouteRec[] | null>(null);
   // Custom-range extras: bump to re-fetch after a live FieldRoutes verification,
   // in-flight indicator for that verification, and the skip-weekends toggle.
@@ -462,14 +463,22 @@ export default function DashboardPage() {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [userProfile?.companyId, dateFilterEnabled, dateFrom, dateTo, today]);
 
-  // Identifier set for the selected technician (matched against route/job fields).
+  // Identifier set for the selected technicians (matched against route/job
+  // fields). Union across every selected tech — a route/job matching ANY of
+  // them passes the filter.
   const techKeys = useMemo(() => {
-    if (filterTech === "all") return new Set<string>();
-    const t = techs.find(x => x.id === filterTech);
-    return new Set([t?.id, t?.name, t?.employeeId, t?.fieldRoutesEmployeeId, t?.fieldRoutesTechId].map(norm).filter(Boolean));
-  }, [filterTech, techs]);
+    const keys = new Set<string>();
+    for (const id of filterTechs) {
+      const t = techs.find(x => x.id === id);
+      for (const k of [t?.id, t?.name, t?.employeeId, t?.fieldRoutesEmployeeId, t?.fieldRoutesTechId]) {
+        const v = norm(k);
+        if (v) keys.add(v);
+      }
+    }
+    return keys;
+  }, [filterTechs, techs]);
 
-  const filtersActive = dateFilterEnabled || filterTech !== "all" || filterGroup !== "all" || filterTemplate !== "all";
+  const filtersActive = dateFilterEnabled || filterTechs.length > 0 || filterGroups.length > 0 || filterTemplates.length > 0;
 
   // Route Template options: distinct template titles across every route loaded
   // (8-week window + custom range), synced from FieldRoutes route.title —
@@ -484,6 +493,7 @@ export default function DashboardPage() {
   }, [rawRoutes, rangeRoutes]);
 
   // Apply technician + route-group + route-template filters to a set of routes.
+  // Each filter is a multi-select: empty = all, otherwise match ANY selection.
   const filterRoutes = useMemo(() => {
     return (routes: RouteRec[]) => routes.filter(r => {
       // A route with no stops is a phantom (its underlying job docs were purged
@@ -491,12 +501,12 @@ export default function DashboardPage() {
       if ((r.totalStops || 0) <= 0) return false;
       // Match on the canonical bucket so every FieldRoutes spelling variant of a
       // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
-      if (filterGroup !== "all" && canonicalRouteGroup(String(r.routeGroupTitle || "")) !== filterGroup) return false;
-      if (filterTemplate !== "all" && String(r.routeTemplateTitle || "").trim() !== filterTemplate) return false;
+      if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(r.routeGroupTitle || "")))) return false;
+      if (filterTemplates.length > 0 && !filterTemplates.includes(String(r.routeTemplateTitle || "").trim())) return false;
       if (!routeMatchesTech(r, techKeys)) return false;
       return true;
     });
-  }, [filterGroup, filterTemplate, techKeys]);
+  }, [filterGroups, filterTemplates, techKeys]);
 
   // Route set for the "Today" cards: the custom range when the date filter is
   // on, otherwise today's routes. Shared with the metric drill-downs so a
@@ -528,8 +538,8 @@ export default function DashboardPage() {
     // Jobs completed today within the tech/group filter scope (jobs carry the
     // scheduled tech name + route group). Freshness is bounded by the last sync.
     const jobInFilterScope = (j: JobRec) => {
-      if (filterGroup !== "all" && canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")) !== filterGroup) return false;
-      if (filterTemplate !== "all" && String(j.fieldRoutesRouteTemplate || "").trim() !== filterTemplate) return false;
+      if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")))) return false;
+      if (filterTemplates.length > 0 && !filterTemplates.includes(String(j.fieldRoutesRouteTemplate || "").trim())) return false;
       if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
       return true;
     };
@@ -660,7 +670,7 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroup, filterTemplate, techKeys, bounds, today, scopedRoutes]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, techKeys, bounds, today, scopedRoutes]);
 
   // ── Metric drill-downs ──────────────────────────────────────────────────
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
@@ -873,32 +883,32 @@ export default function DashboardPage() {
                     )}
                   </>
                 )}
-                <Select value={filterTech} onValueChange={setFilterTech}>
-                  <SelectTrigger className="w-full sm:w-44 h-8 text-xs"><SelectValue placeholder="Technician" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All Technicians</SelectItem>
-                    {techs.map(t => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-                <Select value={filterGroup} onValueChange={setFilterGroup}>
-                  <SelectTrigger className="w-full sm:w-44 h-8 text-xs"><SelectValue placeholder="Route group" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All Route Groups</SelectItem>
-                    {groupOptions.map(g => <SelectItem key={g} value={g}>{g}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-                <Select value={filterTemplate} onValueChange={setFilterTemplate}>
-                  <SelectTrigger className="w-full sm:w-44 h-8 text-xs"><SelectValue placeholder="Route template" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All Route Templates</SelectItem>
-                    {templateOptions.map(t => <SelectItem key={t} value={t}>{t}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <MultiSelect
+                  options={techs.map(t => ({ value: t.id, label: t.name }))}
+                  selected={filterTechs}
+                  onChange={setFilterTechs}
+                  allLabel="All Technicians"
+                  className="w-full sm:w-44 h-8 text-xs"
+                />
+                <MultiSelect
+                  options={groupOptions.map(g => ({ value: g, label: g }))}
+                  selected={filterGroups}
+                  onChange={setFilterGroups}
+                  allLabel="All Route Groups"
+                  className="w-full sm:w-44 h-8 text-xs"
+                />
+                <MultiSelect
+                  options={templateOptions.map(t => ({ value: t, label: t }))}
+                  selected={filterTemplates}
+                  onChange={setFilterTemplates}
+                  allLabel="All Route Templates"
+                  className="w-full sm:w-44 h-8 text-xs"
+                />
                 {filtersActive && (
                   <button
                     type="button"
                     className="text-xs text-muted-foreground/60 hover:text-foreground underline underline-offset-2 ml-auto"
-                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTech("all"); setFilterGroup("all"); setFilterTemplate("all"); }}
+                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTechs([]); setFilterGroups([]); setFilterTemplates([]); }}
                   >
                     Clear filters
                   </button>
@@ -955,9 +965,9 @@ export default function DashboardPage() {
                   <DialogDescription>
                     {routeWindowLabel}
                     {dateFilterEnabled ? ` · ${dateFrom} to ${dateTo}` : ` · ${today}`}
-                    {filterTech !== "all" ? ` · ${techs.find(t => t.id === filterTech)?.name || filterTech}` : ""}
-                    {filterGroup !== "all" ? ` · ${filterGroup}` : ""}
-                    {filterTemplate !== "all" ? ` · ${filterTemplate}` : ""}
+                    {filterTechs.length > 0 ? ` · ${filterTechs.map(id => techs.find(t => t.id === id)?.name || id).join(", ")}` : ""}
+                    {filterGroups.length > 0 ? ` · ${filterGroups.join(", ")}` : ""}
+                    {filterTemplates.length > 0 ? ` · ${filterTemplates.join(", ")}` : ""}
                   </DialogDescription>
                 </DialogHeader>
                 <div className="max-h-[65vh] overflow-y-auto">
