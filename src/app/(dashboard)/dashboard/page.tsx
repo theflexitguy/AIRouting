@@ -153,6 +153,12 @@ interface TechOption {
 
 const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
 
+/** Saturday/Sunday check for a YYYY-MM-DD date string. */
+const isWeekendISO = (iso: string) => {
+  const day = new Date(`${iso}T00:00:00Z`).getUTCDay();
+  return day === 0 || day === 6;
+};
+
 // Lines shown in the Initials breakdown (new-signup first services).
 const INITIAL_LINE_LABELS: Array<{ key: string; label: string }> = [
   { key: "general", label: "GP" },
@@ -214,6 +220,11 @@ export default function DashboardPage() {
   const [filterTech, setFilterTech] = useState("all");
   const [filterGroup, setFilterGroup] = useState("all");
   const [rangeRoutes, setRangeRoutes] = useState<RouteRec[] | null>(null);
+  // Custom-range extras: bump to re-fetch after a live FieldRoutes verification,
+  // in-flight indicator for that verification, and the skip-weekends toggle.
+  const [rangeSyncTick, setRangeSyncTick] = useState(0);
+  const [rangeVerifying, setRangeVerifying] = useState(false);
+  const [excludeWeekends, setExcludeWeekends] = useState(false);
 
   // Calendar boundaries (compared as YYYY-MM-DD strings).
   const bounds = useMemo(() => {
@@ -376,6 +387,7 @@ export default function DashboardPage() {
   }, [userProfile?.companyId, period, today, loadRangeDone]);
 
   // Fetch routes for a custom date range only while that filter is enabled.
+  // rangeSyncTick re-runs the fetch after a live FieldRoutes verification.
   useEffect(() => {
     const companyId = userProfile?.companyId;
     if (!companyId || !dateFilterEnabled) { setRangeRoutes(null); return; }
@@ -396,7 +408,40 @@ export default function DashboardPage() {
       }
     })();
     return () => { cancelled = true; };
-  }, [userProfile, dateFilterEnabled, dateFrom, dateTo]);
+  }, [userProfile, dateFilterEnabled, dateFrom, dateTo, rangeSyncTick]);
+
+  // Live-verify a custom range: rebuild the PAST days of the range from actual
+  // FieldRoutes appointments (cancellations/reschedules drop off, emptied routes
+  // disappear), then re-pull the range routes. Debounced so dragging the date
+  // pickers doesn't fire repeatedly; the server also TTL-caches repeat requests
+  // for the same range so API budget isn't spent twice.
+  useEffect(() => {
+    const companyId = userProfile?.companyId;
+    if (!companyId || !dateFilterEnabled || !dateFrom || !dateTo) return;
+    if (dateFrom >= today) return; // nothing in the past to verify
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setRangeVerifying(true);
+      try {
+        const res = await fetch("/api/fieldroutes/reconcile-range", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ startDate: dateFrom, endDate: dateTo }),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          console.warn("Range verification failed:", d);
+        } else if (!cancelled && !d.cached && (Number(d.routesWritten) > 0 || Number(d.routesDeleted) > 0)) {
+          setRangeSyncTick((v) => v + 1);
+        }
+      } catch (e) {
+        console.warn("Range verification error:", e);
+      } finally {
+        if (!cancelled) setRangeVerifying(false);
+      }
+    }, 800);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [userProfile?.companyId, dateFilterEnabled, dateFrom, dateTo, today]);
 
   // Identifier set for the selected technician (matched against route/job fields).
   const techKeys = useMemo(() => {
@@ -424,11 +469,14 @@ export default function DashboardPage() {
   const stats: DashboardStats = useMemo(() => {
     // Route set for the "Today" cards: the custom range when the date filter is
     // on, otherwise today's routes. KPIs use this week's routes (or the range).
-    const todaySet = filterRoutes(
-      dateFilterEnabled ? (rangeRoutes ?? []) : rawRoutes.filter(r => r.date === today)
-    );
+    // Custom range with "skip weekends" on: Sat/Sun routes drop out of every
+    // range-derived number (stops, drive, value, KPIs).
+    const rangeSet = dateFilterEnabled
+      ? (excludeWeekends ? (rangeRoutes ?? []).filter(r => !isWeekendISO(String(r.date))) : (rangeRoutes ?? []))
+      : null;
+    const todaySet = filterRoutes(rangeSet ?? rawRoutes.filter(r => r.date === today));
     const kpiSet = filterRoutes(
-      dateFilterEnabled ? (rangeRoutes ?? []) : rawRoutes.filter(r => r.date >= bounds.weekStart && r.date <= bounds.weekEnd)
+      rangeSet ?? rawRoutes.filter(r => r.date >= bounds.weekStart && r.date <= bounds.weekEnd)
     );
 
     const totalStops = todaySet.reduce((s, r) => s + (r.totalStops || 0), 0);
@@ -558,7 +606,7 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, filterRoutes, filterGroup, techKeys, bounds, today]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroup, techKeys, bounds, today]);
 
   // Historical period view (null for the current month, which uses the live cards).
   const periodView = useMemo(() => {
@@ -670,6 +718,13 @@ export default function DashboardPage() {
                     <DatePicker value={dateFrom} onChange={setDateFrom} className="h-8 text-xs" />
                     <span className="text-muted-foreground text-sm">to</span>
                     <DatePicker value={dateTo} onChange={setDateTo} className="h-8 text-xs" />
+                    <div className="flex items-center gap-2">
+                      <Switch id="dash-weekends" checked={excludeWeekends} onCheckedChange={setExcludeWeekends} />
+                      <label htmlFor="dash-weekends" className="text-sm text-muted-foreground cursor-pointer whitespace-nowrap">Skip weekends</label>
+                    </div>
+                    {rangeVerifying && (
+                      <span className="text-xs text-blue-300/80 animate-pulse whitespace-nowrap">Verifying range with FieldRoutes…</span>
+                    )}
                   </>
                 )}
                 <Select value={filterTech} onValueChange={setFilterTech}>
@@ -690,7 +745,7 @@ export default function DashboardPage() {
                   <button
                     type="button"
                     className="text-xs text-muted-foreground/60 hover:text-foreground underline underline-offset-2 ml-auto"
-                    onClick={() => { setDateFilterEnabled(false); setFilterTech("all"); setFilterGroup("all"); }}
+                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTech("all"); setFilterGroup("all"); }}
                   >
                     Clear filters
                   </button>

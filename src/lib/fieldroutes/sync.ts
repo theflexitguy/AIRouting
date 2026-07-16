@@ -815,141 +815,337 @@ async function reconcileScheduledRoutes(
     if (ops >= 450) await commit();
   }
 
+  await commit();
+
   // ── Historical window: rewrite PAST route docs from actual appointments. ────
   // A past day's docs used to freeze at whatever the schedule looked like when
   // that day was last synced — stops later cancelled/rescheduled kept counting
   // and emptied routes lingered, so the dashboard's history disagreed with
   // FieldRoutes. pastAppts is the non-cancelled appointment truth for the
-  // trailing ROUTE_HISTORY_DAYS; rebuild each (date, tech) slot from it and
-  // remove window docs FieldRoutes no longer backs. Unchanged slots are left
-  // untouched so previously computed Google drive times/polylines survive.
+  // trailing ROUTE_HISTORY_DAYS.
   if (pastAppts.length > 0) {
-    const historyStart = pastAppts.reduce((min, p) => (p.date < min ? p.date : min), today);
-
-    const pastSnap = await db
-      .collection(`companies/${companyId}/routes`)
-      .where("date", ">=", historyStart)
-      .where("date", "<", today)
-      .get();
-    const pastBySlot = new Map<string, { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData }>();
-    pastSnap.docs.forEach((rd) => {
-      const r = rd.data();
-      pastBySlot.set(`${str(r.date)}::${str(r.techId)}`, { ref: rd.ref, data: r });
+    const rebuilt = await rebuildPastRouteWindow({
+      db,
+      companyId,
+      pastAppts,
+      windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
+      windowEndExclusive: today,
+      now,
+      empNames,
+      resolveTechEmpId: (empId) =>
+        empToTech.get(empId) || nameToTech.get(normName(empNames[empId] || "")) || "",
     });
+    routesWritten += rebuilt.written;
+    routesDeleted += rebuilt.deleted;
+  }
 
-    // Group by (date :: technician doc id); appointments on unassigned routes
-    // (no tech) can't be attributed to a route card and are skipped.
-    const pastGroups = new Map<string, { date: string; techId: string; techName: string; appts: PastAppt[] }>();
-    for (const p of pastAppts) {
-      const techId =
-        empToTech.get(p.techEmpId) || nameToTech.get(normName(empNames[p.techEmpId] || "")) || "";
-      if (!techId) continue;
-      const key = `${p.date}::${techId}`;
-      if (!pastGroups.has(key)) {
-        pastGroups.set(key, { date: p.date, techId, techName: empNames[p.techEmpId] || p.techEmpId, appts: [] });
-      }
-      pastGroups.get(key)!.appts.push(p);
+  return { routesWritten, routesDeleted, techsLinked: empToTech.size };
+}
+
+/**
+ * Rebuild the route docs of a PAST window from actual FieldRoutes appointments
+ * (the non-cancelled/non-rescheduled truth): per (date, tech) slot the stop
+ * list, counts, service/drive estimates, value, and group are rewritten, and
+ * window docs with no backing appointments are deleted. Slots whose stop set is
+ * unchanged are skipped so previously computed Google drive times/polylines
+ * survive. Shared by the sync's trailing-window pass and the on-demand
+ * date-range verification endpoint.
+ */
+async function rebuildPastRouteWindow({
+  db,
+  companyId,
+  pastAppts,
+  windowStart,
+  windowEndExclusive,
+  now,
+  empNames,
+  resolveTechEmpId,
+}: {
+  db: FirebaseFirestore.Firestore;
+  companyId: string;
+  pastAppts: PastAppt[];
+  windowStart: string;
+  windowEndExclusive: string;
+  now: string;
+  empNames: Record<string, string>;
+  resolveTechEmpId: (empId: string) => string;
+}): Promise<{ written: number; deleted: number }> {
+  let batch = db.batch();
+  let ops = 0;
+  let written = 0;
+  let deleted = 0;
+  const commit = async () => {
+    if (ops > 0) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
     }
+  };
 
-    // Job docs (best effort) for stop value/coords/customer name. Purged docs
-    // (e.g. completed one-times) still count as stops, just without value/coords.
-    const subIds = Array.from(new Set(pastAppts.map((p) => p.subId)));
-    const jobBySub = new Map<string, FirebaseFirestore.DocumentData>();
-    for (let i = 0; i < subIds.length; i += 300) {
-      const refs = subIds.slice(i, i + 300).map((id) => db.doc(`companies/${companyId}/jobs/sub_${id}`));
-      const snaps = await db.getAll(...refs);
-      snaps.forEach((s) => {
-        if (s.exists) jobBySub.set(s.id.replace(/^sub_/, ""), s.data() as FirebaseFirestore.DocumentData);
-      });
+  const pastSnap = await db
+    .collection(`companies/${companyId}/routes`)
+    .where("date", ">=", windowStart)
+    .where("date", "<", windowEndExclusive)
+    .get();
+  const pastBySlot = new Map<string, { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData }>();
+  pastSnap.docs.forEach((rd) => {
+    const r = rd.data();
+    pastBySlot.set(`${str(r.date)}::${str(r.techId)}`, { ref: rd.ref, data: r });
+  });
+
+  // Group by (date :: technician doc id); appointments on unassigned routes
+  // (no tech) can't be attributed to a route card and are skipped.
+  const pastGroups = new Map<string, { date: string; techId: string; techName: string; appts: PastAppt[] }>();
+  for (const p of pastAppts) {
+    if (p.date < windowStart || p.date >= windowEndExclusive) continue;
+    const techId = resolveTechEmpId(p.techEmpId);
+    if (!techId) continue;
+    const key = `${p.date}::${techId}`;
+    if (!pastGroups.has(key)) {
+      pastGroups.set(key, { date: p.date, techId, techName: empNames[p.techEmpId] || p.techEmpId, appts: [] });
     }
+    pastGroups.get(key)!.appts.push(p);
+  }
 
-    const sameStopSet = (a: string[], b: string[]) =>
-      a.length === b.length && new Set(a).size === a.length && b.every((id) => a.includes(id));
+  // Job docs (best effort) for stop value/coords/customer name. Purged docs
+  // (e.g. completed one-times) still count as stops, just without value/coords.
+  const subIds = Array.from(new Set(pastAppts.map((p) => p.subId)));
+  const jobBySub = new Map<string, FirebaseFirestore.DocumentData>();
+  for (let i = 0; i < subIds.length; i += 300) {
+    const refs = subIds.slice(i, i + 300).map((id) => db.doc(`companies/${companyId}/jobs/sub_${id}`));
+    const snaps = await db.getAll(...refs);
+    snaps.forEach((s) => {
+      if (s.exists) jobBySub.set(s.id.replace(/^sub_/, ""), s.data() as FirebaseFirestore.DocumentData);
+    });
+  }
 
-    const handledPast = new Set<string>();
-    for (const [key, group] of pastGroups) {
-      handledPast.add(key);
-      // Dedupe subs (a sub with two same-day appointments is still one stop doc)
-      // and order stably by customer name for a readable stop list.
-      const seen = new Set<string>();
-      const stops = group.appts
-        .filter((p) => (seen.has(p.subId) ? false : (seen.add(p.subId), true)))
-        .map((p) => {
-          const j = jobBySub.get(p.subId);
-          return {
-            id: `sub_${p.subId}`,
-            duration: Number(j?.duration) || p.duration || 25,
-            lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
-            lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
-            customerName: str(j?.customerName) || p.subId,
-            value: j
-              ? calculateStopProductionValue({
-                  recurringPrice: j.recurringPrice,
-                  billingPrice: j.billingPrice,
-                  recurringFrequency: j.recurringFrequency,
-                  billingFrequency: j.billingFrequency,
-                  revenue: j.revenue,
-                  productionValue: j.productionValue,
-                }).value || 0
-              : 0,
-            routeGroup: p.routeGroup,
-          };
-        })
-        .sort((a, b) => a.customerName.localeCompare(b.customerName));
-      const stopIds = stops.map((s) => s.id);
+  const sameStopSet = (a: string[], b: string[]) =>
+    a.length === b.length && new Set(a).size === a.length && b.every((id) => a.includes(id));
 
-      const existing = pastBySlot.get(key);
-      const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
-        ? (existing!.data.stopSequence as unknown[]).map(String)
-        : [];
-      if (existing && sameStopSet(prevSeq, stopIds)) continue; // already truthful — keep drive/polyline
+  const handledPast = new Set<string>();
+  for (const [key, group] of pastGroups) {
+    handledPast.add(key);
+    // Dedupe subs (a sub with two same-day appointments is still one stop doc)
+    // and order stably by customer name for a readable stop list.
+    const seen = new Set<string>();
+    const stops = group.appts
+      .filter((p) => (seen.has(p.subId) ? false : (seen.add(p.subId), true)))
+      .map((p) => {
+        const j = jobBySub.get(p.subId);
+        return {
+          id: `sub_${p.subId}`,
+          duration: Number(j?.duration) || p.duration || 25,
+          lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
+          lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
+          customerName: str(j?.customerName) || p.subId,
+          value: j
+            ? calculateStopProductionValue({
+                recurringPrice: j.recurringPrice,
+                billingPrice: j.billingPrice,
+                recurringFrequency: j.recurringFrequency,
+                billingFrequency: j.billingFrequency,
+                revenue: j.revenue,
+                productionValue: j.productionValue,
+              }).value || 0
+            : 0,
+          routeGroup: p.routeGroup,
+        };
+      })
+      .sort((a, b) => a.customerName.localeCompare(b.customerName));
+    const stopIds = stops.map((s) => s.id);
 
-      const metrics = haversineRouteMetrics(stops);
-      const routeGroupTitle = stops.find((s) => s.routeGroup)?.routeGroup || "";
-      const routeValue = stops.reduce((sum, s) => sum + (Number(s.value) || 0), 0);
-      const ref = existing?.ref || db.doc(`companies/${companyId}/routes/${group.date}-${group.techId}`);
-      batch.set(
-        ref,
-        {
-          companyId,
-          date: group.date,
-          techId: group.techId,
-          techName: group.techName,
-          stopSequence: stopIds,
-          totalStops: stopIds.length,
-          fieldRoutesStopIds: stopIds,
-          hasFieldRoutesStops: true,
-          routeGroupTitle,
-          routeValue,
-          ...metrics,
-          approved: true,
-          locked: true,
-          source: "fieldroutes",
-          generatedBy: "fieldroutes",
-          updatedAt: now,
-          ...(existing ? {} : { createdAt: now }),
-        },
-        { merge: true },
-      );
-      routesWritten++;
-      ops++;
-      if (ops >= 450) await commit();
-    }
+    const existing = pastBySlot.get(key);
+    const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
+      ? (existing!.data.stopSequence as unknown[]).map(String)
+      : [];
+    if (existing && sameStopSet(prevSeq, stopIds)) continue; // already truthful — keep drive/polyline
 
-    // Window docs with no backing appointments: the day per FieldRoutes has
-    // nothing for that tech (route emptied/deleted, or a stale local proposal
-    // for a day that already happened) — remove them.
-    for (const [key, existing] of pastBySlot) {
-      if (handledPast.has(key)) continue;
-      batch.delete(existing.ref);
-      routesDeleted++;
-      ops++;
-      if (ops >= 450) await commit();
-    }
+    const metrics = haversineRouteMetrics(stops);
+    const routeGroupTitle = stops.find((s) => s.routeGroup)?.routeGroup || "";
+    const routeValue = stops.reduce((sum, s) => sum + (Number(s.value) || 0), 0);
+    const ref = existing?.ref || db.doc(`companies/${companyId}/routes/${group.date}-${group.techId}`);
+    batch.set(
+      ref,
+      {
+        companyId,
+        date: group.date,
+        techId: group.techId,
+        techName: group.techName,
+        stopSequence: stopIds,
+        totalStops: stopIds.length,
+        fieldRoutesStopIds: stopIds,
+        hasFieldRoutesStops: true,
+        routeGroupTitle,
+        routeValue,
+        ...metrics,
+        approved: true,
+        locked: true,
+        source: "fieldroutes",
+        generatedBy: "fieldroutes",
+        updatedAt: now,
+        ...(existing ? {} : { createdAt: now }),
+      },
+      { merge: true },
+    );
+    written++;
+    ops++;
+    if (ops >= 450) await commit();
+  }
+
+  // Window docs with no backing appointments: the day per FieldRoutes has
+  // nothing for that tech (route emptied/deleted, or a stale local proposal
+  // for a day that already happened) — remove them.
+  for (const [key, existing] of pastBySlot) {
+    if (handledPast.has(key)) continue;
+    batch.delete(existing.ref);
+    deleted++;
+    ops++;
+    if (ops >= 450) await commit();
   }
   await commit();
 
-  return { routesWritten, routesDeleted, techsLinked: empToTech.size };
+  return { written, deleted };
+}
+
+// Per-call cap for the on-demand range verification: bounds the FieldRoutes
+// appointment pull (search + entity gets) a single request can trigger.
+const MAX_RANGE_RECONCILE_DAYS = 62;
+
+/**
+ * On-demand "make this date range exact": pull the actual FieldRoutes
+ * appointments for a PAST window and rebuild its route docs, so a custom
+ * date-range view matches FieldRoutes even beyond the sync's trailing window.
+ * Today/future dates are excluded (every sync reconciles them, and a raw
+ * rebuild would wipe pending AI proposals on mixed routes). Metered against
+ * the company's FieldRoutes budget.
+ */
+export async function reconcileRouteRange(
+  startDate: string,
+  endDate: string,
+): Promise<{
+  companyId: string;
+  windowStart: string;
+  windowEndExclusive: string;
+  appointments: number;
+  routesWritten: number;
+  routesDeleted: number;
+  skipped: boolean;
+  reason?: string;
+  apiReads: number;
+}> {
+  const companyId = targetCompanyId();
+  const db = adminDb();
+  const today = centralTodayISO();
+  const now = new Date().toISOString();
+
+  const endExclusive = endDate < today ? dateOffsetISO(endDate, 1) : today;
+  let windowStart = startDate;
+  const minStart = dateOffsetISO(endExclusive, -MAX_RANGE_RECONCILE_DAYS);
+  if (windowStart < minStart) windowStart = minStart;
+  const base = { companyId, windowStart, windowEndExclusive: endExclusive };
+  if (!(windowStart < endExclusive)) {
+    return { ...base, appointments: 0, routesWritten: 0, routesDeleted: 0, skipped: true, reason: "no past days in range", apiReads: 0 };
+  }
+
+  const client = new FieldRoutesClient();
+  const budget = await loadBudget(db, companyId);
+  client.setMaxReads(budget.remaining);
+  if (budget.remaining <= 0) {
+    return { ...base, appointments: 0, routesWritten: 0, routesDeleted: 0, skipped: true, reason: "FieldRoutes API daily cap reached", apiReads: 0 };
+  }
+
+  const pastAppts: PastAppt[] = [];
+  try {
+    const apptIds = await client.searchIds("appointment", {
+      date: { operator: "BETWEEN", value: [windowStart, dateOffsetISO(endExclusive, -1)] },
+    });
+    const appts = apptIds.length ? await client.getEntities("appointment", apptIds) : [];
+    const routeIdSet = new Set<string>();
+    for (const a of appts) {
+      const routeId = str(rec(a).routeID);
+      if (routeId && routeId !== "0") routeIdSet.add(routeId);
+    }
+    const routes = routeIdSet.size ? await client.getEntities("route", Array.from(routeIdSet)) : [];
+    const routeTechMap = new Map<string, string>();
+    const routeGroupMap = new Map<string, string>();
+    for (const r of routes) {
+      const rr = rec(r);
+      const rid = str(rr.routeID);
+      const techEmpId = str(rr.assignedTech);
+      if (rid && techEmpId && techEmpId !== "0") routeTechMap.set(rid, techEmpId);
+      const groupTitle = str(rr.groupTitle);
+      if (rid && groupTitle) routeGroupMap.set(rid, groupTitle);
+    }
+    for (const a of appts) {
+      const ar = rec(a);
+      const subId = str(ar.subscriptionID);
+      if (!subId) continue;
+      const apptStatus = num(ar.status);
+      if (apptStatus === -1 || apptStatus === -2) continue;
+      const date = toDateOnly(ar.date);
+      if (!date || date < windowStart || date >= endExclusive) continue;
+      const routeId = str(ar.routeID);
+      pastAppts.push({
+        subId,
+        date,
+        techEmpId: routeTechMap.get(routeId) || "",
+        routeGroup: routeGroupMap.get(routeId) || "",
+        duration: num(ar.duration) || 25,
+      });
+    }
+  } catch (err) {
+    await recordApiUsage(db, companyId, { reads: client.readCount });
+    if (err instanceof FieldRoutesBudgetError) {
+      return { ...base, appointments: 0, routesWritten: 0, routesDeleted: 0, skipped: true, reason: "FieldRoutes API daily cap reached", apiReads: client.readCount };
+    }
+    throw err;
+  }
+  await recordApiUsage(db, companyId, { reads: client.readCount });
+
+  // Read-only tech resolution: existing technician docs + the persisted roster
+  // for employee names (no docs are created here — that's the sync's job).
+  const techSnap = await db.collection(`companies/${companyId}/technicians`).get();
+  const byEmpId = new Map<string, string>();
+  const byName = new Map<string, string>();
+  techSnap.docs.forEach((d) => {
+    const data = d.data();
+    for (const k of [data.fieldRoutesEmployeeId, data.fieldRoutesTechId, data.employeeId]) {
+      const id = str(k);
+      if (id && !byEmpId.has(id)) byEmpId.set(id, d.id);
+    }
+    const nm = normName(data.name);
+    if (nm && !byName.has(nm)) byName.set(nm, d.id);
+  });
+  const empNames: Record<string, string> = {};
+  const rosterSnap = await db.doc(`companies/${companyId}/fieldRoutesState/employeeRoster`).get();
+  const rosterEmployees = rosterSnap.exists ? (rosterSnap.data()?.employees as unknown[]) : [];
+  if (Array.isArray(rosterEmployees)) {
+    for (const e of rosterEmployees) {
+      const er = rec(e);
+      const id = str(er.employeeId);
+      if (id) empNames[id] = str(er.name);
+    }
+  }
+
+  const rebuilt = await rebuildPastRouteWindow({
+    db,
+    companyId,
+    pastAppts,
+    windowStart,
+    windowEndExclusive: endExclusive,
+    now,
+    empNames,
+    resolveTechEmpId: (empId) => byEmpId.get(empId) || byName.get(normName(empNames[empId] || "")) || "",
+  });
+
+  return {
+    ...base,
+    appointments: pastAppts.length,
+    routesWritten: rebuilt.written,
+    routesDeleted: rebuilt.deleted,
+    skipped: false,
+    apiReads: client.readCount,
+  };
 }
 
 /** Stable ascending order so the resume offset points at the same IDs across invocations. */
