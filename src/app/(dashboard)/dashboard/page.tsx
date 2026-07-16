@@ -125,6 +125,12 @@ interface DashboardStats {
   monthlyTarget: number;
   weeklyTarget: number;
   dailyTarget: number;
+  // Per-service-line week/day segmentation: target (monthly ÷ 4 / ÷ working
+  // days), done (completed in the window), booked (appointments on the books).
+  lineWeekDay: Record<string, {
+    weekTarget: number; weekDone: number; weekBooked: number;
+    dayTarget: number; todayDone: number; todayBooked: number;
+  }>;
   pace: MonthlyPace;
   weekPace: MonthlyPace;
   trend: TrendRow[];
@@ -684,6 +690,33 @@ export default function DashboardPage() {
     const pace = totalRow.pace;
     const weeklyTarget = Math.round(monthlyTarget / 4);
     const dailyTarget = Math.round(monthlyTarget / MONTH_WORKING_DAYS);
+
+    // Week/day segmentation per service line: targets derive from the line's
+    // monthly target (÷4 weekly, ÷ working-days daily — same derivation the
+    // Total cards use); done counts distinct customers completed in the window
+    // (per-round subs for Lawn, matching its monthly card); booked counts
+    // appointments already on the books.
+    const weekBookedByLine = scheduledCountByLine(rawJobs, today, bounds.weekEnd);
+    const lineWeekDay: DashboardStats["lineWeekDay"] = {};
+    for (const lt of lineTargets) {
+      if (lt.line === "total") continue;
+      const lineJobs = rawJobs.filter(j => String(j.serviceLine ?? "") === lt.line);
+      const doneIn = (start: string, end: string) =>
+        lt.line === "lawn"
+          ? lineJobs.filter(j =>
+              j.inScope !== false && j.pendingCancel !== true &&
+              j.subscriptionLastCompletedDate && j.subscriptionLastCompletedDate >= start && j.subscriptionLastCompletedDate <= end
+            ).length
+          : monthlyServiced(lineJobs, start, end);
+      lineWeekDay[lt.line] = {
+        weekTarget: Math.round(lt.target / 4),
+        weekDone: doneIn(bounds.weekStart, today),
+        weekBooked: weekBookedByLine[lt.line] || 0,
+        dayTarget: Math.round(lt.target / MONTH_WORKING_DAYS),
+        todayDone: doneIn(today, today),
+        todayBooked: lineJobs.filter(j => j.alreadyScheduled === true && j.fieldRoutesScheduledDate === today).length,
+      };
+    }
     const trackedJobs = rawJobs.filter(j => isTrackedServiceLine(String(j.serviceLine ?? "")));
     const weeklyDone = monthlyServiced(trackedJobs, bounds.weekStart, today);
     const weekPace = weeklyPace(weeklyTarget, weeklyDone, bounds.weekStart, today);
@@ -745,6 +778,7 @@ export default function DashboardPage() {
       monthlyTarget,
       weeklyTarget,
       dailyTarget,
+      lineWeekDay,
       pace,
       weekPace,
       trend,
@@ -1352,6 +1386,30 @@ export default function DashboardPage() {
                               : `Projected ${projPct}% with schedule · book ${shortBy.toLocaleString()} more`}
                           </p>
                         </div>
+                        {/* Week / day segmentation for this service line */}
+                        {!isTotal && stats.lineWeekDay[lt.line] && (() => {
+                          const wd = stats.lineWeekDay[lt.line];
+                          return (
+                            <div className="grid grid-cols-2 gap-3 pt-2 border-t border-border/30">
+                              <div>
+                                <p className="text-[10px] uppercase tracking-wider text-muted-foreground/50">This week</p>
+                                <p className="text-sm font-semibold tabular-nums">
+                                  <span className={wd.weekDone >= wd.weekTarget ? "text-emerald-400" : "text-foreground"}>{wd.weekDone}</span>
+                                  <span className="text-muted-foreground/60 font-normal"> / {wd.weekTarget}</span>
+                                </p>
+                                <p className="text-[11px] text-muted-foreground/50">{wd.weekBooked} booked</p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] uppercase tracking-wider text-muted-foreground/50">Today</p>
+                                <p className="text-sm font-semibold tabular-nums">
+                                  <span className={wd.todayDone >= wd.dayTarget ? "text-emerald-400" : "text-foreground"}>{wd.todayDone}</span>
+                                  <span className="text-muted-foreground/60 font-normal"> / {wd.dayTarget}</span>
+                                </p>
+                                <p className="text-[11px] text-muted-foreground/50">{wd.todayBooked} booked</p>
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </CardContent>
                     </Card>
                   );
