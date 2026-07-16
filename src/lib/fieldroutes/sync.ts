@@ -78,8 +78,11 @@ async function loadRoutingConfig(
 export type SyncMode = "full" | "incremental";
 
 // Stop starting new batches once we cross this; leaves headroom under the
-// 60s function cap for the final Firestore flush and the HTTP response.
-const SOFT_DEADLINE_MS = 45_000;
+// 120s function cap (sync/manual-sync routes) for route reconciliation
+// (including the Google drive-time upgrade pass) and, for manual syncs, the
+// post-sync cleanup steps that run in the same invocation (reconcile active
+// subs, purge inactive customers/non-recurring, recompute past-due).
+const SOFT_DEADLINE_MS = 85_000;
 // Subscriptions per batch. One subscription `get` + one customer `get` per
 // batch (both <= 1000-entity cap), so a batch costs ~2 throttled requests.
 const BATCH_SUBS = 250;
@@ -266,18 +269,23 @@ function haversineRouteMetrics(
 }
 
 /**
- * Per-run allowance of Google matrix computations. The sync endpoints run under
- * maxDuration=60s and the route reconciliation happens INSIDE that budget — an
- * unbounded "upgrade every doc" pass (100+ matrix calls on first deploy) blew
- * straight past it and the whole sync 504ed ("Sync failed. Check your
- * connection."). Capping per run keeps each sync comfortably inside its time
- * box; the remaining docs upgrade progressively on subsequent syncs because
- * their driveTimeSource stays "haversine_fallback".
+ * Per-run allowance of Google matrix computations. Route reconciliation happens
+ * INSIDE the sync function's time budget — an unbounded "upgrade every doc"
+ * pass (100+ matrix calls) blew straight past the (then 60s) cap and the whole
+ * sync 504ed ("Sync failed. Check your connection."). sync/manual-sync now run
+ * at maxDuration=120 with a SOFT_DEADLINE_MS of 85s for the subscription loop,
+ * leaving ~35s for reconciliation + (for manual syncs) the post-sync cleanup
+ * steps — comfortable room for this many sequential calls even at the 8s
+ * per-call timeout's worst case; real Google Routes Matrix calls typically
+ * return in well under a second. Any docs beyond this budget upgrade
+ * progressively on the NEXT sync (their driveTimeSource stays
+ * "haversine_fallback" until then) — and a sync fires automatically once daily
+ * via the cron in vercel.json regardless of manual syncs.
  */
 interface GoogleDriveBudget {
   remaining: number;
 }
-const GOOGLE_MATRIX_PER_SYNC_RUN = 12;
+const GOOGLE_MATRIX_PER_SYNC_RUN = 30;
 const GOOGLE_MATRIX_CALL_TIMEOUT_MS = 8_000;
 
 /**
@@ -813,12 +821,45 @@ async function reconcileScheduledRoutes(
     }
   };
 
-  // One Google-matrix allowance shared by the forward pass and the
-  // appointment-window rebuild, so the whole reconciliation stays bounded.
+  // One Google-matrix allowance shared by the appointment-window rebuild and
+  // the forward pass, so the whole reconciliation stays bounded.
   const googleBudget: GoogleDriveBudget = { remaining: GOOGLE_MATRIX_PER_SYNC_RUN };
 
+  // ── Appointment window FIRST: rewrite PAST + TODAY route docs from actual
+  // appointments. Runs BEFORE the future-days pass so TODAY gets first claim on
+  // the Google drive-time budget — the other way round, dozens of future docs
+  // drained the allowance and today (the day being dispatched and audited)
+  // stayed on straight-line estimates. Past days used to freeze at whatever the
+  // schedule looked like when last synced; TODAY used to be assembled from job
+  // docs, which undercounts (same-day pairs collapse, standalones vanish,
+  // completed subs drop off as they roll forward). pastAppts is the
+  // non-cancelled appointment truth for the trailing ROUTE_HISTORY_DAYS through
+  // today.
+  if (pastAppts.length > 0) {
+    const rebuilt = await rebuildPastRouteWindow({
+      db,
+      companyId,
+      pastAppts,
+      windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
+      windowEndExclusive: dateOffsetISO(today, 1),
+      todayISO: today,
+      googleBudget,
+      now,
+      empNames,
+      resolveTechEmpId: (empId) =>
+        empToTech.get(empId) || nameToTech.get(normName(empNames[empId] || "")) || "",
+    });
+    routesWritten += rebuilt.written;
+    routesDeleted += rebuilt.deleted;
+  }
+
+  // ── Future days: assembled from scheduled job docs. Nearest days first so
+  // whatever Google budget remains lands on tomorrow before day 13.
+  const orderedGroups = Array.from(groups.entries()).sort((a, b) =>
+    a[1].date.localeCompare(b[1].date),
+  );
   const handledSlots = new Set<string>();
-  for (const [key, group] of groups) {
+  for (const [key, group] of orderedGroups) {
     handledSlots.add(key);
     const orderedJobs = group.jobs
       .slice()
@@ -965,30 +1006,6 @@ async function reconcileScheduledRoutes(
 
   await commit();
 
-  // ── Appointment window: rewrite PAST + TODAY route docs from actual
-  // appointments. Past days used to freeze at whatever the schedule looked like
-  // when last synced; TODAY used to be assembled from job docs, which undercounts
-  // (same-day pairs collapse, standalones vanish, completed subs drop off as they
-  // roll forward). pastAppts is the non-cancelled appointment truth for the
-  // trailing ROUTE_HISTORY_DAYS through today.
-  if (pastAppts.length > 0) {
-    const rebuilt = await rebuildPastRouteWindow({
-      db,
-      companyId,
-      pastAppts,
-      windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
-      windowEndExclusive: dateOffsetISO(today, 1),
-      todayISO: today,
-      googleBudget,
-      now,
-      empNames,
-      resolveTechEmpId: (empId) =>
-        empToTech.get(empId) || nameToTech.get(normName(empNames[empId] || "")) || "",
-    });
-    routesWritten += rebuilt.written;
-    routesDeleted += rebuilt.deleted;
-  }
-
   return { routesWritten, routesDeleted, techsLinked: empToTech.size };
 }
 
@@ -1079,8 +1096,13 @@ async function rebuildPastRouteWindow({
     });
   }
 
+  // TODAY first, then most-recent past — so the Google drive-time budget lands
+  // on the day being dispatched before it's spent on history.
+  const orderedPastGroups = Array.from(pastGroups.entries()).sort(
+    (a, b) => b[1].date.localeCompare(a[1].date),
+  );
   const handledPast = new Set<string>();
-  for (const [key, group] of pastGroups) {
+  for (const [key, group] of orderedPastGroups) {
     handledPast.add(key);
     // EVERY appointment is a stop — FieldRoutes counts appointments, and a
     // customer visited twice in one day (service + same-day reservice on the
