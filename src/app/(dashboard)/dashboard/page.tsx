@@ -701,12 +701,29 @@ export default function DashboardPage() {
     for (const lt of lineTargets) {
       if (lt.line === "total") continue;
       const lineJobs = rawJobs.filter(j => String(j.serviceLine ?? "") === lt.line);
+      // Lawn done: ONLY the current round (the round sub whose seasonal window
+      // covers this month), deduped to distinct plans (customers). A plan owns
+      // several round subs, so counting sub records — or other rounds — would
+      // over-report like the monthly card did (113 vs 82 plans). Other lines
+      // already count distinct customers.
+      const lawnCurrentRound = (j: JobRec) => {
+        const start = Number(j.seasonalStartMonth);
+        const end = Number(j.seasonalEndMonth);
+        if (!j.isSeasonal || !start || !end) return true; // window-less: date rules constrain it
+        return start <= end
+          ? bounds.monthIndex >= start && bounds.monthIndex <= end
+          : bounds.monthIndex >= start || bounds.monthIndex <= end;
+      };
       const doneIn = (start: string, end: string) =>
         lt.line === "lawn"
-          ? lineJobs.filter(j =>
-              j.inScope !== false && j.pendingCancel !== true &&
-              j.subscriptionLastCompletedDate && j.subscriptionLastCompletedDate >= start && j.subscriptionLastCompletedDate <= end
-            ).length
+          ? new Set(
+              lineJobs
+                .filter(j =>
+                  j.inScope !== false && j.pendingCancel !== true && lawnCurrentRound(j) &&
+                  j.subscriptionLastCompletedDate && j.subscriptionLastCompletedDate >= start && j.subscriptionLastCompletedDate <= end
+                )
+                .map(j => String(j.customerId || j.docId || ""))
+            ).size
           : monthlyServiced(lineJobs, start, end);
       lineWeekDay[lt.line] = {
         weekTarget: Math.round(lt.target / 4),

@@ -19,6 +19,7 @@ export interface JobLike {
   scheduledDate?: string; // next service date (YYYY-MM-DD)
   subscriptionLastCompletedDate?: string; // last completed date (YYYY-MM-DD)
   customerId?: string;
+  subscriptionId?: string; // fallback dedupe key when customerId is absent
   inScope?: boolean;
   pendingCancel?: boolean;
   frequency?: number; // raw service interval in days
@@ -323,26 +324,27 @@ export function isTrackedServiceLine(line: string): boolean {
 }
 
 /**
- * Lawn target/done for a specific month, counted DIRECTLY from the round
- * subscriptions rather than the seasonality-rate formula. Lawn is a 7-round
- * program where each customer's round is due inside its real cycle window
- * (synced from FieldRoutes' servicePlanRound resource), so "how many rounds
- * belong to this month" is the honest count:
- *   done   = round subs COMPLETED this month (lastCompleted in [monthStart, today])
- *   left   = round subs still DUE by month end whose WINDOW includes this month
- *   target = done + left
- * Two guards keep the number honest (a July target once read 181 against ~82
- * active plans without them):
- *   - WINDOW GATE: a round only counts as due in a month its actual window
- *     covers. FieldRoutes nextService dates drift (last year's completion +
- *     interval), so a Round 5 could claim a July due date while its real window
- *     is Aug 1 – Sep 15 — those must not inflate July.
- *   - OVERDUE SPILLOVER: within the window, a round due earlier in the window
- *     but not yet completed is still this month's work (an unserviced June
- *     Round 4 is July work, not silently dropped). Docs with NO stamped window
- *     get the strict in-month rule — otherwise skipped rounds from earlier in
- *     the year would pile onto every later month forever.
- * Counts subscriptions (each round is its own sub), not distinct customers.
+ * Lawn target/done for a specific month. Owner's rule: for lawn, count ONLY the
+ * CURRENT ROUND, and only the part of it that belongs to THIS month. Lawn is a
+ * 7-round program and FieldRoutes models EACH round as its own subscription, so
+ * one plan (customer) owns several round sub-records at once — the "current
+ * round" for a plan in a given month is the round sub whose seasonal window
+ * covers that month (Round 4's window covers July; Round 5's is Aug 1 – Sep 15).
+ *
+ * Counted as DISTINCT PLANS (customers) — the unit the owner counts in ("82
+ * lawn service plans") — so a plan can't be counted twice (e.g. its Round 4
+ * completed AND its Round 5 next-service date drifted into July, which pushed
+ * July to 113 against 82 plans). Both passes are gated to the current round:
+ *   done = plans whose CURRENT-ROUND visit completed this month
+ *   left = plans (not already done) whose CURRENT-ROUND visit is still due this
+ *          month (incl. overdue-but-in-window spillover — an unserviced June
+ *          Round 4 is still July work)
+ *   target = done + left  (≤ active plan count)
+ *
+ * "Current round" = the round sub whose stamped window covers this month
+ * (activeInMonth). Windows come from FieldRoutes' servicePlanRound resource.
+ * A round with NO stamped window falls back to a strict in-month rule (due date
+ * within this month) so dead earlier-year rounds don't pile onto later months.
  */
 function lawnMonthTargetDone(
   lawnJobs: JobLike[],
@@ -351,28 +353,40 @@ function lawnMonthTargetDone(
   monthEnd: string,
   today: string,
 ): { target: number; done: number } {
-  let done = 0;
-  let due = 0;
+  const planKey = (j: JobLike) => String(j.customerId || j.subscriptionId || "");
+  // Is this round sub the plan's CURRENT round for this month? A stamped window
+  // must cover the month; a window-less sub can't be gated so it passes here and
+  // is constrained by the date rules in each pass instead.
+  const isCurrentRound = (j: JobLike) => {
+    const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
+    return !hasWindow || activeInMonth(j, month);
+  };
+  const donePlans = new Set<string>();
+  const duePlans = new Set<string>();
+  // Pass 1: plans whose current-round visit completed this month.
   for (const j of lawnJobs) {
     if (j.inScope === false || j.pendingCancel === true) continue;
+    if (!isCurrentRound(j)) continue;
     const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) {
-      done++;
-      continue;
-    }
+    if (lc && lc >= monthStart && lc <= today) donePlans.add(planKey(j));
+  }
+  // Pass 2: plans (not already done) whose current-round visit is still due this month.
+  for (const j of lawnJobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    if (!isCurrentRound(j)) continue;
+    const key = planKey(j);
+    if (donePlans.has(key)) continue; // this plan already counted as done
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && lc >= monthStart && lc <= today) continue;
     const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
-    if (hasWindow && !activeInMonth(j, month)) continue; // window gate
     const sd = j.scheduledDate;
     if (!sd || sd > monthEnd) continue; // due by end of this month
-    // Overdue spillover (due earlier but not yet serviced) only counts when the
-    // round's WINDOW covers this month — an unserviced June Round 4 is July
-    // work. A window-less lawn doc gets the strict in-month rule instead;
-    // otherwise every skipped round from earlier in the year (dead R1–R3 due
-    // dates that never completed) piles onto every later month forever.
-    if (!hasWindow && sd < monthStart) continue;
+    if (!hasWindow && sd < monthStart) continue; // strict in-month for window-less rounds
     if (lc && lc >= sd) continue; // this cycle already serviced (completed a prior month)
-    due++;
+    duePlans.add(key);
   }
+  const done = donePlans.size;
+  const due = duePlans.size;
   return { target: done + due, done };
 }
 
