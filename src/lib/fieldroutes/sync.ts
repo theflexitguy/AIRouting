@@ -128,6 +128,30 @@ interface ApptInfo {
 // for a day FieldRoutes shows as 7 non-empty routes/84 stops).
 const ROUTE_HISTORY_DAYS = 14;
 
+// Days after which a past day's route docs are LOCKED IN ("finalized"). Owner's
+// rule: 3 full days after a date, what ran is settled — so once every doc up to
+// today-3 is appointment-true AND carries a real Google drive time, the
+// finalization watermark advances (rides the daily sync; the vercel.json cron
+// fires at 9:00 UTC = 4 AM Central, i.e. the early morning of "day 4").
+// Finalized days are skipped by both the sync's trailing rebuild and the
+// on-demand range verification, so pulling a month or quarter serves straight
+// from stored route docs with ZERO FieldRoutes/Google spend. A forced range
+// re-verify remains available as the escape hatch for late edits.
+const FINALIZE_AFTER_DAYS = 3;
+
+/** Latest date (inclusive) whose route docs are locked in. "" = none yet. */
+async function loadFinalizedThrough(
+  db: FirebaseFirestore.Firestore,
+  companyId: string,
+): Promise<string> {
+  try {
+    const snap = await db.doc(`companies/${companyId}/fieldRoutesState/routeFinalization`).get();
+    return str(snap.data()?.finalizedThrough);
+  } catch {
+    return "";
+  }
+}
+
 /** ISO date shifted by `days` (negative = past). */
 function dateOffsetISO(iso: string, days: number): string {
   const d = new Date(`${iso}T00:00:00Z`);
@@ -835,12 +859,19 @@ async function reconcileScheduledRoutes(
   // completed subs drop off as they roll forward). pastAppts is the
   // non-cancelled appointment truth for the trailing ROUTE_HISTORY_DAYS through
   // today.
+  // Finalized days are settled — skip them so each sync only re-verifies the
+  // live window (finalizedThrough+1 .. today), typically ~4 days.
+  const finalizedThrough = await loadFinalizedThrough(db, companyId);
+  const rebuildStart = maxDateString(
+    dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
+    finalizedThrough ? dateOffsetISO(finalizedThrough, 1) : "",
+  );
   if (pastAppts.length > 0) {
     const rebuilt = await rebuildPastRouteWindow({
       db,
       companyId,
       pastAppts,
-      windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
+      windowStart: rebuildStart,
       windowEndExclusive: dateOffsetISO(today, 1),
       todayISO: today,
       googleBudget,
@@ -851,6 +882,45 @@ async function reconcileScheduledRoutes(
     });
     routesWritten += rebuilt.written;
     routesDeleted += rebuilt.deleted;
+  }
+
+  // Advance the finalization watermark: once every FieldRoutes-managed doc up
+  // to today-FINALIZE_AFTER_DAYS carries a real Google drive time, those days
+  // are locked in and never re-verified (or re-billed) again. Held back while
+  // any doc still awaits its Google upgrade so an estimate is never frozen —
+  // the budget prioritizes today then most-recent past, so this converges
+  // within a sync or two.
+  try {
+    const finalizeTarget = dateOffsetISO(today, -FINALIZE_AFTER_DAYS);
+    if (finalizeTarget > finalizedThrough) {
+      const checkStart = finalizedThrough
+        ? dateOffsetISO(finalizedThrough, 1)
+        : dateOffsetISO(today, -ROUTE_HISTORY_DAYS);
+      const checkSnap = await db
+        .collection(`companies/${companyId}/routes`)
+        .where("date", ">=", checkStart)
+        .where("date", "<=", finalizeTarget)
+        .get();
+      const awaitingGoogle = hasGoogleRoutesApiKey()
+        ? checkSnap.docs.filter((d) => {
+            const r = d.data();
+            return r.hasFieldRoutesStops === true && str(r.driveTimeSource) !== "routes_api_matrix";
+          }).length
+        : 0;
+      if (awaitingGoogle === 0) {
+        await db
+          .doc(`companies/${companyId}/fieldRoutesState/routeFinalization`)
+          .set({ finalizedThrough: finalizeTarget, updatedAt: now }, { merge: true });
+        console.log(`[fieldroutes/sync] routes finalized through ${finalizeTarget}`);
+      } else {
+        console.log(
+          `[fieldroutes/sync] finalization held at ${finalizedThrough || "(none)"}: ` +
+            `${awaitingGoogle} route(s) ≤ ${finalizeTarget} still awaiting Google drive times`,
+        );
+      }
+    }
+  } catch (err) {
+    console.warn("[fieldroutes/sync] finalization watermark update failed:", String(err));
   }
 
   // ── Future days: assembled from scheduled job docs. Nearest days first so
@@ -1323,12 +1393,17 @@ const MAX_RANGE_RECONCILE_DAYS = 62;
  * appointments for a PAST window and rebuild its route docs, so a custom
  * date-range view matches FieldRoutes even beyond the sync's trailing window.
  * Today/future dates are excluded (every sync reconciles them, and a raw
- * rebuild would wipe pending AI proposals on mixed routes). Metered against
- * the company's FieldRoutes budget.
+ * rebuild would wipe pending AI proposals on mixed routes). Days at or before
+ * the finalization watermark are settled — appointment set, per-stop
+ * completion, and Google drive times are already stored on their route docs —
+ * so they're skipped entirely (a fully finalized range costs ZERO API reads).
+ * Pass force=true to re-verify finalized days anyway (late FieldRoutes edits).
+ * Metered against the company's FieldRoutes budget.
  */
 export async function reconcileRouteRange(
   startDate: string,
   endDate: string,
+  opts: { force?: boolean } = {},
 ): Promise<{
   companyId: string;
   windowStart: string;
@@ -1349,6 +1424,25 @@ export async function reconcileRouteRange(
   let windowStart = startDate;
   const minStart = dateOffsetISO(endExclusive, -MAX_RANGE_RECONCILE_DAYS);
   if (windowStart < minStart) windowStart = minStart;
+  if (!opts.force) {
+    const finalizedThrough = await loadFinalizedThrough(db, companyId);
+    if (finalizedThrough && windowStart <= finalizedThrough) {
+      windowStart = dateOffsetISO(finalizedThrough, 1);
+    }
+    if (!(windowStart < endExclusive)) {
+      return {
+        companyId,
+        windowStart,
+        windowEndExclusive: endExclusive,
+        appointments: 0,
+        routesWritten: 0,
+        routesDeleted: 0,
+        skipped: true,
+        reason: "range already finalized — served from stored route data",
+        apiReads: 0,
+      };
+    }
+  }
   const base = { companyId, windowStart, windowEndExclusive: endExclusive };
   if (!(windowStart < endExclusive)) {
     return { ...base, appointments: 0, routesWritten: 0, routesDeleted: 0, skipped: true, reason: "no past days in range", apiReads: 0 };
