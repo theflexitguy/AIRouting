@@ -7,6 +7,8 @@ import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { TopBar } from "@/components/layout/TopBar";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Badge } from "@/components/ui/badge";
 import { SkeletonCard, SkeletonChart } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
@@ -130,20 +132,33 @@ interface DashboardStats {
 }
 
 // Raw doc shapes the dashboard fetches once, then filters/derives client-side.
+interface RouteStopDetail {
+  id: string;
+  customerName?: string;
+  value?: number;
+  completed?: boolean; // stamped by the historical reconcile (appointment status 1)
+}
 interface RouteRec extends RouteLike {
   date: string;
   techId?: string;
   techName?: string;
   routeGroupTitle?: string;
+  routeTemplateTitle?: string; // FieldRoutes route template ("Regular", "Rain Day", …)
   routeValue?: number;
   completedStops?: number; // stamped by the historical reconcile (appointment status 1)
+  stopSequence?: string[];
+  stops?: RouteStopDetail[]; // light per-stop detail persisted by the sync/reconcile
 }
 interface JobRec extends JobLike {
+  docId?: string; // Firestore doc id (sub_<subscriptionId>), stamped at load
   status?: string;
   overdueActionable?: boolean;
   serviceType?: string;
   fieldRoutesRouteGroup?: string;
+  fieldRoutesRouteTemplate?: string;
   scheduledTech?: string; // FieldRoutes tech name on the booked appointment
+  customerName?: string;
+  address?: string;
 }
 interface TechOption {
   id: string;
@@ -221,6 +236,7 @@ export default function DashboardPage() {
   const [dateTo, setDateTo] = useState(today);
   const [filterTech, setFilterTech] = useState("all");
   const [filterGroup, setFilterGroup] = useState("all");
+  const [filterTemplate, setFilterTemplate] = useState("all");
   const [rangeRoutes, setRangeRoutes] = useState<RouteRec[] | null>(null);
   // Custom-range extras: bump to re-fetch after a live FieldRoutes verification,
   // in-flight indicator for that verification, and the skip-weekends toggle.
@@ -267,6 +283,7 @@ export default function DashboardPage() {
       // the per-line targets populate without waiting on a full re-sync.
       setRawJobs(jobsSnap.docs.map(d => {
         const data = d.data() as JobRec;
+        data.docId = d.id; // lets drill-downs join route stopSequence ids back to jobs
         if (!data.serviceLine) {
           data.serviceLine = deriveServiceLine(data.serviceType, data.fieldRoutesRouteGroup);
         }
@@ -452,9 +469,21 @@ export default function DashboardPage() {
     return new Set([t?.id, t?.name, t?.employeeId, t?.fieldRoutesEmployeeId, t?.fieldRoutesTechId].map(norm).filter(Boolean));
   }, [filterTech, techs]);
 
-  const filtersActive = dateFilterEnabled || filterTech !== "all" || filterGroup !== "all";
+  const filtersActive = dateFilterEnabled || filterTech !== "all" || filterGroup !== "all" || filterTemplate !== "all";
 
-  // Apply technician + route-group filters to a set of routes.
+  // Route Template options: distinct template titles across every route loaded
+  // (8-week window + custom range), synced from FieldRoutes route.title —
+  // "Regular", "Rain Day", "Early Release", "Requested Off", "Call In", ….
+  const templateOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const r of [...rawRoutes, ...(rangeRoutes ?? [])]) {
+      const t = String(r.routeTemplateTitle || "").trim();
+      if (t) set.add(t);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [rawRoutes, rangeRoutes]);
+
+  // Apply technician + route-group + route-template filters to a set of routes.
   const filterRoutes = useMemo(() => {
     return (routes: RouteRec[]) => routes.filter(r => {
       // A route with no stops is a phantom (its underlying job docs were purged
@@ -463,20 +492,30 @@ export default function DashboardPage() {
       // Match on the canonical bucket so every FieldRoutes spelling variant of a
       // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
       if (filterGroup !== "all" && canonicalRouteGroup(String(r.routeGroupTitle || "")) !== filterGroup) return false;
+      if (filterTemplate !== "all" && String(r.routeTemplateTitle || "").trim() !== filterTemplate) return false;
       if (!routeMatchesTech(r, techKeys)) return false;
       return true;
     });
-  }, [filterGroup, techKeys]);
+  }, [filterGroup, filterTemplate, techKeys]);
 
-  const stats: DashboardStats = useMemo(() => {
-    // Route set for the "Today" cards: the custom range when the date filter is
-    // on, otherwise today's routes. KPIs use this week's routes (or the range).
-    // Custom range with "skip weekends" on: Sat/Sun routes drop out of every
-    // range-derived number (stops, drive, value, KPIs).
+  // Route set for the "Today" cards: the custom range when the date filter is
+  // on, otherwise today's routes. Shared with the metric drill-downs so a
+  // card's number and its detail list always come from the same route set.
+  // Custom range with "skip weekends" on: Sat/Sun routes drop out of every
+  // range-derived number (stops, drive, value, KPIs).
+  const scopedRoutes = useMemo(() => {
     const rangeSet = dateFilterEnabled
       ? (excludeWeekends ? (rangeRoutes ?? []).filter(r => !isWeekendISO(String(r.date))) : (rangeRoutes ?? []))
       : null;
-    const todaySet = filterRoutes(rangeSet ?? rawRoutes.filter(r => r.date === today));
+    return filterRoutes(rangeSet ?? rawRoutes.filter(r => r.date === today));
+  }, [dateFilterEnabled, excludeWeekends, rangeRoutes, rawRoutes, filterRoutes, today]);
+
+  const stats: DashboardStats = useMemo(() => {
+    // KPIs use this week's routes (or the custom range).
+    const rangeSet = dateFilterEnabled
+      ? (excludeWeekends ? (rangeRoutes ?? []).filter(r => !isWeekendISO(String(r.date))) : (rangeRoutes ?? []))
+      : null;
+    const todaySet = scopedRoutes;
     const kpiSet = filterRoutes(
       rangeSet ?? rawRoutes.filter(r => r.date >= bounds.weekStart && r.date <= bounds.weekEnd)
     );
@@ -490,6 +529,7 @@ export default function DashboardPage() {
     // scheduled tech name + route group). Freshness is bounded by the last sync.
     const jobInFilterScope = (j: JobRec) => {
       if (filterGroup !== "all" && canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")) !== filterGroup) return false;
+      if (filterTemplate !== "all" && String(j.fieldRoutesRouteTemplate || "").trim() !== filterTemplate) return false;
       if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
       return true;
     };
@@ -505,16 +545,20 @@ export default function DashboardPage() {
       : completedToday;
 
     // Work still sitting on routes: future days count whole, today counts booked
-    // minus what's already been completed (as of the last sync). Past days are
-    // history, not remaining work.
+    // minus what's already been completed (as of the last sync), and PAST days
+    // count each route's booked-minus-completed remainder (completedStops is
+    // stamped from actual appointment statuses by the reconcile) — so a 68-stop
+    // day with 65 done shows 3 remaining, not 0.
     const stopsStillToDo = (routes: RouteRec[]): number => {
+      let past = 0;
       let future = 0;
       let todayBooked = 0;
       for (const r of routes) {
         if (r.date > today) future += r.totalStops || 0;
         else if (r.date === today) todayBooked += r.totalStops || 0;
+        else past += Math.max(0, (r.totalStops || 0) - (Number(r.completedStops) || 0));
       }
-      return future + Math.max(0, todayBooked - completedToday);
+      return past + future + Math.max(0, todayBooked - completedToday);
     };
     const stopsLeftToday = stopsStillToDo(todaySet);
     const stopsLeftWeek = stopsStillToDo(kpiSet);
@@ -616,7 +660,94 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroup, techKeys, bounds, today]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroup, filterTemplate, techKeys, bounds, today, scopedRoutes]);
+
+  // ── Metric drill-downs ──────────────────────────────────────────────────
+  // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
+  // view of the exact routes/stops behind that number.
+  const [drill, setDrill] = useState<"routes" | "stops" | "completed" | "remaining" | null>(null);
+
+  // Join route stopSequence ids (sub_<subscriptionId> / appt_<id>) back to job
+  // docs for customer id / service type / today's completion state.
+  const jobsByDocId = useMemo(() => {
+    const m = new Map<string, JobRec>();
+    for (const j of rawJobs) if (j.docId) m.set(j.docId, j);
+    return m;
+  }, [rawJobs]);
+
+  const drillData = useMemo(() => {
+    const routes = [...scopedRoutes].sort(
+      (a, b) => a.date.localeCompare(b.date) || String(a.techName || "").localeCompare(String(b.techName || ""))
+    );
+
+    interface StopRow {
+      key: string;
+      customerId: string;
+      customerName: string;
+      techName: string;
+      date: string;
+      template: string;
+      group: string;
+      serviceType: string;
+      address: string;
+      status: "completed" | "pending" | "scheduled" | "unknown";
+    }
+    const stopRows: StopRow[] = [];
+    const routeRows = routes.map((r) => {
+      const seq: string[] = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
+      const detailById = new Map((Array.isArray(r.stops) ? r.stops : []).map((s) => [String(s.id), s]));
+      let liveCompleted = 0;
+      for (const id of seq) {
+        const detail = detailById.get(id);
+        const job = jobsByDocId.get(id);
+        let status: StopRow["status"];
+        if (r.date > today) status = "scheduled";
+        else if (r.date === today) {
+          status = job?.subscriptionLastCompletedDate === today ? "completed" : "pending";
+        } else {
+          // Past day: per-stop truth stamped by the reconcile. Older docs may
+          // predate the stops array — status unknown until the next sync.
+          status = detail ? (detail.completed ? "completed" : "pending") : "unknown";
+        }
+        if (status === "completed") liveCompleted++;
+        stopRows.push({
+          key: `${r.date}-${String(r.techId || r.techName)}-${id}`,
+          customerId: String(job?.customerId || ""),
+          customerName: String(detail?.customerName || job?.customerName || id),
+          techName: String(r.techName || r.techId || "—"),
+          date: r.date,
+          template: String(r.routeTemplateTitle || "").trim(),
+          group: String(r.routeGroupTitle || "").trim(),
+          serviceType: String(job?.serviceType || ""),
+          address: String(job?.address || ""),
+          status,
+        });
+      }
+      // Completed on the route card: past days trust the reconcile-stamped
+      // count (covers stops whose per-stop detail predates the field), live
+      // days count from job completions.
+      const completed = r.date < today ? (Number(r.completedStops) || 0) : liveCompleted;
+      return {
+        key: `${r.date}-${String(r.techId || r.techName)}`,
+        date: r.date,
+        techName: String(r.techName || r.techId || "—"),
+        template: String(r.routeTemplateTitle || "").trim(),
+        group: String(r.routeGroupTitle || "").trim(),
+        totalStops: r.totalStops || 0,
+        completed,
+        driveMinutes: Number(r.totalDriveTimeMinutes) || 0,
+        routeValue: Number(r.routeValue) || 0,
+      };
+    });
+
+    return {
+      routeRows,
+      stopRows,
+      completedRows: stopRows.filter((s) => s.status === "completed"),
+      remainingRows: stopRows.filter((s) => s.status === "pending" || s.status === "scheduled"),
+      hasUnknown: stopRows.some((s) => s.status === "unknown"),
+    };
+  }, [scopedRoutes, jobsByDocId, today]);
 
   // Historical period view (null for the current month, which uses the live cards).
   const periodView = useMemo(() => {
@@ -675,12 +806,17 @@ export default function DashboardPage() {
   const kpiWindowLabel = dateFilterEnabled ? "Selected range" : "This Week";
   const fmt1 = (v: number | null) => (v === null ? "—" : v.toFixed(1));
 
-  // TODAY cards (route-derived; respect the filters).
-  const todayCards = [
-    { title: "Routes", value: String(stats.todayRoutes), subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
-    { title: "Total Stops", value: String(stats.totalStops), subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
-    { title: "Completed", value: String(stats.completedInScope), subtitle: dateFilterEnabled ? `${routeWindowLabel} · completed stops` : "today · as of last sync", icon: CheckCircle2, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
-    { title: "Stops Remaining", value: String(stats.stopsLeftToday), subtitle: `${routeWindowLabel} · still on routes`, icon: ListTodo, color: "text-sky-400", bgColor: "bg-sky-500/10" },
+  // TODAY cards (route-derived; respect the filters). Cards with a `drill` key
+  // open an audit view of the routes/stops behind the number.
+  const todayCards: Array<{
+    title: string; value: string; subtitle: string;
+    icon: typeof Route; color: string; bgColor: string;
+    drill?: "routes" | "stops" | "completed" | "remaining";
+  }> = [
+    { title: "Routes", value: String(stats.todayRoutes), subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10", drill: "routes" },
+    { title: "Total Stops", value: String(stats.totalStops), subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10", drill: "stops" },
+    { title: "Completed", value: String(stats.completedInScope), subtitle: dateFilterEnabled ? `${routeWindowLabel} · completed stops` : "today · as of last sync", icon: CheckCircle2, color: "text-emerald-400", bgColor: "bg-emerald-500/10", drill: "completed" },
+    { title: "Stops Remaining", value: String(stats.stopsLeftToday), subtitle: `${routeWindowLabel} · still on routes`, icon: ListTodo, color: "text-sky-400", bgColor: "bg-sky-500/10", drill: "remaining" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
     { title: "Avg Route Value", value: formatCurrency(stats.avgRouteValue), subtitle: `${routeWindowLabel} · per route`, icon: TrendingUp, color: "text-teal-400", bgColor: "bg-teal-500/10" },
@@ -751,11 +887,18 @@ export default function DashboardPage() {
                     {groupOptions.map(g => <SelectItem key={g} value={g}>{g}</SelectItem>)}
                   </SelectContent>
                 </Select>
+                <Select value={filterTemplate} onValueChange={setFilterTemplate}>
+                  <SelectTrigger className="w-full sm:w-44 h-8 text-xs"><SelectValue placeholder="Route template" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All Route Templates</SelectItem>
+                    {templateOptions.map(t => <SelectItem key={t} value={t}>{t}</SelectItem>)}
+                  </SelectContent>
+                </Select>
                 {filtersActive && (
                   <button
                     type="button"
                     className="text-xs text-muted-foreground/60 hover:text-foreground underline underline-offset-2 ml-auto"
-                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTech("all"); setFilterGroup("all"); }}
+                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTech("all"); setFilterGroup("all"); setFilterTemplate("all"); }}
                   >
                     Clear filters
                   </button>
@@ -774,13 +917,20 @@ export default function DashboardPage() {
               {todayCards.map((stat, i) => {
                 const Icon = stat.icon;
                 return (
-                  <Card key={stat.title} className={`border-border/40 animate-fade-in stagger-${i + 1}`}>
+                  <Card
+                    key={stat.title}
+                    className={`border-border/40 animate-fade-in stagger-${i + 1} ${stat.drill ? "cursor-pointer transition-colors hover:border-blue-500/40 hover:bg-accent/20" : ""}`}
+                    onClick={stat.drill ? () => setDrill(stat.drill!) : undefined}
+                    role={stat.drill ? "button" : undefined}
+                    tabIndex={stat.drill ? 0 : undefined}
+                    onKeyDown={stat.drill ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setDrill(stat.drill!); } } : undefined}
+                  >
                     <CardContent className="p-5">
                       <div className="flex items-start justify-between">
                         <div className="space-y-1">
                           <p className="text-[13px] text-muted-foreground font-medium">{stat.title}</p>
                           <p className="text-2xl font-bold text-foreground tracking-tight">{stat.value}</p>
-                          <p className="text-xs text-muted-foreground/70">{stat.subtitle}</p>
+                          <p className="text-xs text-muted-foreground/70">{stat.subtitle}{stat.drill ? " · click to audit" : ""}</p>
                         </div>
                         <div className={`p-2 rounded-lg ${stat.bgColor} ${stat.color}`}>
                           <Icon className="w-4 h-4" />
@@ -791,6 +941,115 @@ export default function DashboardPage() {
                 );
               })}
             </div>
+
+            {/* METRIC DRILL-DOWN — audit view of the routes/stops behind a card */}
+            <Dialog open={drill !== null} onOpenChange={(open) => { if (!open) setDrill(null); }}>
+              <DialogContent className="max-w-5xl">
+                <DialogHeader>
+                  <DialogTitle>
+                    {drill === "routes" && `Routes (${drillData.routeRows.length})`}
+                    {drill === "stops" && `Total Stops (${drillData.stopRows.length})`}
+                    {drill === "completed" && `Completed Stops (${drillData.completedRows.length})`}
+                    {drill === "remaining" && `Stops Remaining (${drillData.remainingRows.length})`}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {routeWindowLabel}
+                    {dateFilterEnabled ? ` · ${dateFrom} to ${dateTo}` : ` · ${today}`}
+                    {filterTech !== "all" ? ` · ${techs.find(t => t.id === filterTech)?.name || filterTech}` : ""}
+                    {filterGroup !== "all" ? ` · ${filterGroup}` : ""}
+                    {filterTemplate !== "all" ? ` · ${filterTemplate}` : ""}
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="max-h-[65vh] overflow-y-auto">
+                  {drill === "routes" ? (
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-background">
+                        <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                          <th className="py-2 pr-4 font-medium">Date</th>
+                          <th className="py-2 pr-4 font-medium">Technician</th>
+                          <th className="py-2 pr-4 font-medium">Template</th>
+                          <th className="py-2 pr-4 font-medium">Group</th>
+                          <th className="py-2 pr-4 font-medium text-right">Completed</th>
+                          <th className="py-2 pr-4 font-medium text-right">Stops</th>
+                          <th className="py-2 pr-4 font-medium text-right">Drive</th>
+                          <th className="py-2 font-medium text-right">Route Value</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {drillData.routeRows.map((r) => (
+                          <tr key={r.key} className="border-b border-border/20 last:border-0">
+                            <td className="py-2 pr-4 text-foreground whitespace-nowrap">{r.date}</td>
+                            <td className="py-2 pr-4 text-foreground">{r.techName}</td>
+                            <td className="py-2 pr-4">
+                              {r.template
+                                ? <Badge variant="secondary" className="font-medium">{r.template}</Badge>
+                                : <span className="text-muted-foreground/40">—</span>}
+                            </td>
+                            <td className="py-2 pr-4 text-muted-foreground">{r.group || "—"}</td>
+                            <td className={`py-2 pr-4 text-right tabular-nums ${r.completed >= r.totalStops ? "text-emerald-400" : "text-foreground"}`}>{r.completed}</td>
+                            <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{r.totalStops}</td>
+                            <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{formatTime(r.driveMinutes)}</td>
+                            <td className="py-2 text-right tabular-nums text-foreground">{formatCurrency(r.routeValue)}</td>
+                          </tr>
+                        ))}
+                        {drillData.routeRows.length === 0 && (
+                          <tr><td colSpan={8} className="py-6 text-center text-muted-foreground/60 text-sm">No routes in this view.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  ) : (
+                    (() => {
+                      const rows = drill === "completed" ? drillData.completedRows
+                        : drill === "remaining" ? drillData.remainingRows
+                        : drillData.stopRows;
+                      return (
+                        <table className="w-full text-sm">
+                          <thead className="sticky top-0 bg-background">
+                            <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                              <th className="py-2 pr-4 font-medium">Customer ID</th>
+                              <th className="py-2 pr-4 font-medium">Customer</th>
+                              <th className="py-2 pr-4 font-medium">Route</th>
+                              <th className="py-2 pr-4 font-medium">Service</th>
+                              <th className="py-2 pr-4 font-medium">Template</th>
+                              <th className="py-2 font-medium">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rows.map((s) => (
+                              <tr key={s.key} className="border-b border-border/20 last:border-0">
+                                <td className="py-2 pr-4 tabular-nums text-muted-foreground whitespace-nowrap">{s.customerId || "—"}</td>
+                                <td className="py-2 pr-4">
+                                  <p className="text-foreground font-medium">{s.customerName}</p>
+                                  {s.address && <p className="text-xs text-muted-foreground/60 truncate max-w-[240px]">{s.address}</p>}
+                                </td>
+                                <td className="py-2 pr-4 text-muted-foreground whitespace-nowrap">{s.techName} · {s.date}</td>
+                                <td className="py-2 pr-4 text-muted-foreground">{s.serviceType || "—"}</td>
+                                <td className="py-2 pr-4 text-muted-foreground">{s.template || "—"}</td>
+                                <td className="py-2">
+                                  {s.status === "completed" && <Badge variant="success">Completed</Badge>}
+                                  {s.status === "pending" && <Badge variant="warning">Not completed</Badge>}
+                                  {s.status === "scheduled" && <Badge variant="secondary">Scheduled</Badge>}
+                                  {s.status === "unknown" && <Badge variant="outline">—</Badge>}
+                                </td>
+                              </tr>
+                            ))}
+                            {rows.length === 0 && (
+                              <tr><td colSpan={6} className="py-6 text-center text-muted-foreground/60 text-sm">No stops in this view.</td></tr>
+                            )}
+                          </tbody>
+                        </table>
+                      );
+                    })()
+                  )}
+                </div>
+                {drill !== "routes" && drillData.hasUnknown && (
+                  <p className="text-xs text-muted-foreground/50">
+                    Some past stops don&apos;t have per-stop completion detail yet — re-pick the date range (or run a sync)
+                    to verify them against FieldRoutes.
+                  </p>
+                )}
+              </DialogContent>
+            </Dialog>
 
             {/* OVERDUE STOPS — its own thing (company-wide) */}
             <Card className="border-red-500/30 bg-red-500/[0.04] animate-fade-in">
