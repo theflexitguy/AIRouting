@@ -148,6 +148,7 @@ interface RouteRec extends RouteLike {
   completedStops?: number; // stamped by the historical reconcile (appointment status 1)
   stopSequence?: string[];
   stops?: RouteStopDetail[]; // light per-stop detail persisted by the sync/reconcile
+  driveTimeSource?: string; // "routes_api_matrix" = real Google drive time, else straight-line estimate
 }
 interface JobRec extends JobLike {
   docId?: string; // Firestore doc id (sub_<subscriptionId>), stamped at load
@@ -821,6 +822,7 @@ export default function DashboardPage() {
         totalStops: r.totalStops || 0,
         completed,
         driveMinutes: Number(r.totalDriveTimeMinutes) || 0,
+        driveEstimated: String(r.driveTimeSource || "") !== "routes_api_matrix",
         routeValue: Number(r.routeValue) || 0,
       };
     });
@@ -831,6 +833,7 @@ export default function DashboardPage() {
       completedRows: stopRows.filter((s) => s.status === "completed"),
       remainingRows: stopRows.filter((s) => s.status === "pending" || s.status === "scheduled"),
       hasUnknown: stopRows.some((s) => s.status === "unknown"),
+      hasEstimatedDrive: routeRows.some((r) => r.driveEstimated),
     };
   }, [scopedRoutes, jobsByDocId, today]);
 
@@ -1081,7 +1084,10 @@ export default function DashboardPage() {
                             <td className="py-2 pr-4 text-muted-foreground">{r.group || "—"}</td>
                             <td className={`py-2 pr-4 text-right tabular-nums ${r.completed >= r.totalStops ? "text-emerald-400" : "text-foreground"}`}>{r.completed}</td>
                             <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{r.totalStops}</td>
-                            <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{formatTime(r.driveMinutes)}</td>
+                            <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground whitespace-nowrap">
+                              {r.driveEstimated ? "~" : ""}{formatTime(r.driveMinutes)}
+                              {r.driveEstimated && <span className="ml-1 text-[10px] text-amber-400/80 align-middle" title="Straight-line estimate — real Google drive time lands on the next sync">est</span>}
+                            </td>
                             <td className="py-2 text-right tabular-nums text-foreground">{formatCurrency(r.routeValue)}</td>
                           </tr>
                         ))}
@@ -1139,6 +1145,12 @@ export default function DashboardPage() {
                   <p className="text-xs text-muted-foreground/50">
                     Some past stops don&apos;t have per-stop completion detail yet — re-pick the date range (or run a sync)
                     to verify them against FieldRoutes.
+                  </p>
+                )}
+                {drill === "routes" && drillData.hasEstimatedDrive && (
+                  <p className="text-xs text-muted-foreground/50">
+                    <span className="text-amber-400/80">~est</span> drive times are straight-line estimates — real Google
+                    drive times replace them on the next sync (today&apos;s routes are upgraded first).
                   </p>
                 )}
               </DialogContent>

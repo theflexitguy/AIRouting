@@ -821,12 +821,45 @@ async function reconcileScheduledRoutes(
     }
   };
 
-  // One Google-matrix allowance shared by the forward pass and the
-  // appointment-window rebuild, so the whole reconciliation stays bounded.
+  // One Google-matrix allowance shared by the appointment-window rebuild and
+  // the forward pass, so the whole reconciliation stays bounded.
   const googleBudget: GoogleDriveBudget = { remaining: GOOGLE_MATRIX_PER_SYNC_RUN };
 
+  // ── Appointment window FIRST: rewrite PAST + TODAY route docs from actual
+  // appointments. Runs BEFORE the future-days pass so TODAY gets first claim on
+  // the Google drive-time budget — the other way round, dozens of future docs
+  // drained the allowance and today (the day being dispatched and audited)
+  // stayed on straight-line estimates. Past days used to freeze at whatever the
+  // schedule looked like when last synced; TODAY used to be assembled from job
+  // docs, which undercounts (same-day pairs collapse, standalones vanish,
+  // completed subs drop off as they roll forward). pastAppts is the
+  // non-cancelled appointment truth for the trailing ROUTE_HISTORY_DAYS through
+  // today.
+  if (pastAppts.length > 0) {
+    const rebuilt = await rebuildPastRouteWindow({
+      db,
+      companyId,
+      pastAppts,
+      windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
+      windowEndExclusive: dateOffsetISO(today, 1),
+      todayISO: today,
+      googleBudget,
+      now,
+      empNames,
+      resolveTechEmpId: (empId) =>
+        empToTech.get(empId) || nameToTech.get(normName(empNames[empId] || "")) || "",
+    });
+    routesWritten += rebuilt.written;
+    routesDeleted += rebuilt.deleted;
+  }
+
+  // ── Future days: assembled from scheduled job docs. Nearest days first so
+  // whatever Google budget remains lands on tomorrow before day 13.
+  const orderedGroups = Array.from(groups.entries()).sort((a, b) =>
+    a[1].date.localeCompare(b[1].date),
+  );
   const handledSlots = new Set<string>();
-  for (const [key, group] of groups) {
+  for (const [key, group] of orderedGroups) {
     handledSlots.add(key);
     const orderedJobs = group.jobs
       .slice()
@@ -973,30 +1006,6 @@ async function reconcileScheduledRoutes(
 
   await commit();
 
-  // ── Appointment window: rewrite PAST + TODAY route docs from actual
-  // appointments. Past days used to freeze at whatever the schedule looked like
-  // when last synced; TODAY used to be assembled from job docs, which undercounts
-  // (same-day pairs collapse, standalones vanish, completed subs drop off as they
-  // roll forward). pastAppts is the non-cancelled appointment truth for the
-  // trailing ROUTE_HISTORY_DAYS through today.
-  if (pastAppts.length > 0) {
-    const rebuilt = await rebuildPastRouteWindow({
-      db,
-      companyId,
-      pastAppts,
-      windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
-      windowEndExclusive: dateOffsetISO(today, 1),
-      todayISO: today,
-      googleBudget,
-      now,
-      empNames,
-      resolveTechEmpId: (empId) =>
-        empToTech.get(empId) || nameToTech.get(normName(empNames[empId] || "")) || "",
-    });
-    routesWritten += rebuilt.written;
-    routesDeleted += rebuilt.deleted;
-  }
-
   return { routesWritten, routesDeleted, techsLinked: empToTech.size };
 }
 
@@ -1087,8 +1096,13 @@ async function rebuildPastRouteWindow({
     });
   }
 
+  // TODAY first, then most-recent past — so the Google drive-time budget lands
+  // on the day being dispatched before it's spent on history.
+  const orderedPastGroups = Array.from(pastGroups.entries()).sort(
+    (a, b) => b[1].date.localeCompare(a[1].date),
+  );
   const handledPast = new Set<string>();
-  for (const [key, group] of pastGroups) {
+  for (const [key, group] of orderedPastGroups) {
     handledPast.add(key);
     // EVERY appointment is a stop — FieldRoutes counts appointments, and a
     // customer visited twice in one day (service + same-day reservice on the
