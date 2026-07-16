@@ -78,8 +78,11 @@ async function loadRoutingConfig(
 export type SyncMode = "full" | "incremental";
 
 // Stop starting new batches once we cross this; leaves headroom under the
-// 60s function cap for the final Firestore flush and the HTTP response.
-const SOFT_DEADLINE_MS = 45_000;
+// 120s function cap (sync/manual-sync routes) for route reconciliation
+// (including the Google drive-time upgrade pass) and, for manual syncs, the
+// post-sync cleanup steps that run in the same invocation (reconcile active
+// subs, purge inactive customers/non-recurring, recompute past-due).
+const SOFT_DEADLINE_MS = 85_000;
 // Subscriptions per batch. One subscription `get` + one customer `get` per
 // batch (both <= 1000-entity cap), so a batch costs ~2 throttled requests.
 const BATCH_SUBS = 250;
@@ -266,18 +269,23 @@ function haversineRouteMetrics(
 }
 
 /**
- * Per-run allowance of Google matrix computations. The sync endpoints run under
- * maxDuration=60s and the route reconciliation happens INSIDE that budget — an
- * unbounded "upgrade every doc" pass (100+ matrix calls on first deploy) blew
- * straight past it and the whole sync 504ed ("Sync failed. Check your
- * connection."). Capping per run keeps each sync comfortably inside its time
- * box; the remaining docs upgrade progressively on subsequent syncs because
- * their driveTimeSource stays "haversine_fallback".
+ * Per-run allowance of Google matrix computations. Route reconciliation happens
+ * INSIDE the sync function's time budget — an unbounded "upgrade every doc"
+ * pass (100+ matrix calls) blew straight past the (then 60s) cap and the whole
+ * sync 504ed ("Sync failed. Check your connection."). sync/manual-sync now run
+ * at maxDuration=120 with a SOFT_DEADLINE_MS of 85s for the subscription loop,
+ * leaving ~35s for reconciliation + (for manual syncs) the post-sync cleanup
+ * steps — comfortable room for this many sequential calls even at the 8s
+ * per-call timeout's worst case; real Google Routes Matrix calls typically
+ * return in well under a second. Any docs beyond this budget upgrade
+ * progressively on the NEXT sync (their driveTimeSource stays
+ * "haversine_fallback" until then) — and a sync fires automatically once daily
+ * via the cron in vercel.json regardless of manual syncs.
  */
 interface GoogleDriveBudget {
   remaining: number;
 }
-const GOOGLE_MATRIX_PER_SYNC_RUN = 12;
+const GOOGLE_MATRIX_PER_SYNC_RUN = 30;
 const GOOGLE_MATRIX_CALL_TIMEOUT_MS = 8_000;
 
 /**
