@@ -176,10 +176,62 @@ interface PastAppt {
   routeTemplate: string;
   duration: number;
   status: number;
+  customerId: string; // appointment.customerID — key for the coordinate fallback below
+  // Customer-record fallbacks for stops with no (or a purged) job doc —
+  // standalone reservices etc. Without coordinates those stops silently drop
+  // out of the drive-time matrix (a far-out stop once cost a route 24 real
+  // minutes), and without a name the drill-down shows a raw id.
+  lat?: number;
+  lng?: number;
+  customerName?: string;
 }
 
 function rec(value: unknown): Record<string, unknown> {
   return (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+}
+
+/**
+ * Attach customer-record coordinates + names to rebuild-window appointments.
+ * Job docs are the primary source for stop coords, but standalone appointments
+ * (no subscription) and appointments whose sub's job doc was purged have none —
+ * their stops silently dropped out of the Google drive-time legs (a far-out
+ * standalone reservice once cost a route 24 real minutes of drive). One
+ * customer `get` per ~1,000 unique ids, so this is a fixed ~1-2 API reads.
+ */
+async function enrichApptsWithCustomerCoords(
+  client: FieldRoutesClient,
+  appts: PastAppt[],
+): Promise<void> {
+  const ids = Array.from(
+    new Set(appts.map((p) => p.customerId).filter((id) => id && id !== "0")),
+  );
+  if (ids.length === 0) return;
+  try {
+    const customers = await client.getEntities("customer", ids);
+    const byId = new Map<string, { lat?: number; lng?: number; name: string }>();
+    for (const c of customers) {
+      const cr = rec(c);
+      const id = str(cr.customerID);
+      if (!id) continue;
+      const lat = Number(cr.lat);
+      const lng = Number(cr.lng);
+      byId.set(id, {
+        lat: Number.isFinite(lat) && lat !== 0 ? lat : undefined,
+        lng: Number.isFinite(lng) && lng !== 0 ? lng : undefined,
+        name: `${str(cr.fname)} ${str(cr.lname)}`.trim(),
+      });
+    }
+    for (const p of appts) {
+      const c = byId.get(p.customerId);
+      if (!c) continue;
+      p.lat = c.lat;
+      p.lng = c.lng;
+      p.customerName = c.name || undefined;
+    }
+  } catch (err) {
+    // Non-fatal: stops fall back to job-doc coords (or stay unlocated).
+    console.warn("[fieldroutes/sync] appointment customer-coord enrichment failed:", String(err));
+  }
 }
 
 function str(value: unknown): string {
@@ -334,7 +386,14 @@ async function routeMetricsWithGoogleDrive(
       Number.isFinite(s.lng) &&
       (s.lat !== 0 || s.lng !== 0),
   );
-  if (located.length < 2 || !hasGoogleRoutesApiKey() || budget.remaining <= 0) return fallback;
+  // Stamped on the doc so a later run knows when MORE stops became locatable
+  // (e.g. customer-coord fallbacks added for standalone stops) and the drive
+  // time must be recomputed — legs to unlocated stops simply don't exist in
+  // the matrix, which once undercounted a route by 24 real minutes.
+  const locatedField = { driveTimeLocatedStops: located.length };
+  if (located.length < 2 || !hasGoogleRoutesApiKey() || budget.remaining <= 0) {
+    return { ...fallback, ...locatedField };
+  }
   budget.remaining--;
   try {
     const result = await Promise.race([
@@ -360,10 +419,11 @@ async function routeMetricsWithGoogleDrive(
       driveTimeSource: "routes_api_matrix",
       polylineSource: "haversine_fallback",
       polylineStatus: "ESTIMATE_ONLY",
+      ...locatedField,
     };
   } catch (err) {
     console.warn("[fieldroutes/sync] Google drive matrix failed, using haversine:", String(err));
-    return fallback;
+    return { ...fallback, ...locatedField };
   }
 }
 
@@ -1211,9 +1271,11 @@ async function rebuildPastRouteWindow({
         id,
         start: str(p.start),
         duration: Number(j?.duration) || p.duration || 25,
-        lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
-        lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
-        customerName: str(j?.customerName) || p.subId || p.apptId,
+        // Job-doc coords first; customer-record fallback for standalone /
+        // purged-sub stops so they stay in the drive-time legs.
+        lat: typeof j?.lat === "number" ? (j.lat as number) : p.lat,
+        lng: typeof j?.lng === "number" ? (j.lng as number) : p.lng,
+        customerName: str(j?.customerName) || str(p.customerName) || p.subId || p.apptId,
         // Only the sub-linked stop carries the production value so a twice-
         // visited customer isn't double-counted in route value.
         value:
@@ -1264,7 +1326,28 @@ async function rebuildPastRouteWindow({
     const newSeq = [...frStopIds, ...preserved];
     const isPureFieldRoutes = preserved.length === 0;
 
-    if (existing && sameStopSet(prevSeq, newSeq) && !needsGoogleDriveUpgrade(existing.data, googleBudget)) {
+    // Located-stop count for the drive matrix: when it grows (customer-coord
+    // fallbacks fill in a standalone stop), the stored drive time is missing
+    // legs and must be recomputed even though the stop SET is unchanged.
+    const locatedNow = stops.filter(
+      (s) =>
+        typeof s.lat === "number" &&
+        typeof s.lng === "number" &&
+        Number.isFinite(s.lat) &&
+        Number.isFinite(s.lng) &&
+        (s.lat !== 0 || s.lng !== 0),
+    ).length;
+    const driveLegsStale =
+      googleBudget.remaining > 0 &&
+      hasGoogleRoutesApiKey() &&
+      locatedNow > num(existing?.data.driveTimeLocatedStops);
+
+    if (
+      existing &&
+      sameStopSet(prevSeq, newSeq) &&
+      !needsGoogleDriveUpgrade(existing.data, googleBudget) &&
+      !driveLegsStale
+    ) {
       // Already truthful with real drive times — keep drive/polyline. Still
       // true-up the completed count / per-stop details / template (they change
       // during the day as appointments complete; older docs predate the fields).
@@ -1500,8 +1583,12 @@ export async function reconcileRouteRange(
         routeTemplate: routeTemplateMap.get(routeId) || "",
         duration: num(ar.duration) || 25,
         status: apptStatus,
+        customerId: str(ar.customerID),
       });
     }
+    // Coordinate/name fallbacks for stops without a job doc — without them,
+    // standalone stops drop out of the drive-time legs.
+    await enrichApptsWithCustomerCoords(client, pastAppts);
   } catch (err) {
     await recordApiUsage(db, companyId, { reads: client.readCount });
     if (err instanceof FieldRoutesBudgetError) {
@@ -1827,6 +1914,7 @@ async function buildRunSetup(
         routeTemplate: routeTemplateMap.get(routeId) || "",
         duration: num(ar.duration) || 25,
         status: apptStatus,
+        customerId: str(ar.customerID),
       });
     }
     if (date < today) {
@@ -1848,6 +1936,10 @@ async function buildRunSetup(
       };
     }
   }
+
+  // Coordinate/name fallbacks for rebuild-window stops without a job doc —
+  // without them, standalone stops drop out of the drive-time legs.
+  await enrichApptsWithCustomerCoords(client, pastAppts);
 
   // Required skills per service type (e.g. Wildlife Exclusion -> "Wild Life"),
   // keyed by the normalized serviceType description — the same join key the
