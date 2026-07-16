@@ -18,7 +18,7 @@ import { reconcileRouteRange } from "@/lib/fieldroutes/sync";
 const TTL_MINUTES = 10;
 // Bump when the rebuild logic changes so a re-pick after a deploy re-verifies
 // instead of returning a result computed by the old logic.
-const REBUILD_VERSION = "v3";
+const REBUILD_VERSION = "v4";
 
 export async function POST(request: Request) {
   try {

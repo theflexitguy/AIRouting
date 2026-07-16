@@ -616,32 +616,38 @@ export default function DashboardPage() {
       if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
       return true;
     };
-    const completedToday = rawJobs.filter(
-      j => j.subscriptionLastCompletedDate === today && jobInFilterScope(j)
-    ).length;
-    // With a custom range active, "Completed" means completions IN THE RANGE —
-    // summed from the per-route completedStops the historical reconcile stamps
-    // from actual appointment statuses (today's live view keeps the job-doc
-    // based count above).
+    // Completed stops on a route: the reconcile stamps completedStops from
+    // actual appointment statuses on past AND today's docs. Docs that predate
+    // the field (or non-FieldRoutes routes) fall back to counting stops whose
+    // job doc completed on the route's date, filtered like everything else.
+    const completedOnRoute = (r: RouteRec): number => {
+      if (typeof r.completedStops === "number") return r.completedStops;
+      const seq = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
+      return seq.filter(id => {
+        const j = jobsByDocId.get(id);
+        return j && j.subscriptionLastCompletedDate === r.date && jobInFilterScope(j);
+      }).length;
+    };
+    const completedToday = todaySet
+      .filter(r => r.date === today)
+      .reduce((s, r) => s + completedOnRoute(r), 0);
+    // "Completed" card: with a custom range, completions across the whole range;
+    // otherwise today's routes — both from the same per-route appointment truth.
     const completedInScope = dateFilterEnabled
-      ? todaySet.reduce((s, r) => s + (Number(r.completedStops) || 0), 0)
+      ? todaySet.reduce((s, r) => s + completedOnRoute(r), 0)
       : completedToday;
 
-    // Work still sitting on routes: future days count whole, today counts booked
-    // minus what's already been completed (as of the last sync), and PAST days
-    // count each route's booked-minus-completed remainder (completedStops is
-    // stamped from actual appointment statuses by the reconcile) — so a 68-stop
-    // day with 65 done shows 3 remaining, not 0.
+    // Work still sitting on routes: future days count whole; today and past
+    // days count each route's booked-minus-completed remainder (appointment
+    // truth as of the last sync) — a 68-stop day with 65 done shows 3
+    // remaining, not 0, and today's count no longer shrinks as work completes.
     const stopsStillToDo = (routes: RouteRec[]): number => {
-      let past = 0;
-      let future = 0;
-      let todayBooked = 0;
+      let left = 0;
       for (const r of routes) {
-        if (r.date > today) future += r.totalStops || 0;
-        else if (r.date === today) todayBooked += r.totalStops || 0;
-        else past += Math.max(0, (r.totalStops || 0) - (Number(r.completedStops) || 0));
+        if (r.date > today) left += r.totalStops || 0;
+        else left += Math.max(0, (r.totalStops || 0) - completedOnRoute(r));
       }
-      return past + future + Math.max(0, todayBooked - completedToday);
+      return left;
     };
     const stopsLeftToday = stopsStillToDo(todaySet);
     const stopsLeftWeek = stopsStillToDo(kpiSet);
@@ -743,7 +749,7 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, techKeys, bounds, today, scopedRoutes]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, techKeys, bounds, today, scopedRoutes, jobsByDocId]);
 
   // ── Metric drill-downs ──────────────────────────────────────────────────
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
@@ -777,12 +783,16 @@ export default function DashboardPage() {
         const job = jobsByDocId.get(id);
         let status: StopRow["status"];
         if (r.date > today) status = "scheduled";
-        else if (r.date === today) {
+        else if (detail && typeof detail.completed === "boolean") {
+          // Per-stop appointment truth stamped by the reconcile — covers past
+          // days AND today (as of the last sync).
+          status = detail.completed ? "completed" : "pending";
+        } else if (r.date === today) {
+          // Today's docs that predate the appointment rebuild: job-doc fallback.
           status = job?.subscriptionLastCompletedDate === today ? "completed" : "pending";
         } else {
-          // Past day: per-stop truth stamped by the reconcile. Older docs may
-          // predate the stops array — status unknown until the next sync.
-          status = detail ? (detail.completed ? "completed" : "pending") : "unknown";
+          // Past day, doc predates the stops array — unknown until re-verified.
+          status = "unknown";
         }
         if (status === "completed") liveCompleted++;
         stopRows.push({
@@ -798,10 +808,10 @@ export default function DashboardPage() {
           status,
         });
       }
-      // Completed on the route card: past days trust the reconcile-stamped
-      // count (covers stops whose per-stop detail predates the field), live
-      // days count from job completions.
-      const completed = r.date < today ? (Number(r.completedStops) || 0) : liveCompleted;
+      // Completed on the route card: trust the reconcile-stamped count when
+      // present (past days and today alike); docs that predate the field use
+      // the per-stop tally above.
+      const completed = typeof r.completedStops === "number" ? r.completedStops : liveCompleted;
       return {
         key: `${r.date}-${String(r.techId || r.techName)}`,
         date: r.date,
