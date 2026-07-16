@@ -266,17 +266,32 @@ function haversineRouteMetrics(
 }
 
 /**
+ * Per-run allowance of Google matrix computations. The sync endpoints run under
+ * maxDuration=60s and the route reconciliation happens INSIDE that budget — an
+ * unbounded "upgrade every doc" pass (100+ matrix calls on first deploy) blew
+ * straight past it and the whole sync 504ed ("Sync failed. Check your
+ * connection."). Capping per run keeps each sync comfortably inside its time
+ * box; the remaining docs upgrade progressively on subsequent syncs because
+ * their driveTimeSource stays "haversine_fallback".
+ */
+interface GoogleDriveBudget {
+  remaining: number;
+}
+const GOOGLE_MATRIX_PER_SYNC_RUN = 12;
+const GOOGLE_MATRIX_CALL_TIMEOUT_MS = 8_000;
+
+/**
  * Route metrics with REAL drive times: Google Routes matrix over the stops that
  * carry coordinates (summing consecutive legs in stop order), haversine when
- * there's no API key / fewer than two located stops / the API fails.
- * computeRouteMatrix caches per (points, date), so unchanged routes re-synced in
- * one invocation don't re-bill. Callers only invoke this when a route's stop
- * set changed (or its drive time was never Google-computed), so quota is spent
- * roughly once per route, not per sync.
+ * there's no API key / fewer than two located stops / the API fails or times
+ * out / the per-run budget is spent. Callers only invoke this when a route's
+ * stop set changed (or its drive time was never Google-computed), so quota is
+ * spent roughly once per route, not per sync.
  */
 async function routeMetricsWithGoogleDrive(
   stops: Array<{ lat?: number; lng?: number; duration: number }>,
   routeDate: string,
+  budget: GoogleDriveBudget,
 ): Promise<Record<string, unknown>> {
   const fallback = haversineRouteMetrics(stops);
   const located = stops.filter(
@@ -287,12 +302,18 @@ async function routeMetricsWithGoogleDrive(
       Number.isFinite(s.lng) &&
       (s.lat !== 0 || s.lng !== 0),
   );
-  if (located.length < 2 || !hasGoogleRoutesApiKey()) return fallback;
+  if (located.length < 2 || !hasGoogleRoutesApiKey() || budget.remaining <= 0) return fallback;
+  budget.remaining--;
   try {
-    const result = await computeRouteMatrix(
-      located.map((s) => ({ lat: s.lat as number, lng: s.lng as number })),
-      { routeDate },
-    );
+    const result = await Promise.race([
+      computeRouteMatrix(
+        located.map((s) => ({ lat: s.lat as number, lng: s.lng as number })),
+        { routeDate },
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("google matrix timeout")), GOOGLE_MATRIX_CALL_TIMEOUT_MS),
+      ),
+    ]);
     if (result.source !== "routes_api_matrix") return fallback;
     let drive = 0;
     for (let i = 0; i < located.length - 1; i++) {
@@ -315,8 +336,15 @@ async function routeMetricsWithGoogleDrive(
 }
 
 /** True when a route doc's drive time should be (re)computed with Google. */
-function needsGoogleDriveUpgrade(data: FirebaseFirestore.DocumentData | undefined): boolean {
-  return hasGoogleRoutesApiKey() && str(data?.driveTimeSource) !== "routes_api_matrix";
+function needsGoogleDriveUpgrade(
+  data: FirebaseFirestore.DocumentData | undefined,
+  budget: GoogleDriveBudget,
+): boolean {
+  return (
+    budget.remaining > 0 &&
+    hasGoogleRoutesApiKey() &&
+    str(data?.driveTimeSource) !== "routes_api_matrix"
+  );
 }
 
 /** Same stop MEMBERSHIP (order-insensitive, no duplicates in `a`). */
@@ -785,6 +813,10 @@ async function reconcileScheduledRoutes(
     }
   };
 
+  // One Google-matrix allowance shared by the forward pass and the
+  // appointment-window rebuild, so the whole reconciliation stays bounded.
+  const googleBudget: GoogleDriveBudget = { remaining: GOOGLE_MATRIX_PER_SYNC_RUN };
+
   const handledSlots = new Set<string>();
   for (const [key, group] of groups) {
     handledSlots.add(key);
@@ -827,9 +859,9 @@ async function reconcileScheduledRoutes(
       // Google-computed. An unchanged, already-Google doc keeps its metrics
       // instead of being clobbered with a haversine estimate every sync.
       const metricFields =
-        !sameStopSet(prevSeq, newSeq) || needsGoogleDriveUpgrade(existing.data)
+        !sameStopSet(prevSeq, newSeq) || needsGoogleDriveUpgrade(existing.data, googleBudget)
           ? adjustMetricsForPreserved(
-              await routeMetricsWithGoogleDrive(orderedJobs, group.date),
+              await routeMetricsWithGoogleDrive(orderedJobs, group.date, googleBudget),
               preserved.length,
             )
           : {};
@@ -873,7 +905,7 @@ async function reconcileScheduledRoutes(
         routeTemplateTitle,
         routeValue,
         stops: stopDetails,
-        ...(await routeMetricsWithGoogleDrive(orderedJobs, group.date)),
+        ...(await routeMetricsWithGoogleDrive(orderedJobs, group.date, googleBudget)),
         confidence: 1,
         approved: true,
         locked: true,
@@ -947,6 +979,7 @@ async function reconcileScheduledRoutes(
       windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
       windowEndExclusive: dateOffsetISO(today, 1),
       todayISO: today,
+      googleBudget,
       now,
       empNames,
       resolveTechEmpId: (empId) =>
@@ -979,6 +1012,7 @@ async function rebuildPastRouteWindow({
   windowStart,
   windowEndExclusive,
   todayISO = "",
+  googleBudget,
   now,
   empNames,
   resolveTechEmpId,
@@ -990,6 +1024,8 @@ async function rebuildPastRouteWindow({
   windowEndExclusive: string;
   /** Dates >= this get today-semantics (preserve generated stops, gentle sweep). Empty = whole window is past. */
   todayISO?: string;
+  /** Shared per-run allowance of Google matrix computations. */
+  googleBudget: GoogleDriveBudget;
   now: string;
   empNames: Record<string, string>;
   resolveTechEmpId: (empId: string) => string;
@@ -1136,7 +1172,7 @@ async function rebuildPastRouteWindow({
     const newSeq = [...frStopIds, ...preserved];
     const isPureFieldRoutes = preserved.length === 0;
 
-    if (existing && sameStopSet(prevSeq, newSeq) && !needsGoogleDriveUpgrade(existing.data)) {
+    if (existing && sameStopSet(prevSeq, newSeq) && !needsGoogleDriveUpgrade(existing.data, googleBudget)) {
       // Already truthful with real drive times — keep drive/polyline. Still
       // true-up the completed count / per-stop details / template (they change
       // during the day as appointments complete; older docs predate the fields).
@@ -1161,7 +1197,7 @@ async function rebuildPastRouteWindow({
     }
 
     const metrics = adjustMetricsForPreserved(
-      await routeMetricsWithGoogleDrive(stops, group.date),
+      await routeMetricsWithGoogleDrive(stops, group.date, googleBudget),
       preserved.length,
     );
     const routeGroupTitle = stops.find((s) => s.routeGroup)?.routeGroup || "";
@@ -1391,6 +1427,9 @@ export async function reconcileRouteRange(
     windowStart,
     windowEndExclusive: endExclusive,
     todayISO: today,
+    // The range endpoint runs under maxDuration=120 and does little else after
+    // the appointment pull — a bigger (but still bounded) Google allowance.
+    googleBudget: { remaining: 20 },
     now,
     empNames,
     resolveTechEmpId: (empId) => byEmpId.get(empId) || byName.get(normName(empNames[empId] || "")) || "",
