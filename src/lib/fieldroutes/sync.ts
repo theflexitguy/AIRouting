@@ -22,6 +22,7 @@
 import { adminDb } from "@/lib/firebase-admin";
 import { normalizeServiceType } from "@/lib/job-id";
 import { calculateStopProductionValue } from "@/lib/production-value";
+import { computeRouteMatrix, hasGoogleRoutesApiKey } from "@/lib/google-routing";
 import { deriveServiceLine, isInScopeForLine, lawnRoundSeasonalWindow } from "@/lib/routing/service-line";
 import { computeDeadlineFlags } from "@/lib/routing/intervals";
 import {
@@ -131,15 +132,18 @@ function dateOffsetISO(iso: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-// One PAST appointment (non-cancelled, non-rescheduled) — the ground truth used
-// to rewrite historical route docs so past days match FieldRoutes. subId may be
-// empty (standalone appointments — reservices/one-offs without a subscription
-// still count as stops in FieldRoutes); apptId is always present. status: 0
-// Pending, 1 Completed, 2 No-Show.
+// One appointment in the rebuild window (trailing history THROUGH today),
+// non-cancelled/non-rescheduled — the ground truth used to rewrite those days'
+// route docs so they match FieldRoutes exactly (every appointment is a stop,
+// including same-day pairs and standalones). subId may be empty (standalone
+// appointments — reservices/one-offs without a subscription still count as
+// stops in FieldRoutes); apptId is always present. status: 0 Pending,
+// 1 Completed, 2 No-Show.
 interface PastAppt {
   subId: string;
   apptId: string;
   date: string;
+  start: string; // appointment start time ("HH:MM:SS") — orders stops like the FieldRoutes board
   techEmpId: string;
   routeGroup: string;
   routeTemplate: string;
@@ -258,6 +262,88 @@ function haversineRouteMetrics(
     driveTimeSource: "haversine_fallback",
     polylineSource: "haversine_fallback",
     polylineStatus: "ESTIMATE_ONLY",
+  };
+}
+
+/**
+ * Route metrics with REAL drive times: Google Routes matrix over the stops that
+ * carry coordinates (summing consecutive legs in stop order), haversine when
+ * there's no API key / fewer than two located stops / the API fails.
+ * computeRouteMatrix caches per (points, date), so unchanged routes re-synced in
+ * one invocation don't re-bill. Callers only invoke this when a route's stop
+ * set changed (or its drive time was never Google-computed), so quota is spent
+ * roughly once per route, not per sync.
+ */
+async function routeMetricsWithGoogleDrive(
+  stops: Array<{ lat?: number; lng?: number; duration: number }>,
+  routeDate: string,
+): Promise<Record<string, unknown>> {
+  const fallback = haversineRouteMetrics(stops);
+  const located = stops.filter(
+    (s) =>
+      typeof s.lat === "number" &&
+      typeof s.lng === "number" &&
+      Number.isFinite(s.lat) &&
+      Number.isFinite(s.lng) &&
+      (s.lat !== 0 || s.lng !== 0),
+  );
+  if (located.length < 2 || !hasGoogleRoutesApiKey()) return fallback;
+  try {
+    const result = await computeRouteMatrix(
+      located.map((s) => ({ lat: s.lat as number, lng: s.lng as number })),
+      { routeDate },
+    );
+    if (result.source !== "routes_api_matrix") return fallback;
+    let drive = 0;
+    for (let i = 0; i < located.length - 1; i++) {
+      drive += Number(result.matrix[i]?.[i + 1]) || 0;
+    }
+    const roundedDrive = Math.round(drive);
+    const service = Math.round(stops.reduce((sum, s) => sum + (Number(s.duration) || 25), 0));
+    return {
+      totalDriveTimeMinutes: roundedDrive,
+      totalServiceMinutes: service,
+      totalWorkMinutes: roundedDrive + service,
+      driveTimeSource: "routes_api_matrix",
+      polylineSource: "haversine_fallback",
+      polylineStatus: "ESTIMATE_ONLY",
+    };
+  } catch (err) {
+    console.warn("[fieldroutes/sync] Google drive matrix failed, using haversine:", String(err));
+    return fallback;
+  }
+}
+
+/** True when a route doc's drive time should be (re)computed with Google. */
+function needsGoogleDriveUpgrade(data: FirebaseFirestore.DocumentData | undefined): boolean {
+  return hasGoogleRoutesApiKey() && str(data?.driveTimeSource) !== "routes_api_matrix";
+}
+
+/** Same stop MEMBERSHIP (order-insensitive, no duplicates in `a`). */
+function sameStopSet(a: string[], b: string[]): boolean {
+  return a.length === b.length && new Set(a).size === a.length && b.every((id) => a.includes(id));
+}
+
+/**
+ * A route doc's metrics cover only its FieldRoutes stops; a MIXED slot also
+ * keeps preserved generated stops (counted in totalStops), so add their service
+ * time (default 25m each — their job docs aren't loaded here) to keep
+ * service/work consistent with the stop count. Without this the doc showed a
+ * "full day" for a subset of its stops, which the UI surfaced as the
+ * impossible DAY < SERVICE.
+ */
+function adjustMetricsForPreserved(
+  metrics: Record<string, unknown>,
+  preservedCount: number,
+): Record<string, unknown> {
+  if (preservedCount <= 0) return metrics;
+  return {
+    ...metrics,
+    totalServiceMinutes: (metrics.totalServiceMinutes as number) + preservedCount * 25,
+    totalWorkMinutes:
+      (metrics.totalDriveTimeMinutes as number) +
+      (metrics.totalServiceMinutes as number) +
+      preservedCount * 25,
   };
 }
 
@@ -613,6 +699,12 @@ async function reconcileScheduledRoutes(
     const techEmpId = str(d.fieldRoutesServicedById);
     const techName = str(d.fieldRoutesServicedBy || d.assignedTechId);
     if (techEmpId) servingEmployeeIds.add(techEmpId);
+    // TODAY's routes are rebuilt from actual appointments (rebuildPastRouteWindow
+    // below) so every appointment counts — same-day pairs, standalones, and
+    // completed stops that this job-doc pass would drop as their subscription
+    // rolls forward. Only FUTURE days are assembled from job docs here. (The
+    // tech is still registered above so today-only techs keep their doc.)
+    if (date === today) return;
     scheduled.push({
       id: doc.id,
       date,
@@ -670,8 +762,11 @@ async function reconcileScheduledRoutes(
     groups.get(key)!.jobs.push(j);
   }
 
-  // Load existing future routes to preserve generated stops and clean up stale ones.
-  const routesSnap = await db.collection(`companies/${companyId}/routes`).where("date", ">=", today).get();
+  // Load existing FUTURE routes to preserve generated stops and clean up stale
+  // ones. Today's docs are deliberately excluded — they belong to the
+  // appointment-based rebuild below, and including them here would make the
+  // cleanup loop treat them as stale (no forward group carries today anymore).
+  const routesSnap = await db.collection(`companies/${companyId}/routes`).where("date", ">", today).get();
   const existingBySlot = new Map<string, { ref: FirebaseFirestore.DocumentReference; data: FirebaseFirestore.DocumentData }>();
   routesSnap.docs.forEach((rd) => {
     const r = rd.data();
@@ -701,7 +796,6 @@ async function reconcileScheduledRoutes(
           a.customerName.localeCompare(b.customerName),
       );
     const frStopIds = orderedJobs.map((j) => j.id);
-    const metrics = haversineRouteMetrics(orderedJobs);
     // A (date,tech) slot's stops share one FieldRoutes route → one group. Take
     // the first non-empty group label so the dashboard can filter by route group.
     const routeGroupTitle = orderedJobs.find((j) => j.routeGroup)?.routeGroup || "";
@@ -728,6 +822,17 @@ async function reconcileScheduledRoutes(
       const preserved = prevSeq.filter((id) => !prevFr.includes(id) && !frStopIds.includes(id));
       const newSeq = [...frStopIds, ...preserved];
       const isPureFieldRoutes = preserved.length === 0;
+      // Drive/work metrics: recompute (Google Routes matrix, haversine fallback)
+      // only when the stop set changed or the doc's drive time was never
+      // Google-computed. An unchanged, already-Google doc keeps its metrics
+      // instead of being clobbered with a haversine estimate every sync.
+      const metricFields =
+        !sameStopSet(prevSeq, newSeq) || needsGoogleDriveUpgrade(existing.data)
+          ? adjustMetricsForPreserved(
+              await routeMetricsWithGoogleDrive(orderedJobs, group.date),
+              preserved.length,
+            )
+          : {};
       batch.set(
         existing.ref,
         {
@@ -743,22 +848,7 @@ async function reconcileScheduledRoutes(
           routeTemplateTitle,
           routeValue,
           stops: stopDetails,
-          ...metrics,
-          // `metrics` covers only the FieldRoutes jobs. On a MIXED slot the doc
-          // also keeps `preserved` generated stops (counted in totalStops), so add
-          // their service time (default 25m each — their job docs aren't loaded
-          // here) to keep service/work consistent with the stop count. Without
-          // this the doc showed a "full day" for a subset of its stops, which the
-          // UI surfaced as the impossible DAY < SERVICE.
-          ...(preserved.length > 0
-            ? {
-                totalServiceMinutes: (metrics.totalServiceMinutes as number) + preserved.length * 25,
-                totalWorkMinutes:
-                  (metrics.totalDriveTimeMinutes as number) +
-                  (metrics.totalServiceMinutes as number) +
-                  preserved.length * 25,
-              }
-            : {}),
+          ...metricFields,
           // A pure-FieldRoutes slot is locked. A slot that also holds generated
           // stops keeps its existing approval so we don't surprise-lock an AI
           // route — its FieldRoutes stops are still protected by pinning.
@@ -783,7 +873,7 @@ async function reconcileScheduledRoutes(
         routeTemplateTitle,
         routeValue,
         stops: stopDetails,
-        ...metrics,
+        ...(await routeMetricsWithGoogleDrive(orderedJobs, group.date)),
         confidence: 1,
         approved: true,
         locked: true,
@@ -843,19 +933,20 @@ async function reconcileScheduledRoutes(
 
   await commit();
 
-  // ── Historical window: rewrite PAST route docs from actual appointments. ────
-  // A past day's docs used to freeze at whatever the schedule looked like when
-  // that day was last synced — stops later cancelled/rescheduled kept counting
-  // and emptied routes lingered, so the dashboard's history disagreed with
-  // FieldRoutes. pastAppts is the non-cancelled appointment truth for the
-  // trailing ROUTE_HISTORY_DAYS.
+  // ── Appointment window: rewrite PAST + TODAY route docs from actual
+  // appointments. Past days used to freeze at whatever the schedule looked like
+  // when last synced; TODAY used to be assembled from job docs, which undercounts
+  // (same-day pairs collapse, standalones vanish, completed subs drop off as they
+  // roll forward). pastAppts is the non-cancelled appointment truth for the
+  // trailing ROUTE_HISTORY_DAYS through today.
   if (pastAppts.length > 0) {
     const rebuilt = await rebuildPastRouteWindow({
       db,
       companyId,
       pastAppts,
       windowStart: dateOffsetISO(today, -ROUTE_HISTORY_DAYS),
-      windowEndExclusive: today,
+      windowEndExclusive: dateOffsetISO(today, 1),
+      todayISO: today,
       now,
       empNames,
       resolveTechEmpId: (empId) =>
@@ -869,13 +960,17 @@ async function reconcileScheduledRoutes(
 }
 
 /**
- * Rebuild the route docs of a PAST window from actual FieldRoutes appointments
- * (the non-cancelled/non-rescheduled truth): per (date, tech) slot the stop
- * list, counts, service/drive estimates, value, and group are rewritten, and
- * window docs with no backing appointments are deleted. Slots whose stop set is
- * unchanged are skipped so previously computed Google drive times/polylines
- * survive. Shared by the sync's trailing-window pass and the on-demand
- * date-range verification endpoint.
+ * Rebuild the route docs of an appointment window (past days, and — when the
+ * sync passes todayISO — TODAY) from actual FieldRoutes appointments, the
+ * non-cancelled/non-rescheduled truth: per (date, tech) slot the stop list
+ * (ordered by appointment start time, like the FieldRoutes board), counts,
+ * per-stop completion, service/drive estimates, value, group, and template are
+ * rewritten, and window docs with no backing appointments are swept. Today's
+ * MIXED slots keep their AI-generated stops (mirroring the forward pass);
+ * past days never preserve (stale proposals for a day that already happened).
+ * Slots whose stop set is unchanged AND already carry Google drive times are
+ * skipped apart from a cheap completion/detail true-up. Shared by the sync's
+ * trailing-window pass and the on-demand date-range verification endpoint.
  */
 async function rebuildPastRouteWindow({
   db,
@@ -883,6 +978,7 @@ async function rebuildPastRouteWindow({
   pastAppts,
   windowStart,
   windowEndExclusive,
+  todayISO = "",
   now,
   empNames,
   resolveTechEmpId,
@@ -892,6 +988,8 @@ async function rebuildPastRouteWindow({
   pastAppts: PastAppt[];
   windowStart: string;
   windowEndExclusive: string;
+  /** Dates >= this get today-semantics (preserve generated stops, gentle sweep). Empty = whole window is past. */
+  todayISO?: string;
   now: string;
   empNames: Record<string, string>;
   resolveTechEmpId: (empId: string) => string;
@@ -945,9 +1043,6 @@ async function rebuildPastRouteWindow({
     });
   }
 
-  const sameStopSet = (a: string[], b: string[]) =>
-    a.length === b.length && new Set(a).size === a.length && b.every((id) => a.includes(id));
-
   const handledPast = new Set<string>();
   for (const [key, group] of pastGroups) {
     handledPast.add(key);
@@ -962,6 +1057,7 @@ async function rebuildPastRouteWindow({
     const seenIds = new Set<string>();
     const stops: Array<{
       id: string;
+      start: string;
       duration: number;
       lat?: number;
       lng?: number;
@@ -985,6 +1081,7 @@ async function rebuildPastRouteWindow({
       const firstOfSub = id.startsWith("sub_");
       stops.push({
         id,
+        start: str(p.start),
         duration: Number(j?.duration) || p.duration || 25,
         lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
         lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
@@ -1007,8 +1104,9 @@ async function rebuildPastRouteWindow({
         completed: p.status === 1,
       });
     }
-    stops.sort((a, b) => a.customerName.localeCompare(b.customerName));
-    const stopIds = stops.map((s) => s.id);
+    // Order like the FieldRoutes board: appointment start time, then name.
+    stops.sort((a, b) => a.start.localeCompare(b.start) || a.customerName.localeCompare(b.customerName));
+    const frStopIds = stops.map((s) => s.id);
     const completedStops = stops.filter((s) => s.completed).length;
     const routeTemplateTitle = stops.find((s) => s.routeTemplate)?.routeTemplate || "";
     // Light per-stop detail (name + did-it-happen) persisted for the dashboard
@@ -1025,9 +1123,23 @@ async function rebuildPastRouteWindow({
     const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
       ? (existing!.data.stopSequence as unknown[]).map(String)
       : [];
-    if (existing && sameStopSet(prevSeq, stopIds)) {
-      // Already truthful — keep drive/polyline. Still true-up the completed
-      // count / per-stop details / template (older docs predate these fields).
+    const prevFr: string[] = Array.isArray(existing?.data.fieldRoutesStopIds)
+      ? (existing!.data.fieldRoutesStopIds as unknown[]).map(String)
+      : [];
+    // TODAY: a mixed slot keeps its AI-generated stops alongside the
+    // FieldRoutes ones (mirroring the forward pass). Past days never preserve —
+    // a leftover proposal for a day that already happened is stale.
+    const isTodaySlot = Boolean(todayISO) && group.date >= todayISO;
+    const preserved = isTodaySlot
+      ? prevSeq.filter((id) => !prevFr.includes(id) && !frStopIds.includes(id))
+      : [];
+    const newSeq = [...frStopIds, ...preserved];
+    const isPureFieldRoutes = preserved.length === 0;
+
+    if (existing && sameStopSet(prevSeq, newSeq) && !needsGoogleDriveUpgrade(existing.data)) {
+      // Already truthful with real drive times — keep drive/polyline. Still
+      // true-up the completed count / per-stop details / template (they change
+      // during the day as appointments complete; older docs predate the fields).
       // Never blank an already-stamped template: a resumed run can rehydrate
       // pastAppts persisted before routeTemplate existed.
       const keptTemplate = routeTemplateTitle || str(existing.data.routeTemplateTitle);
@@ -1048,7 +1160,10 @@ async function rebuildPastRouteWindow({
       continue;
     }
 
-    const metrics = haversineRouteMetrics(stops);
+    const metrics = adjustMetricsForPreserved(
+      await routeMetricsWithGoogleDrive(stops, group.date),
+      preserved.length,
+    );
     const routeGroupTitle = stops.find((s) => s.routeGroup)?.routeGroup || "";
     const routeValue = stops.reduce((sum, s) => sum + (Number(s.value) || 0), 0);
     const ref = existing?.ref || db.doc(`companies/${companyId}/routes/${group.date}-${group.techId}`);
@@ -1059,20 +1174,21 @@ async function rebuildPastRouteWindow({
         date: group.date,
         techId: group.techId,
         techName: group.techName,
-        stopSequence: stopIds,
-        totalStops: stopIds.length,
+        stopSequence: newSeq,
+        totalStops: newSeq.length,
         completedStops,
         stops: stopDetails,
-        fieldRoutesStopIds: stopIds,
+        fieldRoutesStopIds: frStopIds,
         hasFieldRoutesStops: true,
         routeGroupTitle,
         routeTemplateTitle: routeTemplateTitle || str(existing?.data.routeTemplateTitle),
         routeValue,
         ...metrics,
-        approved: true,
-        locked: true,
-        source: "fieldroutes",
-        generatedBy: "fieldroutes",
+        // A pure-FieldRoutes slot is locked; a today-slot that also holds
+        // generated stops keeps its existing approval (same as the forward pass).
+        approved: isPureFieldRoutes ? true : existing?.data.approved === true,
+        ...(isPureFieldRoutes ? { locked: true, generatedBy: "fieldroutes" } : {}),
+        source: isPureFieldRoutes ? "fieldroutes" : "mixed",
         updatedAt: now,
         ...(existing ? {} : { createdAt: now }),
       },
@@ -1083,11 +1199,53 @@ async function rebuildPastRouteWindow({
     if (ops >= 450) await commit();
   }
 
-  // Window docs with no backing appointments: the day per FieldRoutes has
-  // nothing for that tech (route emptied/deleted, or a stale local proposal
-  // for a day that already happened) — remove them.
+  // Window docs with no backing appointments. PAST days: the day per
+  // FieldRoutes has nothing for that tech (route emptied/deleted, or a stale
+  // local proposal for a day that already happened) — remove them. TODAY:
+  // mirror the forward pass — a pure AI route for today is legitimate work in
+  // progress (leave it alone unless it's empty); a mixed doc loses its
+  // FieldRoutes stops but keeps the generated ones; a pure-FR doc goes away.
   for (const [key, existing] of pastBySlot) {
     if (handledPast.has(key)) continue;
+    const docDate = str(existing.data.date);
+    if (todayISO && docDate >= todayISO) {
+      const prevFr: string[] = Array.isArray(existing.data.fieldRoutesStopIds)
+        ? existing.data.fieldRoutesStopIds.map(String)
+        : [];
+      const prevSeq: string[] = Array.isArray(existing.data.stopSequence)
+        ? existing.data.stopSequence.map(String)
+        : [];
+      if (prevFr.length === 0) {
+        if (prevSeq.length === 0) {
+          batch.delete(existing.ref);
+          deleted++;
+          ops++;
+          if (ops >= 450) await commit();
+        }
+        continue;
+      }
+      const preserved = prevSeq.filter((id) => !prevFr.includes(id));
+      if (preserved.length === 0) {
+        batch.delete(existing.ref);
+        deleted++;
+      } else {
+        batch.set(
+          existing.ref,
+          {
+            stopSequence: preserved,
+            totalStops: preserved.length,
+            fieldRoutesStopIds: [],
+            hasFieldRoutesStops: false,
+            source: existing.data.source === "mixed" ? "ai" : existing.data.source,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+      }
+      ops++;
+      if (ops >= 450) await commit();
+      continue;
+    }
     batch.delete(existing.ref);
     deleted++;
     ops++;
@@ -1184,6 +1342,7 @@ export async function reconcileRouteRange(
         subId: subId === "0" ? "" : subId,
         apptId,
         date,
+        start: str(ar.start),
         techEmpId: routeTechMap.get(routeId) || "",
         routeGroup: routeGroupMap.get(routeId) || "",
         routeTemplate: routeTemplateMap.get(routeId) || "",
@@ -1231,6 +1390,7 @@ export async function reconcileRouteRange(
     pastAppts,
     windowStart,
     windowEndExclusive: endExclusive,
+    todayISO: today,
     now,
     empNames,
     resolveTechEmpId: (empId) => byEmpId.get(empId) || byName.get(normName(empNames[empId] || "")) || "",
@@ -1494,24 +1654,30 @@ async function buildRunSetup(
     if (!date) continue;
     const routeId = str(ar.routeID);
     const techEmpId = routeTechMap.get(routeId) || "";
+    const apptId = str(ar.appointmentID);
+    // Rebuild window (trailing history THROUGH today): appointment ground truth
+    // for rewriting those days' route docs — every appointment is a stop,
+    // including same-day GP+Mosquito pairs and standalone appointments with no
+    // subscription. Today lives here (not in the job-doc forward pass) so its
+    // counts hold at what FieldRoutes booked instead of shrinking as
+    // subscriptions complete and roll forward.
+    if (date <= today && date >= historyStart && (subId || apptId)) {
+      pastAppts.push({
+        subId: subId === "0" ? "" : subId,
+        apptId,
+        date,
+        start: str(ar.start),
+        techEmpId,
+        routeGroup: routeGroupMap.get(routeId) || "",
+        routeTemplate: routeTemplateMap.get(routeId) || "",
+        duration: num(ar.duration) || 25,
+        status: apptStatus,
+      });
+    }
     if (date < today) {
-      // Past window: ground truth for re-reconciling historical route docs.
-      // NOT added to apptMap — job docs' alreadyScheduled/scheduledFor must
-      // keep meaning "has a FUTURE appointment". Standalone appointments
-      // (no subscription) still count: FieldRoutes shows them as stops.
-      const apptId = str(ar.appointmentID);
-      if (date >= historyStart && (subId || apptId)) {
-        pastAppts.push({
-          subId: subId === "0" ? "" : subId,
-          apptId,
-          date,
-          techEmpId,
-          routeGroup: routeGroupMap.get(routeId) || "",
-          routeTemplate: routeTemplateMap.get(routeId) || "",
-          duration: num(ar.duration) || 25,
-          status: apptStatus,
-        });
-      }
+      // Past appointments are NOT added to apptMap — job docs'
+      // alreadyScheduled/scheduledFor must keep meaning "has an appointment
+      // today or later".
       continue;
     }
     if (!subId) continue;
