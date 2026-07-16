@@ -15,7 +15,7 @@ import { Switch } from "@/components/ui/switch";
 import { DatePicker } from "@/components/ui/date-picker";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { formatTime } from "@/lib/utils";
-import { formatCurrency } from "@/lib/production-value";
+import { formatCurrency, calculateStopProductionValue } from "@/lib/production-value";
 import { deriveServiceLine } from "@/lib/routing/service-line";
 import type { MonthlyDone } from "@/lib/fieldroutes/monthly-done";
 import {
@@ -159,6 +159,14 @@ interface JobRec extends JobLike {
   scheduledTech?: string; // FieldRoutes tech name on the booked appointment
   customerName?: string;
   address?: string;
+  duration?: number; // service minutes for the stop
+  // Billing fields feeding calculateStopProductionValue (per-stop route value
+  // fallback when a route doc's stops detail predates the value field).
+  recurringPrice?: string;
+  billingPrice?: string;
+  billingFrequency?: string;
+  revenue?: number | string;
+  productionValue?: number | string;
 }
 interface TechOption {
   id: string;
@@ -238,6 +246,7 @@ export default function DashboardPage() {
   const [filterTechs, setFilterTechs] = useState<string[]>([]);
   const [filterGroups, setFilterGroups] = useState<string[]>([]);
   const [filterTemplates, setFilterTemplates] = useState<string[]>([]);
+  const [filterSubTypes, setFilterSubTypes] = useState<string[]>([]);
   const [rangeRoutes, setRangeRoutes] = useState<RouteRec[] | null>(null);
   // Custom-range extras: bump to re-fetch after a live FieldRoutes verification,
   // in-flight indicator for that verification, and the skip-weekends toggle.
@@ -478,7 +487,7 @@ export default function DashboardPage() {
     return keys;
   }, [filterTechs, techs]);
 
-  const filtersActive = dateFilterEnabled || filterTechs.length > 0 || filterGroups.length > 0 || filterTemplates.length > 0;
+  const filtersActive = dateFilterEnabled || filterTechs.length > 0 || filterGroups.length > 0 || filterTemplates.length > 0 || filterSubTypes.length > 0;
 
   // Route Template options: distinct template titles across every route loaded
   // (8-week window + custom range), synced from FieldRoutes route.title —
@@ -492,21 +501,84 @@ export default function DashboardPage() {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [rawRoutes, rangeRoutes]);
 
-  // Apply technician + route-group + route-template filters to a set of routes.
-  // Each filter is a multi-select: empty = all, otherwise match ANY selection.
+  // Subscription Type options: distinct FieldRoutes service types across the
+  // synced subscriptions ("General Pest Control", "Mosquito", "Termite", …).
+  const subTypeOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const j of rawJobs) {
+      const t = String(j.serviceType || "").trim();
+      if (t) set.add(t);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [rawJobs]);
+
+  // Join route stopSequence ids (sub_<subscriptionId> / appt_<id>) back to job
+  // docs for customer id / service type / today's completion state.
+  const jobsByDocId = useMemo(() => {
+    const m = new Map<string, JobRec>();
+    for (const j of rawJobs) if (j.docId) m.set(j.docId, j);
+    return m;
+  }, [rawJobs]);
+
+  // Apply technician + route-group + route-template + subscription-type filters
+  // to a set of routes. Each filter is a multi-select: empty = all, otherwise
+  // match ANY selection. Tech/group/template include or exclude WHOLE routes;
+  // subscription type is a STOP-level filter — routes mix types, so each route
+  // is rewritten to just its matching stops (stop count, completions, value,
+  // service minutes) and every downstream metric reads the rewritten numbers.
   const filterRoutes = useMemo(() => {
-    return (routes: RouteRec[]) => routes.filter(r => {
-      // A route with no stops is a phantom (its underlying job docs were purged
-      // out from under it) — never count or display it as a route.
-      if ((r.totalStops || 0) <= 0) return false;
-      // Match on the canonical bucket so every FieldRoutes spelling variant of a
-      // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
-      if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(r.routeGroupTitle || "")))) return false;
-      if (filterTemplates.length > 0 && !filterTemplates.includes(String(r.routeTemplateTitle || "").trim())) return false;
-      if (!routeMatchesTech(r, techKeys)) return false;
-      return true;
-    });
-  }, [filterGroups, filterTemplates, techKeys]);
+    const stopMatchesSubType = (id: string) => {
+      const t = String(jobsByDocId.get(id)?.serviceType || "").trim();
+      return t !== "" && filterSubTypes.includes(t);
+    };
+    return (routes: RouteRec[]) => {
+      const base = routes.filter(r => {
+        // A route with no stops is a phantom (its underlying job docs were purged
+        // out from under it) — never count or display it as a route.
+        if ((r.totalStops || 0) <= 0) return false;
+        // Match on the canonical bucket so every FieldRoutes spelling variant of a
+        // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
+        if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(r.routeGroupTitle || "")))) return false;
+        if (filterTemplates.length > 0 && !filterTemplates.includes(String(r.routeTemplateTitle || "").trim())) return false;
+        if (!routeMatchesTech(r, techKeys)) return false;
+        return true;
+      });
+      if (filterSubTypes.length === 0) return base;
+      const rewritten: RouteRec[] = [];
+      for (const r of base) {
+        const seq = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
+        const keep = seq.filter(stopMatchesSubType);
+        if (keep.length === 0) continue;
+        const keepSet = new Set(keep);
+        const detail = (Array.isArray(r.stops) ? r.stops : []).filter(s => keepSet.has(String(s.id)));
+        const detailById = new Map(detail.map(s => [String(s.id), s]));
+        // Per-stop value: the reconcile-stamped stop value, falling back to the
+        // job's production value for docs that predate the stops detail.
+        const routeValue = keep.reduce((sum, id) => {
+          const d = detailById.get(id);
+          if (d && Number.isFinite(Number(d.value))) return sum + Number(d.value);
+          const j = jobsByDocId.get(id);
+          return sum + (j ? calculateStopProductionValue(j).value || 0 : 0);
+        }, 0);
+        const totalServiceMinutes = keep.reduce(
+          (sum, id) => sum + (Number(jobsByDocId.get(id)?.duration) || 25), 0
+        );
+        rewritten.push({
+          ...r,
+          stopSequence: keep,
+          stops: detail,
+          totalStops: keep.length,
+          completedStops: detail.filter(s => s.completed).length,
+          routeValue,
+          totalServiceMinutes,
+          // Drive time stays the whole route's (a drive isn't attributable to a
+          // single stop); work minutes pair it with the filtered service time.
+          totalWorkMinutes: (Number(r.totalDriveTimeMinutes) || 0) + totalServiceMinutes,
+        });
+      }
+      return rewritten;
+    };
+  }, [filterGroups, filterTemplates, filterSubTypes, techKeys, jobsByDocId]);
 
   // Route set for the "Today" cards: the custom range when the date filter is
   // on, otherwise today's routes. Shared with the metric drill-downs so a
@@ -540,6 +612,7 @@ export default function DashboardPage() {
     const jobInFilterScope = (j: JobRec) => {
       if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")))) return false;
       if (filterTemplates.length > 0 && !filterTemplates.includes(String(j.fieldRoutesRouteTemplate || "").trim())) return false;
+      if (filterSubTypes.length > 0 && !filterSubTypes.includes(String(j.serviceType || "").trim())) return false;
       if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
       return true;
     };
@@ -670,20 +743,12 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, techKeys, bounds, today, scopedRoutes]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, techKeys, bounds, today, scopedRoutes]);
 
   // ── Metric drill-downs ──────────────────────────────────────────────────
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
   // view of the exact routes/stops behind that number.
   const [drill, setDrill] = useState<"routes" | "stops" | "completed" | "remaining" | null>(null);
-
-  // Join route stopSequence ids (sub_<subscriptionId> / appt_<id>) back to job
-  // docs for customer id / service type / today's completion state.
-  const jobsByDocId = useMemo(() => {
-    const m = new Map<string, JobRec>();
-    for (const j of rawJobs) if (j.docId) m.set(j.docId, j);
-    return m;
-  }, [rawJobs]);
 
   const drillData = useMemo(() => {
     const routes = [...scopedRoutes].sort(
@@ -904,11 +969,18 @@ export default function DashboardPage() {
                   allLabel="All Route Templates"
                   className="w-full sm:w-44 h-8 text-xs"
                 />
+                <MultiSelect
+                  options={subTypeOptions.map(t => ({ value: t, label: t }))}
+                  selected={filterSubTypes}
+                  onChange={setFilterSubTypes}
+                  allLabel="All Subscription Types"
+                  className="w-full sm:w-48 h-8 text-xs"
+                />
                 {filtersActive && (
                   <button
                     type="button"
                     className="text-xs text-muted-foreground/60 hover:text-foreground underline underline-offset-2 ml-auto"
-                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTechs([]); setFilterGroups([]); setFilterTemplates([]); }}
+                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTechs([]); setFilterGroups([]); setFilterTemplates([]); setFilterSubTypes([]); }}
                   >
                     Clear filters
                   </button>
@@ -968,6 +1040,7 @@ export default function DashboardPage() {
                     {filterTechs.length > 0 ? ` · ${filterTechs.map(id => techs.find(t => t.id === id)?.name || id).join(", ")}` : ""}
                     {filterGroups.length > 0 ? ` · ${filterGroups.join(", ")}` : ""}
                     {filterTemplates.length > 0 ? ` · ${filterTemplates.join(", ")}` : ""}
+                    {filterSubTypes.length > 0 ? ` · ${filterSubTypes.join(", ")}` : ""}
                   </DialogDescription>
                 </DialogHeader>
                 <div className="max-h-[65vh] overflow-y-auto">
