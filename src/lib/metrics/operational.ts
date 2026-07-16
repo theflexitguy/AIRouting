@@ -339,7 +339,9 @@ export function isTrackedServiceLine(line: string): boolean {
  *     is Aug 1 – Sep 15 — those must not inflate July.
  *   - OVERDUE SPILLOVER: within the window, a round due earlier in the window
  *     but not yet completed is still this month's work (an unserviced June
- *     Round 4 is July work, not silently dropped).
+ *     Round 4 is July work, not silently dropped). Docs with NO stamped window
+ *     get the strict in-month rule — otherwise skipped rounds from earlier in
+ *     the year would pile onto every later month forever.
  * Counts subscriptions (each round is its own sub), not distinct customers.
  */
 function lawnMonthTargetDone(
@@ -358,9 +360,16 @@ function lawnMonthTargetDone(
       done++;
       continue;
     }
-    if (!activeInMonth(j, month)) continue; // window gate
+    const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
+    if (hasWindow && !activeInMonth(j, month)) continue; // window gate
     const sd = j.scheduledDate;
-    if (!sd || sd > monthEnd) continue; // due by end of this month (incl. spillover)
+    if (!sd || sd > monthEnd) continue; // due by end of this month
+    // Overdue spillover (due earlier but not yet serviced) only counts when the
+    // round's WINDOW covers this month — an unserviced June Round 4 is July
+    // work. A window-less lawn doc gets the strict in-month rule instead;
+    // otherwise every skipped round from earlier in the year (dead R1–R3 due
+    // dates that never completed) piles onto every later month forever.
+    if (!hasWindow && sd < monthStart) continue;
     if (lc && lc >= sd) continue; // this cycle already serviced (completed a prior month)
     due++;
   }
