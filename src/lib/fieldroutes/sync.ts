@@ -131,13 +131,18 @@ function dateOffsetISO(iso: string, days: number): string {
 }
 
 // One PAST appointment (non-cancelled, non-rescheduled) — the ground truth used
-// to rewrite historical route docs so past days match FieldRoutes.
+// to rewrite historical route docs so past days match FieldRoutes. subId may be
+// empty (standalone appointments — reservices/one-offs without a subscription
+// still count as stops in FieldRoutes); apptId is always present. status: 0
+// Pending, 1 Completed, 2 No-Show.
 interface PastAppt {
   subId: string;
+  apptId: string;
   date: string;
   techEmpId: string;
   routeGroup: string;
   duration: number;
+  status: number;
 }
 
 function rec(value: unknown): Record<string, unknown> {
@@ -909,7 +914,7 @@ async function rebuildPastRouteWindow({
 
   // Job docs (best effort) for stop value/coords/customer name. Purged docs
   // (e.g. completed one-times) still count as stops, just without value/coords.
-  const subIds = Array.from(new Set(pastAppts.map((p) => p.subId)));
+  const subIds = Array.from(new Set(pastAppts.map((p) => p.subId).filter(Boolean)));
   const jobBySub = new Map<string, FirebaseFirestore.DocumentData>();
   for (let i = 0; i < subIds.length; i += 300) {
     const refs = subIds.slice(i, i + 300).map((id) => db.doc(`companies/${companyId}/jobs/sub_${id}`));
@@ -925,19 +930,32 @@ async function rebuildPastRouteWindow({
   const handledPast = new Set<string>();
   for (const [key, group] of pastGroups) {
     handledPast.add(key);
-    // Dedupe subs (a sub with two same-day appointments is still one stop doc)
-    // and order stably by customer name for a readable stop list.
+    // Stop identity: the subscription's job doc when there is one, else the
+    // appointment itself (standalone reservices/one-offs count as stops in
+    // FieldRoutes too). Dedupe (a sub with two same-day appointments is one
+    // stop doc — completed if ANY of its appointments completed) and order
+    // stably by customer name for a readable stop list.
+    const stopIdOf = (p: PastAppt) => (p.subId ? `sub_${p.subId}` : `appt_${p.apptId}`);
+    const completedByStop = new Map<string, boolean>();
+    for (const p of group.appts) {
+      const sid = stopIdOf(p);
+      if (p.status === 1) completedByStop.set(sid, true);
+      else if (!completedByStop.has(sid)) completedByStop.set(sid, false);
+    }
     const seen = new Set<string>();
     const stops = group.appts
-      .filter((p) => (seen.has(p.subId) ? false : (seen.add(p.subId), true)))
+      .filter((p) => {
+        const sid = stopIdOf(p);
+        return seen.has(sid) ? false : (seen.add(sid), true);
+      })
       .map((p) => {
-        const j = jobBySub.get(p.subId);
+        const j = p.subId ? jobBySub.get(p.subId) : undefined;
         return {
-          id: `sub_${p.subId}`,
+          id: stopIdOf(p),
           duration: Number(j?.duration) || p.duration || 25,
           lat: typeof j?.lat === "number" ? (j.lat as number) : undefined,
           lng: typeof j?.lng === "number" ? (j.lng as number) : undefined,
-          customerName: str(j?.customerName) || p.subId,
+          customerName: str(j?.customerName) || p.subId || p.apptId,
           value: j
             ? calculateStopProductionValue({
                 recurringPrice: j.recurringPrice,
@@ -953,12 +971,23 @@ async function rebuildPastRouteWindow({
       })
       .sort((a, b) => a.customerName.localeCompare(b.customerName));
     const stopIds = stops.map((s) => s.id);
+    const completedStops = stopIds.filter((id) => completedByStop.get(id)).length;
 
     const existing = pastBySlot.get(key);
     const prevSeq: string[] = Array.isArray(existing?.data.stopSequence)
       ? (existing!.data.stopSequence as unknown[]).map(String)
       : [];
-    if (existing && sameStopSet(prevSeq, stopIds)) continue; // already truthful — keep drive/polyline
+    if (existing && sameStopSet(prevSeq, stopIds)) {
+      // Already truthful — keep drive/polyline. Still true-up the completed
+      // count (older docs predate the field).
+      if (num(existing.data.completedStops) !== completedStops) {
+        batch.set(existing.ref, { completedStops, updatedAt: now }, { merge: true });
+        written++;
+        ops++;
+        if (ops >= 450) await commit();
+      }
+      continue;
+    }
 
     const metrics = haversineRouteMetrics(stops);
     const routeGroupTitle = stops.find((s) => s.routeGroup)?.routeGroup || "";
@@ -973,6 +1002,7 @@ async function rebuildPastRouteWindow({
         techName: group.techName,
         stopSequence: stopIds,
         totalStops: stopIds.length,
+        completedStops,
         fieldRoutesStopIds: stopIds,
         hasFieldRoutesStops: true,
         routeGroupTitle,
@@ -1079,18 +1109,21 @@ export async function reconcileRouteRange(
     for (const a of appts) {
       const ar = rec(a);
       const subId = str(ar.subscriptionID);
-      if (!subId) continue;
+      const apptId = str(ar.appointmentID);
+      if (!subId && !apptId) continue;
       const apptStatus = num(ar.status);
       if (apptStatus === -1 || apptStatus === -2) continue;
       const date = toDateOnly(ar.date);
       if (!date || date < windowStart || date >= endExclusive) continue;
       const routeId = str(ar.routeID);
       pastAppts.push({
-        subId,
+        subId: subId === "0" ? "" : subId,
+        apptId,
         date,
         techEmpId: routeTechMap.get(routeId) || "",
         routeGroup: routeGroupMap.get(routeId) || "",
         duration: num(ar.duration) || 25,
+        status: apptStatus,
       });
     }
   } catch (err) {
@@ -1379,7 +1412,6 @@ async function buildRunSetup(
   for (const a of allAppts) {
     const ar = rec(a);
     const subId = str(ar.subscriptionID);
-    if (!subId) continue;
     // Drop Cancelled (-1) and Rescheduled (-2) appointments — they still exist in
     // the appointment table (and would otherwise be treated as live scheduled
     // stops), but FieldRoutes no longer has the customer on that route. Pending
@@ -1394,18 +1426,23 @@ async function buildRunSetup(
     if (date < today) {
       // Past window: ground truth for re-reconciling historical route docs.
       // NOT added to apptMap — job docs' alreadyScheduled/scheduledFor must
-      // keep meaning "has a FUTURE appointment".
-      if (date >= historyStart) {
+      // keep meaning "has a FUTURE appointment". Standalone appointments
+      // (no subscription) still count: FieldRoutes shows them as stops.
+      const apptId = str(ar.appointmentID);
+      if (date >= historyStart && (subId || apptId)) {
         pastAppts.push({
-          subId,
+          subId: subId === "0" ? "" : subId,
+          apptId,
           date,
           techEmpId,
           routeGroup: routeGroupMap.get(routeId) || "",
           duration: num(ar.duration) || 25,
+          status: apptStatus,
         });
       }
       continue;
     }
+    if (!subId) continue;
     const existing = apptMap[subId];
     if (!existing || date < existing.date) {
       apptMap[subId] = {
