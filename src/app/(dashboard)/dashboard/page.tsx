@@ -755,7 +755,9 @@ export default function DashboardPage() {
   // ── Metric drill-downs ──────────────────────────────────────────────────
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
   // view of the exact routes/stops behind that number.
-  const [drill, setDrill] = useState<"routes" | "stops" | "completed" | "remaining" | null>(null);
+  const [drill, setDrill] = useState<
+    "routes" | "stops" | "completed" | "remaining" | "drive" | "value" | "stopsHour" | null
+  >(null);
 
   const drillData = useMemo(() => {
     const routes = [...scopedRoutes].sort(
@@ -813,6 +815,11 @@ export default function DashboardPage() {
       // present (past days and today alike); docs that predate the field use
       // the per-stop tally above.
       const completed = typeof r.completedStops === "number" ? r.completedStops : liveCompleted;
+      // Working hours for the per-route Stops/Hr column — same formula as the
+      // stopsPerHour KPI (work minutes when present, else drive + service).
+      const workMinutes = (Number(r.totalWorkMinutes) || 0) > 0
+        ? Number(r.totalWorkMinutes)
+        : (Number(r.totalDriveTimeMinutes) || 0) + (Number(r.totalServiceMinutes) || 0);
       return {
         key: `${r.date}-${String(r.techId || r.techName)}`,
         date: r.date,
@@ -824,6 +831,8 @@ export default function DashboardPage() {
         driveMinutes: Number(r.totalDriveTimeMinutes) || 0,
         driveEstimated: String(r.driveTimeSource || "") !== "routes_api_matrix",
         routeValue: Number(r.routeValue) || 0,
+        workMinutes,
+        stopsPerHour: workMinutes > 0 ? (r.totalStops || 0) / (workMinutes / 60) : null,
       };
     });
 
@@ -899,16 +908,16 @@ export default function DashboardPage() {
   const todayCards: Array<{
     title: string; value: string; subtitle: string;
     icon: typeof Route; color: string; bgColor: string;
-    drill?: "routes" | "stops" | "completed" | "remaining";
+    drill?: "routes" | "stops" | "completed" | "remaining" | "drive" | "value" | "stopsHour";
   }> = [
     { title: "Routes", value: String(stats.todayRoutes), subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10", drill: "routes" },
     { title: "Total Stops", value: String(stats.totalStops), subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10", drill: "stops" },
     { title: "Completed", value: String(stats.completedInScope), subtitle: dateFilterEnabled ? `${routeWindowLabel} · completed stops` : "today · as of last sync", icon: CheckCircle2, color: "text-emerald-400", bgColor: "bg-emerald-500/10", drill: "completed" },
     { title: "Stops Remaining", value: String(stats.stopsLeftToday), subtitle: `${routeWindowLabel} · still on routes`, icon: ListTodo, color: "text-sky-400", bgColor: "bg-sky-500/10", drill: "remaining" },
-    { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
-    { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
-    { title: "Avg Route Value", value: formatCurrency(stats.avgRouteValue), subtitle: `${routeWindowLabel} · per route`, icon: TrendingUp, color: "text-teal-400", bgColor: "bg-teal-500/10" },
-    { title: "Stops / Hour", value: fmt1(stats.todayStopsPerHour), subtitle: `${routeWindowLabel} · per working hour`, icon: Activity, color: "text-yellow-400", bgColor: "bg-yellow-500/10" },
+    { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10", drill: "drive" },
+    { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10", drill: "value" },
+    { title: "Avg Route Value", value: formatCurrency(stats.avgRouteValue), subtitle: `${routeWindowLabel} · per route`, icon: TrendingUp, color: "text-teal-400", bgColor: "bg-teal-500/10", drill: "value" },
+    { title: "Stops / Hour", value: fmt1(stats.todayStopsPerHour), subtitle: `${routeWindowLabel} · per working hour`, icon: Activity, color: "text-yellow-400", bgColor: "bg-yellow-500/10", drill: "stopsHour" },
   ];
 
   // THIS WEEK efficiency KPIs vs targets, plus the concrete work remaining.
@@ -1046,6 +1055,9 @@ export default function DashboardPage() {
                     {drill === "stops" && `Total Stops (${drillData.stopRows.length})`}
                     {drill === "completed" && `Completed Stops (${drillData.completedRows.length})`}
                     {drill === "remaining" && `Stops Remaining (${drillData.remainingRows.length})`}
+                    {drill === "drive" && `Drive Time by Route (${formatTime(drillData.routeRows.reduce((s, r) => s + r.driveMinutes, 0))} total)`}
+                    {drill === "value" && `Route Value by Route (${formatCurrency(drillData.routeRows.reduce((s, r) => s + r.routeValue, 0))} total)`}
+                    {drill === "stopsHour" && "Stops / Hour by Route"}
                   </DialogTitle>
                   <DialogDescription>
                     {routeWindowLabel}
@@ -1057,45 +1069,86 @@ export default function DashboardPage() {
                   </DialogDescription>
                 </DialogHeader>
                 <div className="max-h-[65vh] overflow-y-auto">
-                  {drill === "routes" ? (
-                    <table className="w-full text-sm">
-                      <thead className="sticky top-0 bg-background">
-                        <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
-                          <th className="py-2 pr-4 font-medium">Date</th>
-                          <th className="py-2 pr-4 font-medium">Technician</th>
-                          <th className="py-2 pr-4 font-medium">Template</th>
-                          <th className="py-2 pr-4 font-medium">Group</th>
-                          <th className="py-2 pr-4 font-medium text-right">Completed</th>
-                          <th className="py-2 pr-4 font-medium text-right">Stops</th>
-                          <th className="py-2 pr-4 font-medium text-right">Drive</th>
-                          <th className="py-2 font-medium text-right">Route Value</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {drillData.routeRows.map((r) => (
-                          <tr key={r.key} className="border-b border-border/20 last:border-0">
-                            <td className="py-2 pr-4 text-foreground whitespace-nowrap">{r.date}</td>
-                            <td className="py-2 pr-4 text-foreground">{r.techName}</td>
-                            <td className="py-2 pr-4">
-                              {r.template
-                                ? <Badge variant="secondary" className="font-medium">{r.template}</Badge>
-                                : <span className="text-muted-foreground/40">—</span>}
-                            </td>
-                            <td className="py-2 pr-4 text-muted-foreground">{r.group || "—"}</td>
-                            <td className={`py-2 pr-4 text-right tabular-nums ${r.completed >= r.totalStops ? "text-emerald-400" : "text-foreground"}`}>{r.completed}</td>
-                            <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{r.totalStops}</td>
-                            <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground whitespace-nowrap">
-                              {r.driveEstimated ? "~" : ""}{formatTime(r.driveMinutes)}
-                              {r.driveEstimated && <span className="ml-1 text-[10px] text-amber-400/80 align-middle" title="Straight-line estimate — real Google drive time lands on the next sync">est</span>}
-                            </td>
-                            <td className="py-2 text-right tabular-nums text-foreground">{formatCurrency(r.routeValue)}</td>
-                          </tr>
-                        ))}
-                        {drillData.routeRows.length === 0 && (
-                          <tr><td colSpan={8} className="py-6 text-center text-muted-foreground/60 text-sm">No routes in this view.</td></tr>
-                        )}
-                      </tbody>
-                    </table>
+                  {drill === "routes" || drill === "drive" || drill === "value" || drill === "stopsHour" ? (
+                    (() => {
+                      // Same per-route table for every route-level metric —
+                      // sorted by the metric that was clicked (worst/biggest
+                      // first), date/tech order for the plain Routes view.
+                      const rows = [...drillData.routeRows].sort((a, b) => {
+                        if (drill === "drive") return b.driveMinutes - a.driveMinutes;
+                        if (drill === "value") return b.routeValue - a.routeValue;
+                        if (drill === "stopsHour") return (b.stopsPerHour ?? -1) - (a.stopsPerHour ?? -1);
+                        return a.date.localeCompare(b.date) || a.techName.localeCompare(b.techName);
+                      });
+                      const focus = (kind: string) =>
+                        drill === kind ? "text-foreground font-semibold" : "text-muted-foreground";
+                      return (
+                        <table className="w-full text-sm">
+                          <thead className="sticky top-0 bg-background">
+                            <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                              <th className="py-2 pr-4 font-medium">Date</th>
+                              <th className="py-2 pr-4 font-medium">Technician</th>
+                              <th className="py-2 pr-4 font-medium">Template</th>
+                              <th className="py-2 pr-4 font-medium">Group</th>
+                              <th className="py-2 pr-4 font-medium text-right">Completed</th>
+                              <th className="py-2 pr-4 font-medium text-right">Stops</th>
+                              <th className="py-2 pr-4 font-medium text-right">Drive</th>
+                              <th className="py-2 pr-4 font-medium text-right">Stops/Hr</th>
+                              <th className="py-2 font-medium text-right">Route Value</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rows.map((r) => (
+                              <tr key={r.key} className="border-b border-border/20 last:border-0">
+                                <td className="py-2 pr-4 text-foreground whitespace-nowrap">{r.date}</td>
+                                <td className="py-2 pr-4 text-foreground">{r.techName}</td>
+                                <td className="py-2 pr-4">
+                                  {r.template
+                                    ? <Badge variant="secondary" className="font-medium">{r.template}</Badge>
+                                    : <span className="text-muted-foreground/40">—</span>}
+                                </td>
+                                <td className="py-2 pr-4 text-muted-foreground">{r.group || "—"}</td>
+                                <td className={`py-2 pr-4 text-right tabular-nums ${r.completed >= r.totalStops ? "text-emerald-400" : "text-foreground"}`}>{r.completed}</td>
+                                <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{r.totalStops}</td>
+                                <td className={`py-2 pr-4 text-right tabular-nums whitespace-nowrap ${focus("drive")}`}>
+                                  {r.driveEstimated ? "~" : ""}{formatTime(r.driveMinutes)}
+                                  {r.driveEstimated && <span className="ml-1 text-[10px] text-amber-400/80 align-middle" title="Straight-line estimate — real Google drive time lands on the next sync">est</span>}
+                                </td>
+                                <td className={`py-2 pr-4 text-right tabular-nums ${focus("stopsHour")}`}>
+                                  {r.stopsPerHour === null ? "—" : r.stopsPerHour.toFixed(1)}
+                                </td>
+                                <td className={`py-2 text-right tabular-nums ${drill === "value" ? "text-foreground font-semibold" : "text-foreground"}`}>{formatCurrency(r.routeValue)}</td>
+                              </tr>
+                            ))}
+                            {rows.length === 0 && (
+                              <tr><td colSpan={9} className="py-6 text-center text-muted-foreground/60 text-sm">No routes in this view.</td></tr>
+                            )}
+                            {rows.length > 1 && (
+                              <tr className="border-t border-border/40">
+                                <td colSpan={4} className="py-2 pr-4 text-xs text-muted-foreground/60">Total · avg per route</td>
+                                <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{rows.reduce((s, r) => s + r.completed, 0)}</td>
+                                <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{rows.reduce((s, r) => s + r.totalStops, 0)}</td>
+                                <td className={`py-2 pr-4 text-right tabular-nums whitespace-nowrap ${focus("drive")}`}>
+                                  {formatTime(rows.reduce((s, r) => s + r.driveMinutes, 0))}
+                                  <span className="block text-[10px] text-muted-foreground/50">{formatTime(Math.round(rows.reduce((s, r) => s + r.driveMinutes, 0) / rows.length))} avg</span>
+                                </td>
+                                <td className={`py-2 pr-4 text-right tabular-nums ${focus("stopsHour")}`}>
+                                  {(() => {
+                                    const work = rows.reduce((s, r) => s + r.workMinutes, 0);
+                                    const stops = rows.reduce((s, r) => s + r.totalStops, 0);
+                                    return work > 0 ? (stops / (work / 60)).toFixed(1) : "—";
+                                  })()}
+                                </td>
+                                <td className={`py-2 text-right tabular-nums ${drill === "value" ? "text-foreground font-semibold" : "text-muted-foreground"}`}>
+                                  {formatCurrency(rows.reduce((s, r) => s + r.routeValue, 0))}
+                                  <span className="block text-[10px] text-muted-foreground/50">{formatCurrency(rows.reduce((s, r) => s + r.routeValue, 0) / rows.length)} avg</span>
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      );
+                    })()
                   ) : (
                     (() => {
                       const rows = drill === "completed" ? drillData.completedRows
@@ -1141,13 +1194,13 @@ export default function DashboardPage() {
                     })()
                   )}
                 </div>
-                {drill !== "routes" && drillData.hasUnknown && (
+                {(drill === "stops" || drill === "completed" || drill === "remaining") && drillData.hasUnknown && (
                   <p className="text-xs text-muted-foreground/50">
                     Some past stops don&apos;t have per-stop completion detail yet — re-pick the date range (or run a sync)
                     to verify them against FieldRoutes.
                   </p>
                 )}
-                {drill === "routes" && drillData.hasEstimatedDrive && (
+                {(drill === "routes" || drill === "drive" || drill === "value" || drill === "stopsHour") && drillData.hasEstimatedDrive && (
                   <p className="text-xs text-muted-foreground/50">
                     <span className="text-amber-400/80">~est</span> drive times are straight-line estimates — real Google
                     drive times replace them on the next sync (today&apos;s routes are upgraded first).
