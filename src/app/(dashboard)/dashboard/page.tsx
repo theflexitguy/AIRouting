@@ -105,6 +105,7 @@ interface DashboardStats {
   todayRoutes: number;
   totalStops: number;
   completedToday: number;
+  completedInScope: number;
   stopsLeftToday: number;
   estimatedDriveTime: number;
   totalRouteValue: number;
@@ -135,6 +136,7 @@ interface RouteRec extends RouteLike {
   techName?: string;
   routeGroupTitle?: string;
   routeValue?: number;
+  completedStops?: number; // stamped by the historical reconcile (appointment status 1)
 }
 interface JobRec extends JobLike {
   status?: string;
@@ -494,6 +496,13 @@ export default function DashboardPage() {
     const completedToday = rawJobs.filter(
       j => j.subscriptionLastCompletedDate === today && jobInFilterScope(j)
     ).length;
+    // With a custom range active, "Completed" means completions IN THE RANGE —
+    // summed from the per-route completedStops the historical reconcile stamps
+    // from actual appointment statuses (today's live view keeps the job-doc
+    // based count above).
+    const completedInScope = dateFilterEnabled
+      ? todaySet.reduce((s, r) => s + (Number(r.completedStops) || 0), 0)
+      : completedToday;
 
     // Work still sitting on routes: future days count whole, today counts booked
     // minus what's already been completed (as of the last sync). Past days are
@@ -584,6 +593,7 @@ export default function DashboardPage() {
       todayRoutes: todaySet.length,
       totalStops,
       completedToday,
+      completedInScope,
       stopsLeftToday,
       estimatedDriveTime,
       totalRouteValue,
@@ -669,7 +679,7 @@ export default function DashboardPage() {
   const todayCards = [
     { title: "Routes", value: String(stats.todayRoutes), subtitle: `${routeWindowLabel} · active routes`, icon: Route, color: "text-blue-400", bgColor: "bg-blue-500/10" },
     { title: "Total Stops", value: String(stats.totalStops), subtitle: `${routeWindowLabel} · all techs`, icon: Briefcase, color: "text-purple-400", bgColor: "bg-purple-500/10" },
-    { title: "Completed", value: String(stats.completedToday), subtitle: "today · as of last sync", icon: CheckCircle2, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
+    { title: "Completed", value: String(stats.completedInScope), subtitle: dateFilterEnabled ? `${routeWindowLabel} · completed stops` : "today · as of last sync", icon: CheckCircle2, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
     { title: "Stops Remaining", value: String(stats.stopsLeftToday), subtitle: `${routeWindowLabel} · still on routes`, icon: ListTodo, color: "text-sky-400", bgColor: "bg-sky-500/10" },
     { title: "Drive Time", value: formatTime(stats.estimatedDriveTime), subtitle: `${routeWindowLabel} · total`, icon: Clock, color: "text-orange-400", bgColor: "bg-orange-500/10" },
     { title: "Total Route Value", value: formatCurrency(stats.totalRouteValue), subtitle: `${routeWindowLabel} · all routes`, icon: DollarSign, color: "text-emerald-400", bgColor: "bg-emerald-500/10" },
