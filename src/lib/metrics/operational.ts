@@ -325,16 +325,26 @@ export function isTrackedServiceLine(line: string): boolean {
 /**
  * Lawn target/done for a specific month, counted DIRECTLY from the round
  * subscriptions rather than the seasonality-rate formula. Lawn is a 7-round
- * program where each customer's round is due on a real date inside its ~6-week
- * window, so "how many are due this month" is the honest count:
+ * program where each customer's round is due inside its real cycle window
+ * (synced from FieldRoutes' servicePlanRound resource), so "how many rounds
+ * belong to this month" is the honest count:
  *   done   = round subs COMPLETED this month (lastCompleted in [monthStart, today])
- *   left   = round subs still DUE this month  (serviceDue in [monthStart, monthEnd],
- *            not already completed this month)
- *   target = done + left (every round appointment that belongs to this month)
+ *   left   = round subs still DUE by month end whose WINDOW includes this month
+ *   target = done + left
+ * Two guards keep the number honest (a July target once read 181 against ~82
+ * active plans without them):
+ *   - WINDOW GATE: a round only counts as due in a month its actual window
+ *     covers. FieldRoutes nextService dates drift (last year's completion +
+ *     interval), so a Round 5 could claim a July due date while its real window
+ *     is Aug 1 – Sep 15 — those must not inflate July.
+ *   - OVERDUE SPILLOVER: within the window, a round due earlier in the window
+ *     but not yet completed is still this month's work (an unserviced June
+ *     Round 4 is July work, not silently dropped).
  * Counts subscriptions (each round is its own sub), not distinct customers.
  */
 function lawnMonthTargetDone(
   lawnJobs: JobLike[],
+  month: number,
   monthStart: string,
   monthEnd: string,
   today: string,
@@ -348,8 +358,11 @@ function lawnMonthTargetDone(
       done++;
       continue;
     }
+    if (!activeInMonth(j, month)) continue; // window gate
     const sd = j.scheduledDate;
-    if (sd && sd >= monthStart && sd <= monthEnd) due++;
+    if (!sd || sd > monthEnd) continue; // due by end of this month (incl. spillover)
+    if (lc && lc >= sd) continue; // this cycle already serviced (completed a prior month)
+    due++;
   }
   return { target: done + due, done };
 }
@@ -378,7 +391,7 @@ export function monthlyTargetsByLine(
   const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number } => {
     // Lawn is counted by rounds actually due this month; every other line uses
     // the seasonality-aware expected-services-per-month rate.
-    if (line === "lawn") return lawnMonthTargetDone(lineJobs, monthStart, monthEnd, today);
+    if (line === "lawn") return lawnMonthTargetDone(lineJobs, month, monthStart, monthEnd, today);
     return {
       target: monthlyServiceTarget(lineJobs, month),
       done: monthlyServiced(lineJobs, monthStart, today),

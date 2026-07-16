@@ -109,15 +109,17 @@ export function serviceLineMeta(line: ServiceLine): ServiceLineMeta {
 // field, not set per round subscription), so the window is looked up by round
 // number instead of read off the subscription. Month-level approximation of the
 // day-level schedule (a day landing mid-month rounds to that month, so adjacent
-// rounds share their boundary month — e.g. both R2 and R3 touch April).
-//   R1  01/01–02/28   R2  03/01–04/14   R3  04/15–05/31   R4  06/01–07/15
-//   R5  07/16–08/31   R6  09/01–10/15   R7  10/16–11/30
+// rounds share their boundary month — e.g. both R2 and R3 touch April). Owner's
+// FieldRoutes round calendar (fallback only — the sync prefers the REAL
+// per-cycle window from the servicePlanRound resource when available):
+//   R1  01/25–02/28   R2  03/01–04/14   R3  04/15–05/31   R4  06/01–07/31
+//   R5  08/01–09/15   R6  09/16–10/15   R7  10/16–11/30
 const LAWN_ROUND_SEASONS: Record<number, { startMonth: number; endMonth: number }> = {
   1: { startMonth: 1, endMonth: 2 },
   2: { startMonth: 3, endMonth: 4 },
   3: { startMonth: 4, endMonth: 5 },
   4: { startMonth: 6, endMonth: 7 },
-  5: { startMonth: 7, endMonth: 8 },
+  5: { startMonth: 8, endMonth: 9 },
   6: { startMonth: 9, endMonth: 10 },
   7: { startMonth: 10, endMonth: 11 },
 };
