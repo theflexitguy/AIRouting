@@ -3,7 +3,7 @@
 // are AUTO-COMPUTED from data we already pull — there is no manual weekly logging.
 
 import { parseFrequencyDays } from "@/lib/production-value";
-import { serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
+import { serviceLineMeta, lawnRoundNumberForWindow, type ServiceLine } from "@/lib/routing/service-line";
 
 /** Minimal shape of a route doc this module needs. */
 export interface RouteLike {
@@ -346,36 +346,63 @@ export function isTrackedServiceLine(line: string): boolean {
  * A round with NO stamped window falls back to a strict in-month rule (due date
  * within this month) so dead earlier-year rounds don't pile onto later months.
  */
+export interface LawnRoundBreakdown {
+  label: string; // "Round 4"
+  round: number | null; // 1–7, null when unresolved (window-less)
+  target: number;
+  done: number;
+}
+
 function lawnMonthTargetDone(
   lawnJobs: JobLike[],
   month: number,
   monthStart: string,
   monthEnd: string,
   today: string,
-): { target: number; done: number } {
+): { target: number; done: number; rounds: LawnRoundBreakdown[] } {
   const planKey = (j: JobLike) => String(j.customerId || j.subscriptionId || "");
-  // Is this round sub the plan's CURRENT round for this month? A stamped window
-  // must cover the month; a window-less sub can't be gated so it passes here and
-  // is constrained by the date rules in each pass instead.
+  // Is this round sub a CURRENT round for this month? A stamped window must
+  // cover the month; a window-less sub can't be gated so it passes here and is
+  // constrained by the date rules in each pass instead. A STRADDLE month (a
+  // round ends mid-month and the next begins — e.g. April: R2 Mar–Apr and
+  // R3 Apr–May, or September: R5 and R6) legitimately has two active rounds;
+  // both pass and are reported separately.
   const isCurrentRound = (j: JobLike) => {
     const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
     return !hasWindow || activeInMonth(j, month);
   };
-  const donePlans = new Set<string>();
-  const duePlans = new Set<string>();
+  // Group by round so a straddle month shows each round on its own. Dedupe by
+  // plan WITHIN a round (a plan counts once per round), but a plan genuinely
+  // getting two visits this month — its ending round + its starting round —
+  // shows in both, which is real work.
+  const roundKeyOf = (j: JobLike): string => {
+    const n = lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
+    return n !== null ? `R${n}` : "R?";
+  };
+  const groups = new Map<string, { round: number | null; done: Set<string>; due: Set<string> }>();
+  const groupFor = (j: JobLike) => {
+    const k = roundKeyOf(j);
+    if (!groups.has(k)) {
+      const n = lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
+      groups.set(k, { round: n, done: new Set(), due: new Set() });
+    }
+    return groups.get(k)!;
+  };
+
   // Pass 1: plans whose current-round visit completed this month.
   for (const j of lawnJobs) {
     if (j.inScope === false || j.pendingCancel === true) continue;
     if (!isCurrentRound(j)) continue;
     const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) donePlans.add(planKey(j));
+    if (lc && lc >= monthStart && lc <= today) groupFor(j).done.add(planKey(j));
   }
-  // Pass 2: plans (not already done) whose current-round visit is still due this month.
+  // Pass 2: plans (not already done for that round) whose current-round visit is still due this month.
   for (const j of lawnJobs) {
     if (j.inScope === false || j.pendingCancel === true) continue;
     if (!isCurrentRound(j)) continue;
+    const g = groupFor(j);
     const key = planKey(j);
-    if (donePlans.has(key)) continue; // this plan already counted as done
+    if (g.done.has(key)) continue; // this plan already counted done for this round
     const lc = j.subscriptionLastCompletedDate;
     if (lc && lc >= monthStart && lc <= today) continue;
     const hasWindow = Boolean(j.isSeasonal && j.seasonalStartMonth && j.seasonalEndMonth);
@@ -383,11 +410,22 @@ function lawnMonthTargetDone(
     if (!sd || sd > monthEnd) continue; // due by end of this month
     if (!hasWindow && sd < monthStart) continue; // strict in-month for window-less rounds
     if (lc && lc >= sd) continue; // this cycle already serviced (completed a prior month)
-    duePlans.add(key);
+    g.due.add(key);
   }
-  const done = donePlans.size;
-  const due = duePlans.size;
-  return { target: done + due, done };
+
+  const rounds: LawnRoundBreakdown[] = Array.from(groups.values())
+    .map((g) => ({
+      label: g.round !== null ? `Round ${g.round}` : "Lawn",
+      round: g.round,
+      done: g.done.size,
+      target: g.done.size + g.due.size,
+    }))
+    .filter((r) => r.target > 0)
+    .sort((a, b) => (a.round ?? 99) - (b.round ?? 99));
+
+  const done = rounds.reduce((s, r) => s + r.done, 0);
+  const target = rounds.reduce((s, r) => s + r.target, 0);
+  return { target, done, rounds };
 }
 
 export interface LineTarget {
@@ -396,6 +434,10 @@ export interface LineTarget {
   target: number;
   done: number;
   pace: PaceResult;
+  // Lawn only: per-round split of this month's target/done. In a straddle month
+  // (a round ends mid-month and the next begins) this has 2 entries so the card
+  // can show each round; otherwise 1 (or empty for non-lawn lines).
+  rounds?: LawnRoundBreakdown[];
 }
 
 /**
@@ -411,7 +453,7 @@ export function monthlyTargetsByLine(
   monthEnd: string,
   today: string,
 ): LineTarget[] {
-  const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number } => {
+  const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number; rounds?: LawnRoundBreakdown[] } => {
     // Lawn is counted by rounds actually due this month; every other line uses
     // the seasonality-aware expected-services-per-month rate.
     if (line === "lawn") return lawnMonthTargetDone(lineJobs, month, monthStart, monthEnd, today);
@@ -423,8 +465,8 @@ export function monthlyTargetsByLine(
 
   const rows: LineTarget[] = TARGET_SERVICE_LINES.map((line) => {
     const lineJobs = jobs.filter((j) => lineOf(j) === line);
-    const { target, done } = targetDoneFor(line, lineJobs);
-    return { line, label: TARGET_SERVICE_LINE_LABELS[line], target, done, pace: monthlyPace(target, done, today) };
+    const { target, done, rounds } = targetDoneFor(line, lineJobs);
+    return { line, label: TARGET_SERVICE_LINE_LABELS[line], target, done, pace: monthlyPace(target, done, today), rounds };
   });
   // Total sums the per-line figures so Lawn's due-count contributes consistently.
   const target = rows.reduce((s, r) => s + r.target, 0);
