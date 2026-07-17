@@ -452,10 +452,50 @@ export interface LineTarget {
 }
 
 /**
+ * Exact "due this month" target for an ANNUAL line (Termite): each subscription
+ * renews once a year on its anniversary, so the honest target is the exact set
+ * of subs whose renewal lands this month — NOT the 1/12-per-month rate spread
+ * (the "slinky" that put a slice of every annual sub on every month). Counts
+ * distinct customers so a customer with two termite subs isn't double-counted.
+ *   done   = customers whose termite renewal COMPLETED this month
+ *   left   = customers (not already done) with a termite renewal DUE this month
+ *   target = done + left
+ */
+function annualRenewalMonthTargetDone(
+  jobs: JobLike[],
+  monthStart: string,
+  monthEnd: string,
+  today: string,
+): { target: number; done: number } {
+  const key = (j: JobLike) => String(j.customerId || j.subscriptionId || "");
+  const donePlans = new Set<string>();
+  const duePlans = new Set<string>();
+  for (const j of jobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && lc >= monthStart && lc <= today) donePlans.add(key(j));
+  }
+  for (const j of jobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    const k = key(j);
+    if (donePlans.has(k)) continue;
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && lc >= monthStart && lc <= today) continue;
+    const sd = j.scheduledDate;
+    if (!sd || sd < monthStart || sd > monthEnd) continue; // renewal must land THIS month
+    if (lc && lc >= sd) continue; // already serviced this cycle
+    duePlans.add(k);
+  }
+  return { target: donePlans.size + duePlans.size, done: donePlans.size };
+}
+
+/**
  * Per-service-line monthly targets + pace, plus a combined Total over the tracked
- * lines. Each line uses the same seasonality-aware target math as the company-wide
- * number, scoped to that line's subscriptions. Mosquito here includes Outdoor /
- * Boat Docks (they share the "mosquito" service line). GR and Wildlife are excluded.
+ * lines. Mosquito here includes Outdoor / Boat Docks (they share the "mosquito"
+ * service line). GR and Wildlife are excluded. Line-specific target math:
+ *   - Lawn: the current round's visits due this month (see lawnMonthTargetDone).
+ *   - Termite: the EXACT annual renewals due this month (no rate spread).
+ *   - Others: the seasonality-aware expected-services-per-month rate.
  */
 export function monthlyTargetsByLine(
   jobs: JobLike[],
@@ -465,9 +505,10 @@ export function monthlyTargetsByLine(
   today: string,
 ): LineTarget[] {
   const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number; rounds?: LawnRoundBreakdown[] } => {
-    // Lawn is counted by rounds actually due this month; every other line uses
-    // the seasonality-aware expected-services-per-month rate.
     if (line === "lawn") return lawnMonthTargetDone(lineJobs, month, monthStart, monthEnd, today);
+    // Termite is strictly annual — count the exact renewals due this month
+    // rather than spreading 1/12 of the book across every month.
+    if (line === "termite") return annualRenewalMonthTargetDone(lineJobs, monthStart, monthEnd, today);
     return {
       target: monthlyServiceTarget(lineJobs, month),
       done: monthlyServiced(lineJobs, monthStart, today),
