@@ -129,15 +129,15 @@ interface ApptInfo {
 const ROUTE_HISTORY_DAYS = 14;
 
 // Days after which a past day's route docs are LOCKED IN ("finalized"). Owner's
-// rule: 3 full days after a date, what ran is settled — so once every doc up to
-// today-3 is appointment-true AND carries a real Google drive time, the
+// rule: 1 full day after a date, what ran is settled — so once every doc up to
+// today-1 is appointment-true AND carries a real Google drive time, the
 // finalization watermark advances (rides the daily sync; the vercel.json cron
-// fires at 9:00 UTC = 4 AM Central, i.e. the early morning of "day 4").
+// fires at 9:00 UTC = 4 AM Central, i.e. the early morning of "day 2").
 // Finalized days are skipped by both the sync's trailing rebuild and the
 // on-demand range verification, so pulling a month or quarter serves straight
 // from stored route docs with ZERO FieldRoutes/Google spend. A forced range
 // re-verify remains available as the escape hatch for late edits.
-const FINALIZE_AFTER_DAYS = 3;
+const FINALIZE_AFTER_DAYS = 1;
 
 /** Latest date (inclusive) whose route docs are locked in. "" = none yet. */
 async function loadFinalizedThrough(
