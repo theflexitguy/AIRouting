@@ -157,6 +157,32 @@ export function lawnRoundWindowByNumber(round: unknown): { startMonth: number; e
   return LAWN_ROUND_SEASONS[n] || null;
 }
 
+// Day-level round windows (the owner's exact FieldRoutes round calendar) — used
+// to pace a round's monthly target across its real date span (e.g. Round 5 runs
+// Aug 1 – Sept 15, so August gets ~30/45 of the book and September the rest).
+// Feb 28 end is a deliberate non-leap approximation; day precision here only
+// affects the pro-rata split, not membership.
+const LAWN_ROUND_WINDOWS: Record<number, { startMonth: number; startDay: number; endMonth: number; endDay: number }> = {
+  1: { startMonth: 1, startDay: 25, endMonth: 2, endDay: 28 },
+  2: { startMonth: 3, startDay: 1, endMonth: 4, endDay: 14 },
+  3: { startMonth: 4, startDay: 15, endMonth: 5, endDay: 31 },
+  4: { startMonth: 6, startDay: 1, endMonth: 7, endDay: 31 },
+  5: { startMonth: 8, startDay: 1, endMonth: 9, endDay: 15 },
+  6: { startMonth: 9, startDay: 16, endMonth: 10, endDay: 15 },
+  7: { startMonth: 10, startDay: 16, endMonth: 11, endDay: 30 },
+};
+
+/** ISO start/end dates of a round's window for a given year, or null. */
+export function lawnRoundWindowDates(round: unknown, year: string | number): { start: string; end: string } | null {
+  const w = LAWN_ROUND_WINDOWS[Number(round)];
+  if (!w) return null;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return {
+    start: `${year}-${p(w.startMonth)}-${p(w.startDay)}`,
+    end: `${year}-${p(w.endMonth)}-${p(w.endDay)}`,
+  };
+}
+
 /**
  * Best-match round NUMBER for a stamped seasonal window, or null. Round subs
  * carry real per-cycle windows (servicePlanRound) that may not equal the

@@ -8,7 +8,7 @@ import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { centralTodayISO, toDateOnly, num } from "@/lib/fieldroutes/scope";
 import { deriveServiceLine, serviceLineMeta, isInScopeForLine, lawnRoundSeasonalWindow, ServiceLine } from "@/lib/routing/service-line";
-import { TARGET_SERVICE_LINES, TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
+import { TARGET_SERVICE_LINES, TARGET_SERVICE_LINE_LABELS, monthlyTargetsByLine, type JobLike } from "@/lib/metrics/operational";
 
 // Live reconciliation for ALL service-line monthly targets in ONE FieldRoutes
 // pull: fetches every active subscription once, classifies each by line, and
@@ -132,6 +132,37 @@ async function handle(companyIdParam: string | undefined) {
       if (!storedByLine.has(ln)) storedByLine.set(ln, []);
       storedByLine.get(ln)!.push(d);
     }
+
+    // Exactly what the dashboard's "This month" cards show: run the real target
+    // math over the stored job docs so a number can be verified server-side
+    // (the client can't be inspected under Vercel auth / demo mode).
+    const monthStartISO = `${today.slice(0, 7)}-01`;
+    const monthEndDay = new Date(Number(today.slice(0, 4)), monthIndex, 0).getDate();
+    const monthEndISO = `${today.slice(0, 7)}-${String(monthEndDay).padStart(2, "0")}`;
+    const dashboardJobs: JobLike[] = jobsSnap.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        serviceLine: str(d.serviceLine) || deriveServiceLine(d.serviceType, d.fieldRoutesRouteGroup),
+        serviceType: str(d.serviceType),
+        scheduledDate: str(d.scheduledDate),
+        subscriptionLastCompletedDate: str(d.subscriptionLastCompletedDate),
+        customerId: str(d.customerId),
+        subscriptionId: str(d.subscriptionId),
+        isSeasonal: Boolean(d.isSeasonal),
+        seasonalStartMonth: d.seasonalStartMonth != null ? Number(d.seasonalStartMonth) : null,
+        seasonalEndMonth: d.seasonalEndMonth != null ? Number(d.seasonalEndMonth) : null,
+        inScope: d.inScope !== false,
+        pendingCancel: d.pendingCancel === true,
+        frequency: num(d.frequency),
+        recurringFrequency: str(d.recurringFrequency),
+      };
+    });
+    const dashboardTargets = monthlyTargetsByLine(dashboardJobs, monthIndex, monthStartISO, monthEndISO, today).map((t) => ({
+      line: t.line,
+      target: t.target,
+      done: t.done,
+      rounds: t.rounds,
+    }));
 
     const tracked = new Set<string>(TARGET_SERVICE_LINES as readonly string[]);
     const lines: LineAgg[] = ALL_LINES.map((line) => ({
@@ -259,6 +290,7 @@ async function handle(companyIdParam: string | undefined) {
     return NextResponse.json({
       today,
       monthIndex,
+      dashboardTargets,
       totalActiveSubscriptionsPulled: subs.length,
       totalStoredJobDocs: jobsSnap.size,
       lines,

@@ -1403,8 +1403,10 @@ export default function DashboardPage() {
                             {lt.line === "lawn" && (
                               <p className="text-[11px] text-muted-foreground/50">
                                 {lt.rounds && lt.rounds.length > 1
-                                  ? "two rounds active this month · done/target per round"
-                                  : "current round visits due this month (one per plan)"}
+                                  ? "two rounds active · target paced to finish each on time"
+                                  : lt.rounds && lt.rounds[0]
+                                    ? `Round ${lt.rounds[0].round} book ${lt.rounds[0].book} · paced to finish by the round's end`
+                                    : "current round · paced to finish on time"}
                               </p>
                             )}
                           </div>
