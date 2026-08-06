@@ -8,9 +8,16 @@ import {
   lawnRoundNumberForWindow,
   lawnRoundNumberFromServiceType,
   lawnRoundsForMonth,
-  lawnRoundWindowByNumber,
+  lawnRoundWindowDates,
   type ServiceLine,
 } from "@/lib/routing/service-line";
+
+const MS_PER_DAY = 86_400_000;
+/** Whole days from ISO date `a` to ISO date `b` (b − a). Negative if b < a. */
+function daysBetween(a: string, b: string): number {
+  return Math.round((Date.parse(b) - Date.parse(a)) / MS_PER_DAY);
+}
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /** Minimal shape of a route doc this module needs. */
 export interface RouteLike {
@@ -331,36 +338,41 @@ export function isTrackedServiceLine(line: string): boolean {
   return (TARGET_SERVICE_LINES as readonly string[]).includes(line);
 }
 
-/**
- * Lawn target/done for a specific month. Owner's rule: for lawn, count ONLY the
- * CURRENT ROUND, and only the part of it that belongs to THIS month. Lawn is a
- * 7-round program and FieldRoutes models EACH round as its own subscription, so
- * one plan (customer) owns several round sub-records at once — the "current
- * round" for a plan in a given month is the round sub whose seasonal window
- * covers that month (Round 4's window covers July; Round 5's is Aug 1 – Sep 15).
- *
- * Counted as DISTINCT PLANS (customers) — the unit the owner counts in ("82
- * lawn service plans") — so a plan can't be counted twice (e.g. its Round 4
- * completed AND its Round 5 next-service date drifted into July, which pushed
- * July to 113 against 82 plans). Both passes are gated to the current round:
- *   done = plans whose CURRENT-ROUND visit completed this month
- *   left = plans (not already done) whose CURRENT-ROUND visit is still due this
- *          month (incl. overdue-but-in-window spillover — an unserviced June
- *          Round 4 is still July work)
- *   target = done + left  (≤ active plan count)
- *
- * "Current round" = the round sub whose stamped window covers this month
- * (activeInMonth). Windows come from FieldRoutes' servicePlanRound resource.
- * A round with NO stamped window falls back to a strict in-month rule (due date
- * within this month) so dead earlier-year rounds don't pile onto later months.
- */
 export interface LawnRoundBreakdown {
   label: string; // "Round 4"
   round: number | null; // 1–7, null when unresolved (window-less)
   target: number;
   done: number;
+  book: number; // total plans in this round's book (whole-round count)
 }
 
+/**
+ * Lawn target/done for a specific month — a PACE-TO-FINISH model. Owner's rule:
+ * a round is a batch of plans (its "book") to complete across the round's date
+ * window; the monthly target is the share of that book that should be done THIS
+ * month to finish the round on time, and the round's FINAL month shows whatever
+ * is left.
+ *
+ * Lawn is a 7-round program and FieldRoutes models EACH round as its own
+ * subscription, so a plan owns one sub per round. For each round active this
+ * month (usually one; a straddle month like September has two — R5 finishing +
+ * R6 starting):
+ *   book    = distinct plans holding an in-scope sub for that round
+ *   done    = plans whose round completed THIS month (this cycle)
+ *   pace    = book × (window days elapsed by month-end / total window days)
+ *   target  = pace − plans already completed in EARLIER months this cycle,
+ *             clamped to [0, book − earlier-done]
+ * So Round 5 (Aug 1 – Sep 15, ~45d): August targets ~30/45 of the book; then
+ * September (window ends the 15th → 100%) targets whatever's left, alongside
+ * Round 6's own paced share. This is why the old logic read 10 — it counted
+ * only plans with an appointment dated in this calendar month, which is nearly
+ * empty in a round's first week.
+ *
+ * Round attribution comes from the sub's service type ("Round N …", authoritative
+ * even before the window is re-stamped), else the stamped window; unresolved or
+ * other-round subs are excluded. Counted as distinct plans (customerId, sub id
+ * fallback) so a plan can't be double-counted within a round.
+ */
 function lawnMonthTargetDone(
   lawnJobs: JobLike[],
   month: number,
@@ -370,73 +382,87 @@ function lawnMonthTargetDone(
 ): { target: number; done: number; rounds: LawnRoundBreakdown[] } {
   const planKey = (j: JobLike) => String(j.customerId || j.subscriptionId || "");
   const year = monthStart.slice(0, 4);
-  // Rounds the CALENDAR says are active this month — the ONLY rounds counted.
-  // July → [4]; a straddle month like April → [2,3] (R2 Mar–Apr ending +
-  // R3 Apr–May beginning), September → [5,6]. A sub that doesn't resolve to one
-  // of these is excluded (it belongs to another round), so drifted next-service
-  // dates and window-less/unstamped subs can't invent a phantom "Lawn" bucket.
   const activeRounds = new Set(lawnRoundsForMonth(month));
-
-  // Resolve a sub's round: the "Round N" in its service type is authoritative
-  // and survives even when the seasonal window hasn't been (re)stamped yet;
-  // fall back to the stamped window. null = unattributable → not counted.
   const roundOf = (j: JobLike): number | null =>
     lawnRoundNumberFromServiceType(j.serviceType) ??
     lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
 
-  // Earliest ISO date a round's visit can legitimately be due this cycle — the
-  // first of its window's start month, this year — so a stale prior-cycle due
-  // date can't count as overdue spillover.
-  const roundFloor = (round: number): string => {
-    const w = lawnRoundWindowByNumber(round);
-    const startMonth = w ? w.startMonth : month;
-    return `${year}-${String(startMonth).padStart(2, "0")}-01`;
-  };
-
-  const groups = new Map<number, { done: Set<string>; due: Set<string> }>();
+  const groups = new Map<number, { book: Set<string>; doneThis: Set<string>; doneBefore: Set<string> }>();
   const groupFor = (round: number) => {
-    if (!groups.has(round)) groups.set(round, { done: new Set(), due: new Set() });
+    if (!groups.has(round)) groups.set(round, { book: new Set(), doneThis: new Set(), doneBefore: new Set() });
     return groups.get(round)!;
   };
 
-  // Pass 1: plans whose active-round visit completed this month.
   for (const j of lawnJobs) {
     if (j.inScope === false || j.pendingCancel === true) continue;
     const round = roundOf(j);
     if (round === null || !activeRounds.has(round)) continue;
-    const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) groupFor(round).done.add(planKey(j));
-  }
-  // Pass 2: plans (not already done for that round) whose visit is still due this month.
-  for (const j of lawnJobs) {
-    if (j.inScope === false || j.pendingCancel === true) continue;
-    const round = roundOf(j);
-    if (round === null || !activeRounds.has(round)) continue;
+    const win = lawnRoundWindowDates(round, year);
+    if (!win) continue;
     const g = groupFor(round);
     const key = planKey(j);
-    if (g.done.has(key)) continue; // this plan already counted done for this round
+    g.book.add(key);
     const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) continue;
-    const sd = j.scheduledDate;
-    if (!sd || sd > monthEnd) continue; // due by end of this month
-    if (sd < roundFloor(round)) continue; // ignore stale prior-cycle due dates
-    if (lc && lc >= sd) continue; // this cycle already serviced (completed a prior month)
-    g.due.add(key);
+    if (lc && lc >= win.start) {
+      // Completed within THIS cycle's window — this month vs an earlier month.
+      if (lc >= monthStart && lc <= today) g.doneThis.add(key);
+      else if (lc < monthStart) g.doneBefore.add(key);
+    }
   }
 
   const rounds: LawnRoundBreakdown[] = Array.from(groups.entries())
-    .map(([round, g]) => ({
-      label: `Round ${round}`,
-      round,
-      done: g.done.size,
-      target: g.done.size + g.due.size,
-    }))
-    .filter((r) => r.target > 0)
+    .map(([round, g]) => {
+      const win = lawnRoundWindowDates(round, year)!;
+      const totalDays = Math.max(1, daysBetween(win.start, win.end));
+      // Days of the window elapsed by the end of THIS month (clamped to the
+      // window's own end so a round finishing this month hits 100%).
+      const throughDay = monthEnd < win.end ? monthEnd : win.end;
+      const fraction = clamp(daysBetween(win.start, throughDay) / totalDays, 0, 1);
+      const book = g.book.size;
+      const doneBefore = g.doneBefore.size;
+      const plannedByMonthEnd = Math.round(book * fraction);
+      const target = clamp(plannedByMonthEnd - doneBefore, 0, book - doneBefore);
+      return { label: `Round ${round}`, round, target, done: g.doneThis.size, book };
+    })
+    .filter((r) => r.target > 0 || r.done > 0)
     .sort((a, b) => (a.round ?? 99) - (b.round ?? 99));
 
   const done = rounds.reduce((s, r) => s + r.done, 0);
   const target = rounds.reduce((s, r) => s + r.target, 0);
   return { target, done, rounds };
+}
+
+/**
+ * "Due this month" target for a line counted per STOP/subscription (Commercial,
+ * Termite): the exact set of subscriptions whose next service lands this month,
+ * not a rate spread across the year. Counts distinct subscriptions (a
+ * multi-location account contributes one per location due).
+ *   done   = subs COMPLETED this month (lastCompleted in [monthStart, today])
+ *   left   = subs (not already done) whose next service is DUE this month
+ *   target = done + left
+ */
+function dueThisMonthTargetDone(
+  jobs: JobLike[],
+  monthStart: string,
+  monthEnd: string,
+  today: string,
+): { target: number; done: number } {
+  const key = (j: JobLike) => String(j.subscriptionId || j.customerId || "");
+  const done = new Set<string>();
+  const due = new Set<string>();
+  for (const j of jobs) {
+    if (j.inScope === false || j.pendingCancel === true) continue;
+    const lc = j.subscriptionLastCompletedDate;
+    if (lc && lc >= monthStart && lc <= today) {
+      done.add(key(j));
+      continue;
+    }
+    const sd = j.scheduledDate;
+    if (!sd || sd < monthStart || sd > monthEnd) continue; // next service must land THIS month
+    if (lc && lc >= sd) continue; // already serviced this cycle
+    due.add(key(j));
+  }
+  return { target: done.size + due.size, done: done.size };
 }
 
 export interface LineTarget {
@@ -452,49 +478,11 @@ export interface LineTarget {
 }
 
 /**
- * Exact "due this month" target for an ANNUAL line (Termite): each subscription
- * renews once a year on its anniversary, so the honest target is the exact set
- * of subs whose renewal lands this month — NOT the 1/12-per-month rate spread
- * (the "slinky" that put a slice of every annual sub on every month). Counts
- * distinct customers so a customer with two termite subs isn't double-counted.
- *   done   = customers whose termite renewal COMPLETED this month
- *   left   = customers (not already done) with a termite renewal DUE this month
- *   target = done + left
- */
-function annualRenewalMonthTargetDone(
-  jobs: JobLike[],
-  monthStart: string,
-  monthEnd: string,
-  today: string,
-): { target: number; done: number } {
-  const key = (j: JobLike) => String(j.customerId || j.subscriptionId || "");
-  const donePlans = new Set<string>();
-  const duePlans = new Set<string>();
-  for (const j of jobs) {
-    if (j.inScope === false || j.pendingCancel === true) continue;
-    const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) donePlans.add(key(j));
-  }
-  for (const j of jobs) {
-    if (j.inScope === false || j.pendingCancel === true) continue;
-    const k = key(j);
-    if (donePlans.has(k)) continue;
-    const lc = j.subscriptionLastCompletedDate;
-    if (lc && lc >= monthStart && lc <= today) continue;
-    const sd = j.scheduledDate;
-    if (!sd || sd < monthStart || sd > monthEnd) continue; // renewal must land THIS month
-    if (lc && lc >= sd) continue; // already serviced this cycle
-    duePlans.add(k);
-  }
-  return { target: donePlans.size + duePlans.size, done: donePlans.size };
-}
-
-/**
  * Per-service-line monthly targets + pace, plus a combined Total over the tracked
  * lines. Mosquito here includes Outdoor / Boat Docks (they share the "mosquito"
  * service line). GR and Wildlife are excluded. Line-specific target math:
- *   - Lawn: the current round's visits due this month (see lawnMonthTargetDone).
- *   - Termite: the EXACT annual renewals due this month (no rate spread).
+ *   - Lawn: the current round's book, paced across its date window (lawnMonthTargetDone).
+ *   - Termite & Commercial: the exact stops/subscriptions due this month (no rate spread).
  *   - Others: the seasonality-aware expected-services-per-month rate.
  */
 export function monthlyTargetsByLine(
@@ -506,9 +494,9 @@ export function monthlyTargetsByLine(
 ): LineTarget[] {
   const targetDoneFor = (line: TargetServiceLine, lineJobs: JobLike[]): { target: number; done: number; rounds?: LawnRoundBreakdown[] } => {
     if (line === "lawn") return lawnMonthTargetDone(lineJobs, month, monthStart, monthEnd, today);
-    // Termite is strictly annual — count the exact renewals due this month
-    // rather than spreading 1/12 of the book across every month.
-    if (line === "termite") return annualRenewalMonthTargetDone(lineJobs, monthStart, monthEnd, today);
+    // Termite and Commercial: count the exact stops due this month rather than
+    // spreading the book evenly across every month.
+    if (line === "termite" || line === "commercial") return dueThisMonthTargetDone(lineJobs, monthStart, monthEnd, today);
     return {
       target: monthlyServiceTarget(lineJobs, month),
       done: monthlyServiced(lineJobs, monthStart, today),
