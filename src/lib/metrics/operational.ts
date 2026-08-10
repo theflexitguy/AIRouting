@@ -515,6 +515,71 @@ export function monthlyTargetsByLine(
   return rows;
 }
 
+/**
+ * Per-line COMPLETED count from ROUTE docs in [start, end] — the appointment-true
+ * historical record. Preferred over job-doc lastCompleted for an as-of-date view:
+ * a job doc only remembers its LATEST completion, so once a subscription rolls
+ * forward its earlier visit becomes invisible, silently undercounting the past.
+ * Route docs are finalized per day and never roll, so they answer "what had we
+ * actually completed by Friday?" exactly.
+ *
+ * Counts DISTINCT stop ids per line (a stop id is one subscription), matching the
+ * per-subscription/per-plan unit the targets are expressed in, so a same-month
+ * repeat visit doesn't double-count.
+ */
+export function completedByLineFromRoutes(
+  routes: Array<{ date?: string; stops?: Array<{ id?: string; completed?: boolean }> }>,
+  lineOfStopId: (stopId: string) => string,
+  start: string,
+  end: string,
+): Record<string, number> {
+  const seen = new Map<string, Set<string>>();
+  for (const r of routes) {
+    const d = String(r.date ?? "");
+    if (!d || d < start || d > end) continue;
+    for (const s of r.stops || []) {
+      if (s?.completed !== true) continue;
+      const id = String(s.id ?? "");
+      if (!id) continue;
+      const line = lineOfStopId(id);
+      if (!line) continue;
+      if (!seen.has(line)) seen.set(line, new Set());
+      seen.get(line)!.add(id);
+    }
+  }
+  const out: Record<string, number> = {};
+  for (const [line, ids] of seen) out[line] = ids.size;
+  return out;
+}
+
+/** Do the given route docs cover every day in [start, end]? (as-of data completeness) */
+export function routesCoverRange(
+  routes: Array<{ date?: string }>,
+  start: string,
+  end: string,
+): boolean {
+  if (start > end) return false;
+  const have = new Set(routes.map((r) => String(r.date ?? "")).filter(Boolean));
+  // Weekend days legitimately have no routes, so only weekdays must be present.
+  let cursor = Date.parse(`${start}T00:00:00Z`);
+  const endMs = Date.parse(`${end}T00:00:00Z`);
+  if (!Number.isFinite(cursor) || !Number.isFinite(endMs)) return false;
+  let weekdays = 0;
+  let covered = 0;
+  while (cursor <= endMs) {
+    const dt = new Date(cursor);
+    const dow = dt.getUTCDay();
+    if (dow !== 0 && dow !== 6) {
+      weekdays++;
+      if (have.has(dt.toISOString().slice(0, 10))) covered++;
+    }
+    cursor += MS_PER_DAY;
+  }
+  // Allow a few blank weekdays (holidays, genuinely empty days) before declaring
+  // the window unusable — the fallback path is a coarser estimate, not an error.
+  return weekdays === 0 || covered >= weekdays - 3;
+}
+
 // ── Historical period selector (targets vs actuals over past ranges) ──────────
 
 export type DashboardPeriod =
