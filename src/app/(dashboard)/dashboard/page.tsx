@@ -29,7 +29,10 @@ import {
   avgDriveTime,
   monthlyServiced,
   weeklyPace,
+  monthlyPace,
   monthlyTargetsByLine,
+  completedByLineFromRoutes,
+  routesCoverRange,
   isTrackedServiceLine,
   scheduledCountByLine,
   scheduledTrackedTotal,
@@ -91,6 +94,7 @@ import {
   startOfMonth,
   endOfMonth,
   subWeeks,
+  subDays,
 } from "date-fns";
 
 interface WeekKpis {
@@ -233,6 +237,11 @@ export default function DashboardPage() {
   // the live current-month cards; any other period loads cached per-month
   // aggregates + a rate-based target baseline.
   const [period, setPeriod] = useState<DashboardPeriod>("this_month");
+  // "As of" date for Targets by Service: rewind the month-to-date picture to a
+  // past day (e.g. last Friday) to see where each line stood vs where it should
+  // have been that far through the month. "" = live (today).
+  const [asOfDate, setAsOfDate] = useState("");
+  const [asOfRoutes, setAsOfRoutes] = useState<RouteRec[] | null>(null);
   const [rangeDone, setRangeDone] = useState<{
     byLine: Record<string, number>;
     initials: number;
@@ -450,6 +459,33 @@ export default function DashboardPage() {
     })();
     return () => { cancelled = true; };
   }, [userProfile, dateFilterEnabled, dateFrom, dateTo, rangeSyncTick]);
+
+  // Routes covering [month start .. as-of date] for the as-of targets view. The
+  // 8-week trend window already covers most in-month lookbacks, so this only
+  // fetches when it doesn't (e.g. asking about a day in a prior month).
+  useEffect(() => {
+    const companyId = userProfile?.companyId;
+    if (!companyId || !asOfDate) { setAsOfRoutes(null); return; }
+    const mStart = format(startOfMonth(parseISO(asOfDate)), "yyyy-MM-dd");
+    if (routesCoverRange(rawRoutes, mStart, asOfDate)) { setAsOfRoutes(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const snap = await getDocs(
+          query(
+            collection(db, `companies/${companyId}/routes`),
+            where("date", ">=", mStart),
+            where("date", "<=", asOfDate)
+          )
+        );
+        if (!cancelled) setAsOfRoutes(snap.docs.map(d => d.data() as RouteRec));
+      } catch (e) {
+        console.error("As-of routes error:", e);
+        if (!cancelled) setAsOfRoutes([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [userProfile, asOfDate, rawRoutes]);
 
   // Live-verify a custom range: rebuild the PAST days of the range from actual
   // FieldRoutes appointments (cancellations/reschedules drop off, emptied routes
@@ -905,6 +941,45 @@ export default function DashboardPage() {
     };
   }, [scopedRoutes, jobsByDocId, today]);
 
+  // Targets by Service rewound to `asOfDate` (null when live). The month's TARGET
+  // is unchanged — what moves is how much was done by that date and how far
+  // through the month it was, which is exactly the "where should we have been on
+  // Friday?" comparison. "Done" comes from finalized ROUTE docs (appointment
+  // truth that never rolls forward); if routes don't cover the month-to-date
+  // window we fall back to subscription last-completed dates and say so, since
+  // that source can undercount a past date once a subscription rolls forward.
+  const asOfView = useMemo(() => {
+    if (!asOfDate || asOfDate >= today) return null;
+    const d = parseISO(asOfDate);
+    const monthStart = format(startOfMonth(d), "yyyy-MM-dd");
+    const monthEnd = format(endOfMonth(d), "yyyy-MM-dd");
+    const rows = monthlyTargetsByLine(rawJobs, Number(asOfDate.slice(5, 7)), monthStart, monthEnd, asOfDate);
+    const routes = asOfRoutes ?? rawRoutes;
+    const covered = routesCoverRange(routes, monthStart, asOfDate);
+    const doneByLine = covered
+      ? completedByLineFromRoutes(routes, (id) => String(jobsByDocId.get(id)?.serviceLine ?? ""), monthStart, asOfDate)
+      : null;
+    return {
+      monthStart,
+      covered,
+      rows: rows.map((r) => {
+        const done = !doneByLine
+          ? r.done
+          : r.line === "total"
+            ? TARGET_SERVICE_LINES.reduce((s, l) => s + (doneByLine[l] || 0), 0)
+            : doneByLine[r.line] || 0;
+        return {
+          line: r.line,
+          label: r.line === "total" ? "Total (All)" : r.label,
+          target: r.target,
+          done,
+          pace: monthlyPace(r.target, done, asOfDate),
+          rounds: r.rounds,
+        };
+      }),
+    };
+  }, [asOfDate, today, rawJobs, rawRoutes, asOfRoutes, jobsByDocId]);
+
   // Historical period view (null for the current month, which uses the live cards).
   const periodView = useMemo(() => {
     if (period === "this_month") return null;
@@ -1324,6 +1399,38 @@ export default function DashboardPage() {
                     {rangeRefreshing ? "Refreshing…" : "Refresh"}
                   </button>
                 )}
+                {/* As-of: rewind the month-to-date picture to a past day. */}
+                {!periodView && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-muted-foreground/60">As of</span>
+                    <input
+                      type="date"
+                      value={asOfDate || today}
+                      max={today}
+                      onChange={(e) => setAsOfDate(e.target.value >= today ? "" : e.target.value)}
+                      className="text-xs bg-card border border-border/50 rounded-md px-2 py-1.5 text-foreground focus:outline-none focus:ring-1 focus:ring-blue-500/40"
+                    />
+                    <button
+                      onClick={() => {
+                        // Most recent Friday strictly before today.
+                        const d = parseISO(today);
+                        const back = ((d.getDay() + 7 - 5) % 7) || 7;
+                        setAsOfDate(format(subDays(d, back), "yyyy-MM-dd"));
+                      }}
+                      className="text-xs px-2 py-1 rounded-md border border-border/50 text-muted-foreground hover:bg-accent/30 transition-colors"
+                    >
+                      Last Fri
+                    </button>
+                    {asOfDate && (
+                      <button
+                        onClick={() => setAsOfDate("")}
+                        className="text-xs px-2 py-1 rounded-md border border-border/50 text-muted-foreground hover:bg-accent/30 transition-colors"
+                      >
+                        Today
+                      </button>
+                    )}
+                  </div>
+                )}
                 <select
                   value={period}
                   onChange={(e) => setPeriod(e.target.value as DashboardPeriod)}
@@ -1336,7 +1443,59 @@ export default function DashboardPage() {
               </div>
             </div>
 
-            {periodView ? (
+            {asOfView ? (
+              // As-of a past day: same monthly target, but done + % through month
+              // rewound to that date — "where were we vs where we should've been".
+              <div className="space-y-3">
+                <p className="text-xs text-muted-foreground/60">
+                  Month-to-date through <span className="text-foreground font-medium">{asOfDate}</span> ({asOfView.monthStart} → {asOfDate})
+                  {" · "}
+                  {asOfView.covered
+                    ? "completed from finalized routes"
+                    : "estimated from subscription dates (routes not synced for this range — may undercount)"}
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {asOfView.rows.map((r) => {
+                    const isTotal = r.line === "total";
+                    const donePct = Math.round(r.pace.donePct * 100);
+                    const progressPct = Math.round(r.pace.progressPct * 100);
+                    const gap = donePct - progressPct;
+                    // Where the month's clock stood that day — the bar's benchmark.
+                    return (
+                      <Card key={r.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
+                        <CardContent className="p-5 space-y-3">
+                          <div className="flex items-start justify-between">
+                            <div>
+                              <p className="text-[13px] text-muted-foreground font-medium">{r.label}</p>
+                              <p className="text-3xl font-bold text-foreground tracking-tight">
+                                {r.done.toLocaleString()}<span className="text-lg text-muted-foreground/60 font-semibold"> / {r.target.toLocaleString()}</span>
+                              </p>
+                              <p className="text-xs text-muted-foreground/70">{Math.max(0, r.target - r.done).toLocaleString()} left at that point</p>
+                            </div>
+                            <div className={`p-2 rounded-lg ${isTotal ? "bg-blue-500/10 text-blue-400" : "bg-accent/40 text-muted-foreground"}`}><Target className="w-4 h-4" /></div>
+                          </div>
+                          <div className="space-y-1">
+                            {/* Done bar with a marker at where the month's clock stood. */}
+                            <div className="relative h-2 w-full rounded-full bg-secondary overflow-hidden">
+                              <div className={`h-full ${gap >= 0 ? "bg-emerald-500" : "bg-amber-500"}`} style={{ width: `${Math.min(100, Math.max(0, donePct))}%` }} />
+                              <div className="absolute top-0 bottom-0 w-0.5 bg-foreground/70" style={{ left: `${Math.min(100, Math.max(0, progressPct))}%` }} />
+                            </div>
+                            <p className={`text-xs ${gap >= 0 ? "text-emerald-400" : "text-amber-400"}`}>
+                              {donePct}% of target · {progressPct}% through month · {gap >= 0 ? `${gap} pts ahead` : `${Math.abs(gap)} pts behind`}
+                            </p>
+                            {r.line === "lawn" && r.rounds && r.rounds.length > 0 && (
+                              <p className="text-[11px] text-muted-foreground/50">
+                                {r.rounds.map((rd) => `${rd.label} ${rd.done}/${rd.target}`).join(" · ")}
+                              </p>
+                            )}
+                          </div>
+                        </CardContent>
+                      </Card>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : periodView ? (
               // Historical range: actual completed vs a rate-based target baseline.
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {[...periodView.rows, { line: "total" as const, label: "Total (All)", target: periodView.total.target, done: periodView.total.done }].map((r) => {
