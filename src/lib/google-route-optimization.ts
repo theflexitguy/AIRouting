@@ -180,6 +180,14 @@ export function routeOptimizationConfig(): {
 // --- Solver ----------------------------------------------------------------
 
 const seconds = (minutes: number) => `${Math.max(1, Math.round(minutes * 60))}s`;
+/**
+ * ISO timestamp truncated to WHOLE SECONDS. Route Optimization maps these to
+ * protobuf Timestamps and rejects any sub-second precision with
+ * "`nanos` must be unset", so the milliseconds a JS toISOString() always emits
+ * have to go.
+ */
+const isoSeconds = (value: string | number | Date) =>
+  new Date(value).toISOString().replace(/\.\d{3}Z$/, "Z");
 const latLng = (p: { lat: number | null; lng: number | null }) => ({
   latitude: Number(p.lat),
   longitude: Number(p.lng),
@@ -260,10 +268,10 @@ export async function optimizeTours({
   // clamps to now+5min once that has passed, the same rule the drive-time
   // matrix already uses, so both engines model the same departure.
   const vehicleWindows = vehicles.map((vehicle) => {
-    const start = departureTimeForRouteDate(vehicle.date) || new Date(Date.now() + 5 * 60_000).toISOString();
+    const start = isoSeconds(departureTimeForRouteDate(vehicle.date) || Date.now() + 5 * 60_000);
     // A generous shift window: wide enough never to force a stop to be dropped,
     // narrow enough to keep the traffic model on the right day.
-    const end = new Date(Date.parse(start) + 16 * 3600_000).toISOString();
+    const end = isoSeconds(Date.parse(start) + 16 * 3600_000);
     return { start, end };
   });
   const globalStartTime = vehicleWindows.reduce(
