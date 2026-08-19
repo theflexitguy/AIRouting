@@ -68,6 +68,8 @@ function emptyPlan(status: "disabled" | "failed", warnings: string[], extra: Par
 interface Credential {
   source: string;
   projectId: string;
+  /** Service-account identity, so a permission error can name the principal. */
+  clientEmail?: string;
   auth?: GoogleAuth;
   staticToken?: string;
 }
@@ -114,6 +116,7 @@ function resolveCredential(): Credential | null {
       cachedCredential = {
         source: "GOOGLE_ROUTE_OPTIMIZATION_SERVICE_ACCOUNT",
         projectId: explicitProject || String(parsed.project_id || ""),
+        clientEmail: String(parsed.client_email || ""),
         auth: new GoogleAuth({ credentials: parsed, scopes: [SCOPE] }),
       };
       return cachedCredential;
@@ -125,6 +128,7 @@ function resolveCredential(): Credential | null {
     cachedCredential = {
       source: "FIREBASE_SERVICE_ACCOUNT",
       projectId: explicitProject || String(firebaseCred.project_id || ""),
+      clientEmail: String(firebaseCred.client_email || ""),
       auth: new GoogleAuth({ credentials: firebaseCred, scopes: [SCOPE] }),
     };
     return cachedCredential;
@@ -154,12 +158,19 @@ async function getAccessToken(credential: Credential): Promise<string> {
 }
 
 /** Is the Route Optimization API usable in this environment? */
-export function routeOptimizationConfig(): { configured: boolean; source: string; projectId: string } {
+export function routeOptimizationConfig(): {
+  configured: boolean;
+  source: string;
+  projectId: string;
+  serviceAccountEmail: string;
+} {
   const credential = resolveCredential();
   return {
     configured: Boolean(credential && credential.projectId),
     source: credential?.source || "none",
     projectId: credential?.projectId || "",
+    // Named so an IAM denial says exactly WHICH principal needs the role.
+    serviceAccountEmail: credential?.clientEmail || "",
   };
 }
 
