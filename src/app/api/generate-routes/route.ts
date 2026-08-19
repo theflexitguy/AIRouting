@@ -9,11 +9,15 @@ import {
   computeRouteGeometry,
   computeRouteMatrix,
   hasGoogleRoutesApiKey,
-  runRouteOptimizationShadow,
   type MatrixSource,
   type RouteOptimizationShadowResult,
-  type RoutePoint,
 } from "@/lib/google-routing";
+import {
+  optimizeTours,
+  type OptimizationPlan,
+  type OptimizationStop,
+  type OptimizationVehicle,
+} from "@/lib/google-route-optimization";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { calculateStopProductionValue } from "@/lib/production-value";
 import { deriveServiceLine, serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
@@ -787,12 +791,26 @@ async function buildOrderedRoute(
   picked: JobDoc[],
   routeDate: string,
   endNear?: { lat: number; lng: number } | null,
+  seedOrder?: string[],
 ): Promise<OrderedRouteBuild> {
   const matrixResult = await getDriveMatrix(picked, routeDate);
   const orderedResult = orderRouteWithMatrix(picked, matrixResult.matrix);
   const matrixById = new Map<string, number>();
   picked.forEach((job, idx) => matrixById.set(job.docId, idx));
   let ordered = keepSameAddressJobsTogether(orderedResult.ordered);
+  // A seed order from Google Route Optimization: keep it when it actually drives
+  // less on the same matrix, so the two engines can never make sequencing worse
+  // than the local search alone.
+  if (seedOrder && seedOrder.length === picked.length) {
+    const byId = new Map(picked.map((job) => [job.docId, job]));
+    const seeded = seedOrder.map((id) => byId.get(id)).filter((job): job is JobDoc => Boolean(job));
+    if (seeded.length === picked.length) {
+      const seededOrdered = keepSameAddressJobsTogether(seeded);
+      const seededCost = orderedDriveMinutesFromMatrix(seededOrdered, matrixById, matrixResult.matrix);
+      const localCost = orderedDriveMinutesFromMatrix(ordered, matrixById, matrixResult.matrix);
+      if (seededCost <= localCost) ordered = seededOrdered;
+    }
+  }
   // Flex sequencing rule: start at the stop furthest from the tech's home and
   // work back so the day ENDS near home. When the tech's end location is known,
   // flip the route direction if that lands the last stop closer to home without
@@ -1462,6 +1480,115 @@ function assignJobsToTechSlots({
   };
 }
 
+/**
+ * Ask Google Route Optimization to decide WHICH tech/day each job belongs to and
+ * in what order. Assignment was the weakest link in the custom engine — it
+ * scored clusters on straight-line (haversine) distance, which is the biggest
+ * single lever on total drive time.
+ *
+ * The result is returned as a pin map (jobId -> "date::techId") plus a per-slot
+ * stop order. Pins are how this app already forces a job onto a slot, so the
+ * existing engine consumes Google's plan without any change to its cap,
+ * deferral, drive-time or polyline logic — and remains the fallback whenever
+ * Google is unconfigured, errors, or returns something that breaks a rule.
+ */
+async function planWithGoogleRouteOptimization({
+  jobsToRoute,
+  selectedTechs,
+  dates,
+  maxStops,
+  maxDriveTime,
+  rangeStart,
+  rangeEnd,
+  pinnedSlotByJobId,
+  protectedJobIds,
+  ignoreFieldRoutesLocks,
+}: {
+  jobsToRoute: JobDoc[];
+  selectedTechs: Array<Record<string, unknown> & { id: string }>;
+  dates: string[];
+  maxStops: number;
+  maxDriveTime: number;
+  rangeStart: string;
+  rangeEnd: string;
+  pinnedSlotByJobId: Map<string, string>;
+  protectedJobIds: Set<string>;
+  ignoreFieldRoutesLocks: boolean;
+}): Promise<{
+  plan: OptimizationPlan;
+  slotKeyByJobId: Map<string, string>;
+  orderBySlotKey: Map<string, string[]>;
+}> {
+  const empty = { slotKeyByJobId: new Map<string, string>(), orderBySlotKey: new Map<string, string[]>() };
+
+  const vehicles: OptimizationVehicle[] = [];
+  const slotIndexByKey = new Map<string, number>();
+  for (const tech of selectedTechs) {
+    for (const date of dates) {
+      const slotKey = routeSlotKey(date, tech.id);
+      slotIndexByKey.set(slotKey, vehicles.length);
+      const startLat = Number(tech.startLat);
+      const startLng = Number(tech.startLng);
+      const endLat = Number(tech.endLat ?? tech.startLat);
+      const endLng = Number(tech.endLng ?? tech.startLng);
+      const point = (lat: number, lng: number) =>
+        Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0) ? { lat, lng } : null;
+      vehicles.push({
+        slotKey,
+        maxStops: maxStopsForRouteDate(maxStops, date),
+        start: point(startLat, startLng),
+        end: point(endLat, endLng),
+      });
+    }
+  }
+  if (vehicles.length === 0) {
+    return { plan: { status: "disabled", orderBySlotKey: new Map(), skippedStopIds: [], warnings: [] }, ...empty };
+  }
+
+  const stops: OptimizationStop[] = [];
+  for (const job of jobsToRoute) {
+    // A stop already committed to a slot stays there: give the solver exactly
+    // one legal vehicle so it routes AROUND it instead of moving it.
+    const pinned =
+      pinnedSlotByJobId.get(job.docId) ||
+      (ignoreFieldRoutesLocks ? "" : pinnedFieldRoutesSlotKey(job, selectedTechs, rangeStart, rangeEnd));
+    let allowed: number[];
+    if (pinned && slotIndexByKey.has(pinned)) {
+      allowed = [slotIndexByKey.get(pinned) as number];
+    } else {
+      allowed = [];
+      for (const tech of selectedTechs) {
+        if (!jobAssignedToTech(job, tech)) continue;
+        for (const date of dates) {
+          if (!canScheduleJobOnDate(job, date)) continue;
+          const index = slotIndexByKey.get(routeSlotKey(date, tech.id));
+          if (index !== undefined) allowed.push(index);
+        }
+      }
+      // No legal slot (skills/day rules) — let the existing engine report why.
+      if (allowed.length === 0) continue;
+    }
+    stops.push({
+      id: job.docId,
+      lat: typeof job.lat === "number" ? job.lat : null,
+      lng: typeof job.lng === "number" ? job.lng : null,
+      durationMinutes: Number(job.duration || 25),
+      allowedVehicleIndices: allowed,
+      // Overdue work is far more expensive to leave unrouted.
+      priority: protectedJobIds.has(job.docId) || dateTier(job, rangeStart, rangeEnd) === 0,
+    });
+  }
+
+  const plan = await optimizeTours({ stops, vehicles, maxDriveMinutes: maxDriveTime });
+  if (plan.status !== "ok") return { plan, ...empty };
+
+  const slotKeyByJobId = new Map<string, string>();
+  for (const [slotKey, ids] of plan.orderBySlotKey) {
+    for (const id of ids) slotKeyByJobId.set(id, slotKey);
+  }
+  return { plan, slotKeyByJobId, orderBySlotKey: plan.orderBySlotKey };
+}
+
 async function buildFastFallbackRoutes({
   jobsToRoute,
   selectedTechs,
@@ -1474,6 +1601,7 @@ async function buildFastFallbackRoutes({
   pinnedSlotByJobId = new Map<string, string>(),
   rebalance = false,
   protectedJobIds = new Set<string>(),
+  googleOrderBySlotKey,
 }: {
   jobsToRoute: JobDoc[];
   selectedTechs: Array<Record<string, unknown> & { id: string }>;
@@ -1486,6 +1614,8 @@ async function buildFastFallbackRoutes({
   pinnedSlotByJobId?: Map<string, string>;
   rebalance?: boolean;
   protectedJobIds?: Set<string>;
+  /** Stop order per slot from Route Optimization, used as a seed. */
+  googleOrderBySlotKey?: Map<string, string[]>;
 }): Promise<FastRouteBuildResult> {
   const routes: BackendRoute[] = [];
   const deferredJobIds = new Set<string>();
@@ -1558,7 +1688,8 @@ async function buildFastFallbackRoutes({
       if (picked.length === 0) continue;
 
       const endNear = techEndPoint(slot.tech);
-      let orderedBuild = await buildOrderedRoute(picked, slot.date, endNear);
+      const slotSeedOrder = googleOrderBySlotKey?.get(routeSlotKey(slot.date, slot.tech.id));
+      let orderedBuild = await buildOrderedRoute(picked, slot.date, endNear, slotSeedOrder);
       let driveTrimPasses = 0;
       const overDriveCap = () =>
         maxDriveTime > 0 &&
@@ -1597,7 +1728,7 @@ async function buildFastFallbackRoutes({
           driveMinutes: Math.round(orderedBuild.totalDriveMinutes * 10) / 10,
         });
         picked = picked.filter((job) => job.docId !== removal.docId);
-        orderedBuild = await buildOrderedRoute(picked, slot.date, endNear);
+        orderedBuild = await buildOrderedRoute(picked, slot.date, endNear, slotSeedOrder);
         driveTrimPasses++;
       }
 
@@ -2208,8 +2339,73 @@ export async function POST(request: NextRequest) {
       deferredJobIds?: string[];
     };
 
+    // Which engine actually produced the routes, recorded on every route doc so
+    // a route's provenance is verifiable after the fact.
+    let optimizerEngine: "google_route_optimization" | "custom" = "custom";
+    let optimizationPlan: OptimizationPlan | null = null;
+
     const shouldUseCustomRouting = true;
     if (shouldUseCustomRouting) {
+      // Google Route Optimization decides tech/day assignment AND stop order.
+      // Its plan is applied as PINS, which is how this app already forces a job
+      // onto a slot — so every downstream cap, deferral, drive-time and polyline
+      // step is unchanged, and the custom engine stays the fallback.
+      console.log(`[generate-routes] STEP 6a: Route Optimization planning (${jobsToRoute.length} jobs, ${selectedTechs.length} techs, ${dates.length} dates)`);
+      let googleOrderBySlotKey: Map<string, string[]> | undefined;
+      const routingPins = new Map(pinnedSlotByJobId);
+      try {
+        const planned = await planWithGoogleRouteOptimization({
+          jobsToRoute,
+          selectedTechs,
+          dates,
+          maxStops,
+          maxDriveTime,
+          rangeStart,
+          rangeEnd,
+          pinnedSlotByJobId,
+          protectedJobIds: mustRouteJobIds,
+          ignoreFieldRoutesLocks: rebalance,
+        });
+        optimizationPlan = planned.plan;
+        if (planned.plan.status === "ok") {
+          // Validate before trusting it: never move a stop that was already
+          // committed to a slot, and never exceed that slot's stop cap.
+          const perSlotCount = new Map<string, number>();
+          let violation = "";
+          for (const [jobId, slotKey] of planned.slotKeyByJobId) {
+            const existingPin = pinnedSlotByJobId.get(jobId);
+            if (existingPin && existingPin !== slotKey) {
+              violation = `moved pinned stop ${jobId}`;
+              break;
+            }
+            perSlotCount.set(slotKey, (perSlotCount.get(slotKey) || 0) + 1);
+          }
+          if (!violation) {
+            for (const [slotKey, count] of perSlotCount) {
+              const slotDate = slotKey.split("::")[0] || "";
+              const cap = maxStopsForRouteDate(maxStops, slotDate);
+              if (count > cap) {
+                violation = `slot ${slotKey} over cap (${count} > ${cap})`;
+                break;
+              }
+            }
+          }
+          if (violation) {
+            console.warn(`[generate-routes] Route Optimization plan rejected: ${violation}; falling back to custom engine`);
+            optimizationPlan = { ...planned.plan, status: "failed", warnings: [...planned.plan.warnings, `Plan rejected: ${violation}.`] };
+          } else {
+            for (const [jobId, slotKey] of planned.slotKeyByJobId) routingPins.set(jobId, slotKey);
+            googleOrderBySlotKey = planned.orderBySlotKey;
+            optimizerEngine = "google_route_optimization";
+            console.log(`[generate-routes] STEP 6a: Route Optimization applied to ${planned.orderBySlotKey.size} route slots (${planned.slotKeyByJobId.size} stops, ${planned.plan.skippedStopIds.length} unfitted)`);
+          }
+        } else {
+          console.log(`[generate-routes] STEP 6a: Route Optimization ${planned.plan.status} — ${planned.plan.warnings.join(" ")}`);
+        }
+      } catch (error) {
+        console.warn("[generate-routes] Route Optimization planning failed:", error);
+      }
+
       console.log(`[generate-routes] STEP 6: buildFastFallbackRoutes starting (${jobsToRoute.length} jobs, ${selectedTechs.length} techs, ${dates.length} dates)`);
       const fastResult = await buildFastFallbackRoutes({
         jobsToRoute,
@@ -2220,18 +2416,22 @@ export async function POST(request: NextRequest) {
         maxDayMinutes,
         rangeStart,
         rangeEnd,
-        pinnedSlotByJobId,
+        pinnedSlotByJobId: routingPins,
         rebalance,
         protectedJobIds: mustRouteJobIds,
+        googleOrderBySlotKey,
       });
       result = {
         runId: `fast-${Date.now()}`,
         routes: fastResult.routes,
         deferredJobIds: fastResult.deferredJobIds,
         warnings: [
+          optimizerEngine === "google_route_optimization"
+            ? "Routes assigned and sequenced by Google Route Optimization, with Routes API matrix drive times."
+            : `Routes built by the built-in engine (Route Optimization ${optimizationPlan?.status || "unavailable"}). ${optimizationPlan?.warnings.join(" ") || ""}`.trim(),
           hasGoogleRoutesApiKey()
-            ? "Used hard tech/date route generation with Routes API matrix drive times and road polylines where available."
-            : "Used hard tech/date route generation. Add GOOGLE_MAPS_API_KEY for Routes API road drive times and polylines.",
+            ? "Drive times from the Routes API matrix with road polylines where available."
+            : "Add GOOGLE_MAPS_API_KEY for Routes API road drive times and polylines.",
           ...fastResult.warnings,
         ],
         summary: {
@@ -2415,70 +2615,26 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const shadowVehicleSlots = selectedTechs.flatMap((tech) =>
-      dates.map((routeDate) => ({
-        date: routeDate,
-        tech,
-        maxStops: maxStopsForRouteDate(maxStops, routeDate),
-      })),
-    );
-    let routeOptimizationShadow: RouteOptimizationShadowResult = {
-      status: "disabled",
-      runId: `shadow-${result.runId || Date.now()}`,
+    // Route Optimization now PRODUCES the routes (see STEP 6a) rather than
+    // shadowing them, so there is no second solve here — that would bill twice
+    // for the same answer. This summary reports what the real run did.
+    const customDriveMinutesTotal =
+      Math.round(routes.reduce((sum, route) => sum + Number(route.totalDriveMinutes || 0), 0) * 10) / 10;
+    const routeOptimizationShadow: RouteOptimizationShadowResult = {
+      status: optimizationPlan
+        ? optimizationPlan.status === "ok"
+          ? "ok"
+          : optimizationPlan.status === "disabled"
+            ? "disabled"
+            : "failed"
+        : "disabled",
+      runId: String(result.runId || `run-${Date.now()}`),
+      googleDriveMinutes: optimizationPlan?.googleDriveMinutes,
+      customDriveMinutes: customDriveMinutesTotal,
       routeCount: routes.length,
-      warnings: [],
+      rawStatus: optimizerEngine,
+      warnings: optimizationPlan?.warnings || [],
     };
-
-    try {
-      routeOptimizationShadow = await runRouteOptimizationShadow({
-        runId: `shadow-${result.runId || Date.now()}`,
-        jobs: jobsToRoute.map((job) => ({
-          id: job.docId,
-          lat: typeof job.lat === "number" ? job.lat : null,
-          lng: typeof job.lng === "number" ? job.lng : null,
-          duration: Number(job.duration || 25),
-          assignedTechId: String(job.assignedTechId || ""),
-          allowedVehicleIndices: shadowVehicleSlots
-            .map((slot, index) =>
-              jobAssignedToTech(job, slot.tech) && canScheduleJobOnDate(job, slot.date)
-                ? index
-                : -1,
-            )
-            .filter((index) => index >= 0),
-        })) satisfies RoutePoint[],
-        vehicles: shadowVehicleSlots.map((slot) => ({
-          date: slot.date,
-          techId: slot.tech.id,
-          techName: String((slot.tech as Record<string, unknown>).name || slot.tech.id),
-          maxStops: slot.maxStops,
-        })),
-        customRoutes: routes.map((route, index) => ({
-          id: String(route.routeName || index),
-          date: String(route.date || ""),
-          techId: String(route.techId || ""),
-          techName: String(route.techName || ""),
-          totalDriveMinutes: Number(route.totalDriveMinutes || 0),
-          totalWorkMinutes: Number(route.totalWorkMinutes || 0),
-          stops: (route.stops || []).map((stop) => ({
-            id: String(stop.id || stop.customerID || ""),
-            lat: typeof stop.lat === "number" ? stop.lat : null,
-            lng: typeof stop.lng === "number" ? stop.lng : null,
-            duration: typeof stop.duration === "number" ? stop.duration : null,
-          })),
-        })),
-        maxStops,
-        maxDriveMinutes: maxDriveTime,
-      });
-    } catch (error) {
-      routeOptimizationShadow = {
-        status: "failed",
-        runId: `shadow-${result.runId || Date.now()}`,
-        routeCount: routes.length,
-        warnings: [
-          `Route Optimization shadow mode failed. ${error instanceof Error ? error.message : String(error)}`,
-        ],
-      };
-    }
 
     // --- 7. Save routes + mark jobs scheduled ---
     // Enforce one route per tech per day. If an approved route already exists
@@ -2590,6 +2746,7 @@ export async function POST(request: NextRequest) {
             ...(typeof routeOptimizationShadow.score === "number"
               ? { googleRouteOptimizationShadowScore: routeOptimizationShadow.score }
               : {}),
+            optimizerEngine,
             googleRouteOptimizationSummary: {
               status: routeOptimizationShadow.status,
               score: routeOptimizationShadow.score ?? null,
@@ -2737,6 +2894,7 @@ export async function POST(request: NextRequest) {
       ],
       summary: {
         ...(result.summary || {}),
+        optimizerEngine,
         googleRouteOptimizationShadow: routeOptimizationShadow,
       },
     });

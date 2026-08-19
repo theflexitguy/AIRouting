@@ -91,3 +91,13 @@ export const adminDb = () => {
 };
 export const adminStorage = () => getStorage(getAdminApp());
 export const adminAuth = () => getAuth(getAdminApp());
+
+/**
+ * Service-account credentials parsed from the environment, or null when none is
+ * configured. Exposed so other Google API clients that need OAuth (Route
+ * Optimization, which does NOT accept a Maps API key) can mint tokens from the
+ * same credential instead of introducing a second secret.
+ */
+export function serviceAccountCredentials(): { project_id?: string; client_email?: string; private_key?: string } | null {
+  return serviceAccountFromEnv() as { project_id?: string; client_email?: string; private_key?: string } | null;
+}
