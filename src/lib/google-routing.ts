@@ -60,6 +60,9 @@ export interface RouteOptimizationShadowResult {
 const MATRIX_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const POLYLINE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 600;
+// Routes API limit: origins x destinations per computeRouteMatrix request.
+// Requests are tiled into MATRIX_MAX_BLOCK-square chunks to stay under it.
+const MATRIX_MAX_BLOCK = 25;
 const DEFAULT_TRAFFIC_MODE = "TRAFFIC_AWARE";
 const MAX_COMPUTE_ROUTES_STOPS = 27;
 
@@ -315,60 +318,90 @@ export async function computeRouteMatrix(
   if (cached) return cached;
 
   const promise = (async (): Promise<RouteMatrixResult> => {
-    try {
-      const res = await fetch("https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": getGoogleMapsServerApiKey(),
-          "X-Goog-FieldMask": "originIndex,destinationIndex,status,condition,distanceMeters,duration",
-        },
-        body: JSON.stringify({
-          origins: points.map(matrixWaypoint),
-          destinations: points.map(matrixWaypoint),
-          travelMode: "DRIVE",
-          routingPreference: trafficMode,
-          departureTime: departureTimeForRouteDate(options.routeDate),
-        }),
-        signal: AbortSignal.timeout(30000),
-      });
+    const matrix = fallback.map((row) => [...row]);
+    let failedElements = 0;
+    let filledElements = 0;
+    const warnings: string[] = [];
 
-      const payload = (await res.json().catch(() => null)) as RouteMatrixElement[] | unknown;
-      if (!res.ok || !Array.isArray(payload)) {
+    // The Routes API caps a matrix request at MATRIX_MAX_ELEMENTS (origins x
+    // destinations). An N-stop route asks for N*N, so anything over
+    // MATRIX_MAX_BLOCK stops used to blow the limit and fail the WHOLE call —
+    // silently degrading the entire route to straight-line estimates. Tile the
+    // request instead; the element count (and therefore the cost) is identical.
+    const blocks: Array<[number, number]> = [];
+    for (let i = 0; i < points.length; i += MATRIX_MAX_BLOCK) {
+      blocks.push([i, Math.min(points.length, i + MATRIX_MAX_BLOCK)]);
+    }
+
+    try {
+      for (const [originStart, originEnd] of blocks) {
+        for (const [destStart, destEnd] of blocks) {
+          const origins = points.slice(originStart, originEnd);
+          const destinations = points.slice(destStart, destEnd);
+          const res = await fetch("https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Goog-Api-Key": getGoogleMapsServerApiKey(),
+              "X-Goog-FieldMask": "originIndex,destinationIndex,status,condition,distanceMeters,duration",
+            },
+            body: JSON.stringify({
+              origins: origins.map(matrixWaypoint),
+              destinations: destinations.map(matrixWaypoint),
+              travelMode: "DRIVE",
+              routingPreference: trafficMode,
+              departureTime: departureTimeForRouteDate(options.routeDate),
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+
+          const payload = (await res.json().catch(() => null)) as RouteMatrixElement[] | unknown;
+          if (!res.ok || !Array.isArray(payload)) {
+            // This tile stays on haversine estimates; other tiles may still succeed.
+            failedElements += origins.length * destinations.length;
+            warnings.push(warningFromGoogleError(`Routes API Compute Route Matrix HTTP ${res.status}`, payload));
+            continue;
+          }
+
+          payload.forEach((element) => {
+            // proto3 JSON omits zero-valued fields, so an ABSENT index means 0.
+            // Treating it as missing dropped every element in the first row and
+            // column back to straight-line estimates.
+            const originIndex = originStart + Number(element.originIndex ?? 0);
+            const destinationIndex = destStart + Number(element.destinationIndex ?? 0);
+            if (
+              !Number.isInteger(originIndex) ||
+              !Number.isInteger(destinationIndex) ||
+              !matrix[originIndex] ||
+              matrix[originIndex][destinationIndex] === undefined
+            ) {
+              failedElements++;
+              return;
+            }
+            if (originIndex === destinationIndex) {
+              matrix[originIndex][destinationIndex] = 0;
+              return;
+            }
+            const seconds = parseDurationSeconds(element.duration);
+            const elementStatus = statusCode(element.status);
+            if (elementStatus !== 0 || seconds <= 0) {
+              failedElements++;
+              return;
+            }
+            matrix[originIndex][destinationIndex] = seconds / 60;
+            filledElements++;
+          });
+        }
+      }
+
+      if (filledElements === 0) {
         return {
           matrix: fallback,
           source: "haversine_fallback",
           failedElements: Math.max(0, points.length * points.length - points.length),
-          warnings: [warningFromGoogleError(`Routes API Compute Route Matrix HTTP ${res.status}`, payload)],
+          warnings: warnings.length > 0 ? warnings : ["Routes API Compute Route Matrix returned no usable elements; using haversine_fallback estimates."],
         };
       }
-
-      const matrix = fallback.map((row) => [...row]);
-      let failedElements = 0;
-
-      payload.forEach((element) => {
-        const originIndex = Number(element.originIndex);
-        const destinationIndex = Number(element.destinationIndex);
-        if (
-          !Number.isInteger(originIndex) ||
-          !Number.isInteger(destinationIndex) ||
-          !matrix[originIndex]
-        ) {
-          failedElements++;
-          return;
-        }
-        if (originIndex === destinationIndex) {
-          matrix[originIndex][destinationIndex] = 0;
-          return;
-        }
-        const seconds = parseDurationSeconds(element.duration);
-        const elementStatus = statusCode(element.status);
-        if (elementStatus !== 0 || seconds <= 0) {
-          failedElements++;
-          return;
-        }
-        matrix[originIndex][destinationIndex] = seconds / 60;
-      });
 
       return {
         matrix,
@@ -376,8 +409,11 @@ export async function computeRouteMatrix(
         failedElements,
         warnings:
           failedElements > 0
-            ? [`Routes API Compute Route Matrix missed ${failedElements} element(s); missing elements used haversine_fallback estimates.`]
-            : [],
+            ? [
+                ...warnings,
+                `Routes API Compute Route Matrix missed ${failedElements} element(s); missing elements used haversine_fallback estimates.`,
+              ]
+            : warnings,
       };
     } catch (error) {
       return {
