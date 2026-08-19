@@ -1535,6 +1535,7 @@ async function planWithGoogleRouteOptimization({
         Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0) ? { lat, lng } : null;
       vehicles.push({
         slotKey,
+        date,
         maxStops: maxStopsForRouteDate(maxStops, date),
         start: point(startLat, startLng),
         end: point(endLat, endLng),

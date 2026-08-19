@@ -226,7 +226,13 @@ function getTimeZoneOffsetMinutes(date: Date, timeZone: string) {
   return (asUtc - date.getTime()) / 60000;
 }
 
-function departureTimeForRouteDate(routeDate?: string) {
+/**
+ * 8:00 AM Central on the route date, as an ISO timestamp — the departure time
+ * traffic-aware requests model against. Clamps to now+5min when that moment has
+ * already passed, which is what keeps REGENERATING A PAST DAY from being
+ * rejected for a start time "too far in the past".
+ */
+export function departureTimeForRouteDate(routeDate?: string) {
   if (!routeDate || !/^\d{4}-\d{2}-\d{2}$/.test(routeDate)) return undefined;
   const [year, month, day] = routeDate.split("-").map(Number);
   const localHour = 8;
