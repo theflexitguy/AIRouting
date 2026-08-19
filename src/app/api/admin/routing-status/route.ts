@@ -47,6 +47,7 @@ export async function GET(request: NextRequest) {
     configured: config.configured,
     credentialSource: config.source,
     projectId: config.projectId,
+    serviceAccountEmail: config.serviceAccountEmail,
   };
   if (config.configured) {
     try {
@@ -63,6 +64,13 @@ export async function GET(request: NextRequest) {
       optimizationProbe.ok = plan.status === "ok";
       optimizationProbe.googleDriveMinutes = plan.googleDriveMinutes ?? null;
       if (plan.warnings.length) optimizationProbe.warnings = plan.warnings;
+      // The two common failures need different fixes; spell out which applies.
+      const detail = plan.warnings.join(" ");
+      if (/has not been used in project|is disabled/i.test(detail)) {
+        optimizationProbe.remedy = `Enable the Route Optimization API on project ${config.projectId}, then allow a few minutes to propagate.`;
+      } else if (/permission|denied|PERMISSION_DENIED/i.test(detail)) {
+        optimizationProbe.remedy = `Grant roles/routeoptimization.editor on project ${config.projectId} to ${config.serviceAccountEmail || "the service account above"} (IAM & Admin -> Grant access).`;
+      }
     } catch (error) {
       optimizationProbe.ok = false;
       optimizationProbe.error = error instanceof Error ? error.message : String(error);

@@ -12,6 +12,7 @@
 
 import { GoogleAuth } from "google-auth-library";
 import { serviceAccountCredentials } from "@/lib/firebase-admin";
+import { departureTimeForRouteDate } from "@/lib/google-routing";
 
 const SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const ENDPOINT = "https://routeoptimization.googleapis.com/v1";
@@ -41,6 +42,8 @@ export interface OptimizationStop {
 export interface OptimizationVehicle {
   /** Caller's slot key (tech+date); echoed back so results map home cleanly. */
   slotKey: string;
+  /** Route date (YYYY-MM-DD) — sets this vehicle's shift window for traffic. */
+  date?: string;
   maxStops: number;
   /** Tech start/end location. Omitted when the tech has no home coordinates. */
   start?: { lat: number; lng: number } | null;
@@ -68,6 +71,8 @@ function emptyPlan(status: "disabled" | "failed", warnings: string[], extra: Par
 interface Credential {
   source: string;
   projectId: string;
+  /** Service-account identity, so a permission error can name the principal. */
+  clientEmail?: string;
   auth?: GoogleAuth;
   staticToken?: string;
 }
@@ -114,6 +119,7 @@ function resolveCredential(): Credential | null {
       cachedCredential = {
         source: "GOOGLE_ROUTE_OPTIMIZATION_SERVICE_ACCOUNT",
         projectId: explicitProject || String(parsed.project_id || ""),
+        clientEmail: String(parsed.client_email || ""),
         auth: new GoogleAuth({ credentials: parsed, scopes: [SCOPE] }),
       };
       return cachedCredential;
@@ -125,6 +131,7 @@ function resolveCredential(): Credential | null {
     cachedCredential = {
       source: "FIREBASE_SERVICE_ACCOUNT",
       projectId: explicitProject || String(firebaseCred.project_id || ""),
+      clientEmail: String(firebaseCred.client_email || ""),
       auth: new GoogleAuth({ credentials: firebaseCred, scopes: [SCOPE] }),
     };
     return cachedCredential;
@@ -154,12 +161,19 @@ async function getAccessToken(credential: Credential): Promise<string> {
 }
 
 /** Is the Route Optimization API usable in this environment? */
-export function routeOptimizationConfig(): { configured: boolean; source: string; projectId: string } {
+export function routeOptimizationConfig(): {
+  configured: boolean;
+  source: string;
+  projectId: string;
+  serviceAccountEmail: string;
+} {
   const credential = resolveCredential();
   return {
     configured: Boolean(credential && credential.projectId),
     source: credential?.source || "none",
     projectId: credential?.projectId || "",
+    // Named so an IAM denial says exactly WHICH principal needs the role.
+    serviceAccountEmail: credential?.clientEmail || "",
   };
 }
 
@@ -240,6 +254,27 @@ export async function optimizeTours({
     });
   }
 
+  // Traffic-aware solving REQUIRES a global start time, and Google rejects one
+  // that is in the past — which regenerating a past day would otherwise always
+  // produce. departureTimeForRouteDate models 8am Central on the route date and
+  // clamps to now+5min once that has passed, the same rule the drive-time
+  // matrix already uses, so both engines model the same departure.
+  const vehicleWindows = vehicles.map((vehicle) => {
+    const start = departureTimeForRouteDate(vehicle.date) || new Date(Date.now() + 5 * 60_000).toISOString();
+    // A generous shift window: wide enough never to force a stop to be dropped,
+    // narrow enough to keep the traffic model on the right day.
+    const end = new Date(Date.parse(start) + 16 * 3600_000).toISOString();
+    return { start, end };
+  });
+  const globalStartTime = vehicleWindows.reduce(
+    (earliest, w) => (Date.parse(w.start) < Date.parse(earliest) ? w.start : earliest),
+    vehicleWindows[0].start,
+  );
+  const globalEndTime = vehicleWindows.reduce(
+    (latest, w) => (Date.parse(w.end) > Date.parse(latest) ? w.end : latest),
+    vehicleWindows[0].end,
+  );
+
   const body = {
     // Give the solver real time to work; this runs once per generation.
     timeout: seconds(timeoutSeconds / 60),
@@ -247,6 +282,8 @@ export async function optimizeTours({
     populatePolylines: false,
     populateTransitionPolylines: false,
     model: {
+      globalStartTime,
+      globalEndTime,
       shipments: routable.map((stop, index) => ({
         label: stop.id || String(index),
         // Leaving a stop unrouted is expensive, so the solver only does it when
@@ -262,8 +299,12 @@ export async function optimizeTours({
           },
         ],
       })),
-      vehicles: vehicles.map((vehicle) => ({
+      vehicles: vehicles.map((vehicle, index) => ({
         label: vehicle.slotKey,
+        // Per-vehicle shift so a multi-day run models each day's own traffic.
+        startTimeWindows: [
+          { startTime: vehicleWindows[index].start, endTime: vehicleWindows[index].end },
+        ],
         // All cost on travel time == minimize drive.
         costPerTraveledHour: COST_PER_TRAVELED_HOUR,
         ...(vehicle.start && validPoint(vehicle.start) ? { startLocation: latLng(vehicle.start) } : {}),
