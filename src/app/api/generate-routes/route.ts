@@ -2391,6 +2391,27 @@ export async function POST(request: NextRequest) {
               }
             }
           }
+          if (!violation) {
+            // Google has no concept of our service-line rule: an own-route line
+            // (termite / lawn / GR / wildlife) may never share a route with any
+            // other line. Enforce it here so a Google plan can't quietly break
+            // it — same rule as unitCompatibleWithSlotJobs.
+            const linesBySlot = new Map<string, Set<ServiceLine>>();
+            const jobByDocId = new Map(jobsToRoute.map((job) => [job.docId, job]));
+            for (const [jobId, slotKey] of planned.slotKeyByJobId) {
+              const job = jobByDocId.get(jobId);
+              if (!job) continue;
+              if (!linesBySlot.has(slotKey)) linesBySlot.set(slotKey, new Set());
+              linesBySlot.get(slotKey)!.add(jobServiceLine(job));
+            }
+            for (const [slotKey, lines] of linesBySlot) {
+              const ownRoute = Array.from(lines).filter((line) => serviceLineMeta(line).requiresOwnRoute);
+              if (ownRoute.length > 0 && lines.size > 1) {
+                violation = `slot ${slotKey} mixes ${ownRoute.join("/")} with other lines`;
+                break;
+              }
+            }
+          }
           if (violation) {
             console.warn(`[generate-routes] Route Optimization plan rejected: ${violation}; falling back to custom engine`);
             optimizationPlan = { ...planned.plan, status: "failed", warnings: [...planned.plan.warnings, `Plan rejected: ${violation}.`] };

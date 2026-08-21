@@ -300,6 +300,12 @@ export async function optimizeTours({
         ...(stop.allowedVehicleIndices.length > 0
           ? { allowedVehicleIndices: stop.allowedVehicleIndices }
           : {}),
+        // A vehicle's loadLimits cap only binds if shipments DECLARE the load
+        // they consume. Without this every stop counted as zero, the maxStops
+        // limit never applied, and Google returned plans far over the cap that
+        // downstream validation then threw away -- so Route Optimization never
+        // actually produced a route.
+        loadDemands: { stops: { amount: "1" } },
         deliveries: [
           {
             arrivalLocation: latLng(stop),
