@@ -145,6 +145,19 @@ function jobServiceLine(job: JobDoc): ServiceLine {
  * with each other). A route may carry EITHER one own-route line exclusively,
  * or any mix of the shared lines (general / mosquito / commercial).
  */
+/** Shared-line class: general / mosquito / commercial all mix on one route. */
+const SHARED_ROUTE_CLASS = "__shared";
+
+/**
+ * The class of route a job can live on. Every own-route line is its own class
+ * (they can never share); everything else pools into one shared class. Two jobs
+ * can ride the same route if and only if their classes match.
+ */
+function routeClassOf(job: JobDoc): string {
+  const line = jobServiceLine(job);
+  return serviceLineMeta(line).requiresOwnRoute ? line : SHARED_ROUTE_CLASS;
+}
+
 function unitCompatibleWithSlotJobs(unitJobsArr: JobDoc[], slotJobs: JobDoc[]): boolean {
   const lines = new Set<ServiceLine>();
   for (const job of unitJobsArr) lines.add(jobServiceLine(job));
@@ -2222,16 +2235,75 @@ export async function POST(request: NextRequest) {
         softAssignments: rebalance,
         perTechCapacity,
       });
+    // Own-route lines (termite / lawn / GR / wildlife) may never share a route,
+    // so a DAY has to be filled from one class. Taking the top-priority jobs
+    // across all lines produced days whose picks were mostly incompatible and
+    // got deferred downstream — a 23-candidate day that routed 2 stops. Pick a
+    // class per day, then fill that day from it.
+    const classPicks: Array<{ tech: string; date: string; routeClass: string; filled: number }> = [];
     for (const tech of selectedTechs) {
       const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
       // Protected (already-routed / FieldRoutes-scheduled / rebalanced) jobs
       // always make the cut; remaining capacity fills with the highest-priority
-      // unprotected jobs.
+      // unprotected jobs OF THE DAY'S CLASS.
       const pinned = techJobs.filter((job) => isProtectedJob(job.docId));
       const unpinned = techJobs.filter((job) => !isProtectedJob(job.docId));
-      const fillCount = Math.max(0, perTechCapacity - pinned.length);
-      selectedByTech.set(tech.id, [...pinned, ...unpinned.slice(0, fillCount)]);
-      deferredByTech.set(tech.id, unpinned.slice(fillCount));
+
+      // Candidates grouped by class; each list keeps the priority sort above.
+      const byClass = new Map<string, JobDoc[]>();
+      for (const job of unpinned) {
+        const key = routeClassOf(job);
+        if (!byClass.has(key)) byClass.set(key, []);
+        byClass.get(key)!.push(job);
+      }
+
+      const taken: JobDoc[] = [];
+      const takenIds = new Set<string>();
+      for (const routeDate of dates) {
+        const cap = maxStopsForRouteDate(maxStops, routeDate);
+        const pinnedToday = pinned.filter((job) =>
+          String(pinnedSlotByJobId.get(job.docId) || "").startsWith(`${routeDate}::`),
+        );
+        // A stop already committed to the day dictates that day's class.
+        let dayClass = "";
+        for (const job of pinnedToday) {
+          const cls = routeClassOf(job);
+          if (cls !== SHARED_ROUTE_CLASS) { dayClass = cls; break; }
+        }
+        if (!dayClass && pinnedToday.length > 0) dayClass = SHARED_ROUTE_CLASS;
+        if (!dayClass) {
+          // Nothing committed: take the class that fills the day best, breaking
+          // ties toward the class holding the highest-priority job (the lists
+          // are already priority-sorted, so the first entry is that job).
+          let bestScore = -1;
+          let bestHead: JobDoc | null = null;
+          for (const [cls, jobs] of byClass) {
+            const remaining = jobs.filter((job) => !takenIds.has(job.docId));
+            if (remaining.length === 0) continue;
+            const score = Math.min(remaining.length, cap);
+            const head = remaining[0]; // priority-sorted, so this is the class's most urgent job
+            if (score > bestScore || (score === bestScore && bestHead && prioritySort(head, bestHead) < 0)) {
+              bestScore = score;
+              bestHead = head;
+              dayClass = cls;
+            }
+          }
+        }
+        if (!dayClass) continue;
+        let room = Math.max(0, cap - pinnedToday.length);
+        const beforeRoom = room;
+        for (const job of byClass.get(dayClass) || []) {
+          if (room <= 0) break;
+          if (takenIds.has(job.docId)) continue;
+          taken.push(job);
+          takenIds.add(job.docId);
+          room--;
+        }
+        classPicks.push({ tech: tech.id, date: routeDate, routeClass: dayClass, filled: beforeRoom - room + pinnedToday.length });
+      }
+
+      selectedByTech.set(tech.id, [...pinned, ...taken]);
+      deferredByTech.set(tech.id, unpinned.filter((job) => !takenIds.has(job.docId)));
     }
 
     let jobsToRoute = selectedTechs.flatMap((tech) => selectedByTech.get(tech.id) || []);
@@ -2277,6 +2349,7 @@ export async function POST(request: NextRequest) {
       "ROUTE DEBUG:",
       JSON.stringify({
         poolTotal: allJobDocs.length,
+        classPicks,
         tierTotals: {
           overdue: overdue.length,
           inWindow: inWindow.length,
@@ -2448,6 +2521,16 @@ export async function POST(request: NextRequest) {
         routes: fastResult.routes,
         deferredJobIds: fastResult.deferredJobIds,
         warnings: [
+          // Own-route lines can't share a day, so say which line each day was
+          // filled from — otherwise a short route looks broken rather than
+          // constrained.
+          ...(classPicks.length > 0
+            ? [
+                `Route lines: ${classPicks
+                  .map((pick) => `${pick.date} ${pick.routeClass === SHARED_ROUTE_CLASS ? "general/mosquito/commercial" : pick.routeClass} (${pick.filled} stops)`)
+                  .join("; ")}. Termite, lawn, GR and wildlife each require their own route, so other lines were left for another day.`,
+              ]
+            : []),
           optimizerEngine === "google_route_optimization"
             ? "Routes assigned and sequenced by Google Route Optimization, with Routes API matrix drive times."
             : `Routes built by the built-in engine (Route Optimization ${optimizationPlan?.status || "unavailable"}). ${optimizationPlan?.warnings.join(" ") || ""}`.trim(),
