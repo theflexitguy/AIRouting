@@ -21,6 +21,8 @@ import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
 import { canonicalRouteGroup } from "@/lib/route-groups";
+import { deriveServiceLine } from "@/lib/routing/service-line";
+import { TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
 import { getSubscriptionLastServiced, routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { DatePicker } from "@/components/ui/date-picker";
 import { Input } from "@/components/ui/input";
@@ -127,6 +129,26 @@ type MultiSelectOption = { id: string; label: string; hint?: string };
  * Replaces the long chip rows so the header stays small. Supports select-all,
  * clear, and toggling individual options (clear + pick one = single select).
  */
+// Service lines as they appear in the JOB POOL. TARGET_SERVICE_LINE_LABELS only
+// covers the five lines that carry monthly targets; German Roach and Wildlife
+// also show up in the pool and need names here.
+const POOL_SERVICE_LINE_LABELS: Record<string, string> = {
+  ...TARGET_SERVICE_LINE_LABELS,
+  gr: "German Roach",
+  wildlife: "Wildlife",
+};
+
+/**
+ * A pool job's service line. Falls back to deriving it from the service type
+ * for docs written before the line was stamped — the same fallback the
+ * dashboard uses.
+ */
+function poolServiceLine(job: Job): string {
+  const stamped = String((job as Job & { serviceLine?: string }).serviceLine || "").trim();
+  if (stamped) return stamped;
+  return deriveServiceLine(job.serviceType, (job as Job & { fieldRoutesRouteGroup?: string }).fieldRoutesRouteGroup);
+}
+
 function MultiSelectDropdown({
   label,
   icon,
@@ -912,6 +934,9 @@ export default function RoutesPage() {
   // When on, the pool shows ONLY past-due stops — a lighter set when the pool
   // is large (and the dispatcher wants to clear the backlog first). Defaults on.
   const [jobPoolPastDueOnly, setJobPoolPastDueOnly] = useState(true);
+  // Job-pool content filters. Empty = all, matching the other multi-selects.
+  const [jobPoolLines, setJobPoolLines] = useState<string[]>([]);
+  const [jobPoolServiceTypes, setJobPoolServiceTypes] = useState<string[]>([]);
   // Hover is ref-based (no re-renders) — uses direct DOM manipulation
   const hoveredStopIdRef = useRef<string | null>(null);
   const [leftPanelRouteId, setLeftPanelRouteId] = useState<string | null>(null);
@@ -1163,7 +1188,10 @@ export default function RoutesPage() {
     displayRoutes.forEach((tr) => (tr.route.stopSequence || []).forEach((jobId) => ids.add(jobId)));
     return ids;
   }, [displayRoutes]);
-  const jobPoolJobs = useMemo(() => {
+  // Everything EXCEPT the line/type filters. The dropdown options are built from
+  // this, so they always offer what is actually available to pick and choosing
+  // one line doesn't erase the others from the menu.
+  const jobPoolBase = useMemo(() => {
     return Object.values(allJobs)
       .filter((job) => {
         if (selectedJobPoolTechs.length === 0) return false;
@@ -1194,6 +1222,56 @@ export default function RoutesPage() {
         return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
       });
   }, [allJobs, jobPoolDueEnd, jobPoolDueStart, jobPoolPastDueOnly, routedJobIds, selectedJobPoolTechs]);
+
+  // Service lines present in the pool, with counts so the size of each bucket is
+  // visible before clicking.
+  const jobPoolLineOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const job of jobPoolBase) {
+      const line = poolServiceLine(job);
+      if (!line) continue;
+      counts.set(line, (counts.get(line) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([id, count]) => ({ id, label: `${POOL_SERVICE_LINE_LABELS[id] || id} (${count})`, count }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  }, [jobPoolBase]);
+
+  // Subscription types, narrowed to the selected lines so the list stays short
+  // and relevant rather than listing every product in the book.
+  const jobPoolTypeOptions = useMemo(() => {
+    const lineSet = new Set(jobPoolLines);
+    const counts = new Map<string, number>();
+    for (const job of jobPoolBase) {
+      if (lineSet.size > 0 && !lineSet.has(poolServiceLine(job))) continue;
+      const type = String(job.serviceType || "").trim();
+      if (!type) continue;
+      counts.set(type, (counts.get(type) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([id, count]) => ({ id, label: `${id} (${count})`, count }))
+      .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  }, [jobPoolBase, jobPoolLines]);
+
+  // A type selection hidden by a line change would silently filter the pool to
+  // nothing, so drop ids the menu no longer offers.
+  useEffect(() => {
+    if (jobPoolServiceTypes.length === 0) return;
+    const offered = new Set(jobPoolTypeOptions.map((o) => o.id));
+    const kept = jobPoolServiceTypes.filter((id) => offered.has(id));
+    if (kept.length !== jobPoolServiceTypes.length) setJobPoolServiceTypes(kept);
+  }, [jobPoolTypeOptions, jobPoolServiceTypes]);
+
+  const jobPoolJobs = useMemo(() => {
+    if (jobPoolLines.length === 0 && jobPoolServiceTypes.length === 0) return jobPoolBase;
+    const lineSet = new Set(jobPoolLines);
+    const typeSet = new Set(jobPoolServiceTypes);
+    return jobPoolBase.filter((job) => {
+      if (lineSet.size > 0 && !lineSet.has(poolServiceLine(job))) return false;
+      if (typeSet.size > 0 && !typeSet.has(String(job.serviceType || "").trim())) return false;
+      return true;
+    });
+  }, [jobPoolBase, jobPoolLines, jobPoolServiceTypes]);
 
   const getJobsForRoute = useCallback((tr: TechRoute): Job[] => {
     return (tr.route.stopSequence || []).map(id => allJobs[id]).filter(Boolean) as Job[];
@@ -3139,6 +3217,26 @@ export default function RoutesPage() {
               placeholder="Due through"
               className="h-8 w-[150px] text-xs"
             />
+            {jobPoolLineOptions.length > 0 && (
+              <MultiSelectDropdown
+                label="Service Line"
+                options={jobPoolLineOptions.map(({ id, label }) => ({ id, label }))}
+                selectedIds={jobPoolLines}
+                onChange={setJobPoolLines}
+                allLabel={`All (${jobPoolLineOptions.length})`}
+                triggerClassName="h-8 text-xs"
+              />
+            )}
+            {jobPoolTypeOptions.length > 0 && (
+              <MultiSelectDropdown
+                label="Subscription Type"
+                options={jobPoolTypeOptions.map(({ id, label }) => ({ id, label }))}
+                selectedIds={jobPoolServiceTypes}
+                onChange={setJobPoolServiceTypes}
+                allLabel={`All (${jobPoolTypeOptions.length})`}
+                triggerClassName="h-8 text-xs"
+              />
+            )}
             <Button
               type="button"
               size="sm"
@@ -3149,6 +3247,9 @@ export default function RoutesPage() {
                 const { start, end } = defaultJobPoolRange();
                 setJobPoolDueStart(start);
                 setJobPoolDueEnd(end);
+                // Reset means "put the pool back" — content filters included.
+                setJobPoolLines([]);
+                setJobPoolServiceTypes([]);
               }}
             >
               Reset
@@ -3170,7 +3271,8 @@ export default function RoutesPage() {
               Past due only
             </Button>
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
-              {jobPoolJobs.length} in pool · zoom in to work an area
+              {jobPoolJobs.length} in pool
+              {jobPoolJobs.length !== jobPoolBase.length && ` of ${jobPoolBase.length}`} · zoom in to work an area
             </span>
           </div>
         )}
