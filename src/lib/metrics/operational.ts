@@ -33,6 +33,7 @@ export interface JobLike {
   scheduledDate?: string; // next service date (YYYY-MM-DD)
   subscriptionLastCompletedDate?: string; // last completed date (YYYY-MM-DD)
   customerId?: string;
+  customerName?: string; // shown in audit views
   subscriptionId?: string; // fallback dedupe key when customerId is absent
   serviceType?: string; // e.g. "Round 4 - Fertilizer" — the authoritative round label for lawn
   inScope?: boolean;
@@ -160,7 +161,7 @@ export function meetsTarget(
 }
 
 /** Service interval in days for a subscription (raw frequency, or parsed label). */
-function jobFrequencyDays(j: JobLike): number {
+export function jobFrequencyDays(j: JobLike): number {
   const raw = Number(j.frequency);
   if (Number.isFinite(raw) && raw > 0) return raw;
   // A negative frequency is a FieldRoutes placeholder (e.g. -4 for plan-scheduled
@@ -184,7 +185,7 @@ function jobFrequencyDays(j: JobLike): number {
 }
 
 /** Is this subscription serviced in the given calendar month (1–12)? */
-function activeInMonth(j: JobLike, month: number): boolean {
+export function activeInMonth(j: JobLike, month: number): boolean {
   if (!j.isSeasonal) return true; // year-round
   const start = Number(j.seasonalStartMonth);
   const end = Number(j.seasonalEndMonth);
@@ -578,6 +579,237 @@ export function routesCoverRange(
   // Allow a few blank weekdays (holidays, genuinely empty days) before declaring
   // the window unusable — the fallback path is a coarser estimate, not an error.
   return weekdays === 0 || covered >= weekdays - 3;
+}
+
+
+// ── Target audit ────────────────────────────────────────────────────────────
+// "Where did this number come from?" for a Targets-by-Service card. Each line
+// uses a DIFFERENT model, so the audit reports which one ran, the formula with
+// real numbers in it, the grouped inputs, and every subscription considered —
+// including the ones that contributed nothing, with the reason. It reuses the
+// same primitives the targets are computed from (jobFrequencyDays,
+// activeInMonth, the lawn round helpers) so the explanation cannot drift from
+// the calculation.
+
+export type TargetMethod = "lawn_round_pace" | "due_this_month" | "seasonality_rate";
+
+export interface TargetAuditRow {
+  key: string;
+  customerName: string;
+  serviceType: string;
+  frequencyLabel: string;
+  frequencyDays: number; // resolved interval the math actually used
+  scheduledDate: string;
+  lastCompleted: string;
+  contribution: number; // what this subscription adds to the TARGET
+  status: string; // counted / done this month / due this month / why it was skipped
+  counts: boolean;
+}
+
+export interface TargetAuditGroup {
+  label: string;
+  count: number;
+  contribution: number;
+  note?: string;
+}
+
+export interface TargetAudit {
+  line: string;
+  method: TargetMethod;
+  formula: string;
+  /** Target recomputed from the rows below — should equal the card. */
+  rowsTarget: number;
+  rowsDone: number;
+  considered: number; // subscriptions on this line that were looked at
+  contributing: number; // …of which added something to the target
+  groups: TargetAuditGroup[];
+  rows: TargetAuditRow[];
+}
+
+const auditRow = (j: JobLike, contribution: number, status: string): TargetAuditRow => ({
+  key: String(j.subscriptionId || j.customerId || ""),
+  customerName: String(j.customerName || j.customerId || ""),
+  serviceType: String(j.serviceType || ""),
+  frequencyLabel: String(j.recurringFrequency || ""),
+  frequencyDays: jobFrequencyDays(j),
+  scheduledDate: String(j.scheduledDate || ""),
+  lastCompleted: String(j.subscriptionLastCompletedDate || ""),
+  contribution,
+  status,
+  counts: contribution > 0 || status === "done this month",
+});
+
+/** Full derivation behind one service line's monthly target. */
+export function targetAuditForLine(
+  jobs: JobLike[],
+  line: TargetServiceLine,
+  month: number,
+  monthStart: string,
+  monthEnd: string,
+  today: string,
+): TargetAudit {
+  const lineJobs = jobs.filter((j) => lineOf(j) === line);
+  const rows: TargetAuditRow[] = [];
+  const groups: TargetAuditGroup[] = [];
+
+  // ---- Lawn: the current round's book, paced across its date window ----
+  if (line === "lawn") {
+    const year = monthStart.slice(0, 4);
+    const activeRounds = new Set(lawnRoundsForMonth(month));
+    const roundOf = (j: JobLike) =>
+      lawnRoundNumberFromServiceType(j.serviceType) ??
+      lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
+
+    const perRound = new Map<number, { book: Set<string>; doneThis: Set<string>; doneBefore: Set<string> }>();
+    for (const j of lineJobs) {
+      const round = roundOf(j);
+      if (j.inScope === false || j.pendingCancel === true) {
+        rows.push(auditRow(j, 0, j.pendingCancel === true ? "skipped — pending cancel" : "skipped — out of scope"));
+        continue;
+      }
+      if (round === null) {
+        rows.push(auditRow(j, 0, "skipped — round not identifiable"));
+        continue;
+      }
+      if (!activeRounds.has(round)) {
+        rows.push(auditRow(j, 0, `skipped — Round ${round} is not active this month`));
+        continue;
+      }
+      const win = lawnRoundWindowDates(round, year);
+      if (!win) {
+        rows.push(auditRow(j, 0, `skipped — Round ${round} has no window`));
+        continue;
+      }
+      if (!perRound.has(round)) perRound.set(round, { book: new Set(), doneThis: new Set(), doneBefore: new Set() });
+      const g = perRound.get(round)!;
+      const key = String(j.customerId || j.subscriptionId || "");
+      g.book.add(key);
+      const lc = String(j.subscriptionLastCompletedDate || "");
+      let status = `Round ${round} — in this round's book`;
+      if (lc && lc >= win.start) {
+        if (lc >= monthStart && lc <= today) { g.doneThis.add(key); status = `Round ${round} — completed this month`; }
+        else if (lc < monthStart) { g.doneBefore.add(key); status = `Round ${round} — completed earlier this cycle`; }
+      }
+      rows.push(auditRow(j, 0, status));
+    }
+
+    let rowsTarget = 0;
+    let rowsDone = 0;
+    for (const [round, g] of Array.from(perRound.entries()).sort((a, b) => a[0] - b[0])) {
+      const win = lawnRoundWindowDates(round, year)!;
+      const totalDays = Math.max(1, daysBetween(win.start, win.end));
+      const throughDay = monthEnd < win.end ? monthEnd : win.end;
+      const fraction = clamp(daysBetween(win.start, throughDay) / totalDays, 0, 1);
+      const book = g.book.size;
+      const doneBefore = g.doneBefore.size;
+      const planned = Math.round(book * fraction);
+      const target = clamp(planned - doneBefore, 0, book - doneBefore);
+      rowsTarget += target;
+      rowsDone += g.doneThis.size;
+      groups.push({
+        label: `Round ${round} (${win.start} → ${win.end})`,
+        count: book,
+        contribution: target,
+        note: `book ${book} × ${Math.round(fraction * 100)}% of window elapsed by ${monthEnd} = ${planned} planned − ${doneBefore} done earlier this cycle = ${target}; ${g.doneThis.size} done this month`,
+      });
+    }
+
+    return {
+      line,
+      method: "lawn_round_pace",
+      formula: "Each active round is a book of plans to finish inside its date window. Target = book × (window elapsed by month end) − plans already completed earlier in the cycle.",
+      rowsTarget,
+      rowsDone,
+      considered: lineJobs.length,
+      contributing: rows.filter((r) => r.status.includes("book") || r.status.includes("completed")).length,
+      groups,
+      rows,
+    };
+  }
+
+  // ---- Termite / Commercial: the exact stops landing in this month ----
+  if (line === "termite" || line === "commercial") {
+    const done = new Set<string>();
+    const due = new Set<string>();
+    for (const j of lineJobs) {
+      const key = String(j.subscriptionId || j.customerId || "");
+      if (j.inScope === false || j.pendingCancel === true) {
+        rows.push(auditRow(j, 0, j.pendingCancel === true ? "skipped — pending cancel" : "skipped — out of scope"));
+        continue;
+      }
+      const lc = String(j.subscriptionLastCompletedDate || "");
+      if (lc && lc >= monthStart && lc <= today) {
+        done.add(key);
+        rows.push(auditRow(j, 1, "done this month"));
+        continue;
+      }
+      const sd = String(j.scheduledDate || "");
+      if (!sd) { rows.push(auditRow(j, 0, "skipped — no next service date")); continue; }
+      if (sd < monthStart) { rows.push(auditRow(j, 0, `skipped — was due ${sd}, before this month`)); continue; }
+      if (sd > monthEnd) { rows.push(auditRow(j, 0, `skipped — next due ${sd}, after this month`)); continue; }
+      if (lc && lc >= sd) { rows.push(auditRow(j, 0, "skipped — already serviced this cycle")); continue; }
+      due.add(key);
+      rows.push(auditRow(j, 1, "due this month"));
+    }
+    groups.push({ label: "Completed this month", count: done.size, contribution: done.size });
+    groups.push({ label: "Still due this month", count: due.size, contribution: due.size });
+    return {
+      line,
+      method: "due_this_month",
+      formula: `Exact stops landing in this month — no rate spread. Target = ${done.size} completed + ${due.size} still due = ${done.size + due.size}.`,
+      rowsTarget: done.size + due.size,
+      rowsDone: done.size,
+      considered: lineJobs.length,
+      contributing: done.size + due.size,
+      groups,
+      rows,
+    };
+  }
+
+  // ---- Everything else: seasonality-aware expected services per month ----
+  const byFrequency = new Map<number, { count: number; contribution: number; label: string }>();
+  let rowsTarget = 0;
+  for (const j of lineJobs) {
+    if (j.inScope === false || j.pendingCancel === true) {
+      rows.push(auditRow(j, 0, j.pendingCancel === true ? "skipped — pending cancel" : "skipped — out of scope"));
+      continue;
+    }
+    if (!activeInMonth(j, month)) {
+      rows.push(auditRow(j, 0, "skipped — seasonal, out of season this month"));
+      continue;
+    }
+    const days = jobFrequencyDays(j);
+    if (days <= 0) {
+      rows.push(auditRow(j, 0, "skipped — no usable service interval"));
+      continue;
+    }
+    const contribution = AVG_DAYS_PER_MONTH / days;
+    rowsTarget += contribution;
+    rows.push(auditRow(j, contribution, "counted"));
+    const bucket = byFrequency.get(days) || { count: 0, contribution: 0, label: `Every ${days} days` };
+    bucket.count++;
+    bucket.contribution += contribution;
+    byFrequency.set(days, bucket);
+  }
+  for (const [days, b] of Array.from(byFrequency.entries()).sort((a, b2) => a[0] - b2[0])) {
+    groups.push({
+      label: b.label,
+      count: b.count,
+      contribution: b.contribution,
+      note: `${b.count} × (${AVG_DAYS_PER_MONTH} ÷ ${days}) = ${(AVG_DAYS_PER_MONTH / days).toFixed(3)} each`,
+    });
+  }
+  return {
+    line,
+    method: "seasonality_rate",
+    formula: `Each active subscription contributes ${AVG_DAYS_PER_MONTH} ÷ its service interval. A 30-day sub adds ~1.0/month, quarterly ~0.34, annual ~0.08. Seasonal subs only count in their active months.`,
+    rowsTarget: Math.round(rowsTarget),
+    rowsDone: monthlyServiced(lineJobs, monthStart, today),
+    considered: lineJobs.length,
+    contributing: rows.filter((r) => r.contribution > 0).length,
+    groups,
+    rows,
+  };
 }
 
 // ── Historical period selector (targets vs actuals over past ranges) ──────────
