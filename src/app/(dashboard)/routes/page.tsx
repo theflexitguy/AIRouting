@@ -283,6 +283,41 @@ function jobAssignedToTech(job: Job, tech: Technician) {
   });
 }
 
+/**
+ * Does this POOL job belong to `tech`?
+ *
+ * assignedTechId / fieldRoutesServicedBy(Id) are only stamped once a job has an
+ * appointment (sync.ts:2450), and pool jobs are unrouted by definition — so for
+ * them all three are empty and jobAssignedToTech's "no assignment matches
+ * everyone" rule made every pool job show up under every technician. Every
+ * FieldRoutes subscription does carry a technician; it arrives as preferredTech.
+ * Fall back to it so the pool honours the selected technician.
+ */
+function jobPoolTechMatch(job: Job, tech: Technician) {
+  const appointmentTech = [job.assignedTechId, job.fieldRoutesServicedBy, job.fieldRoutesServicedById]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const preferred = String(job.preferredTech || "").trim();
+  const values = appointmentTech.length > 0 ? appointmentTech : preferred ? [preferred] : [];
+  // Genuinely no technician anywhere: a data gap, not "anyone's work". Keep it
+  // visible rather than silently dropping work, and surface the count in the bar.
+  if (values.length === 0) return true;
+  const tokens = technicianMatchTokens(tech);
+  return values.some((assigned) => {
+    const assignedNormalized = normalizeMatchValue(assigned);
+    return tokens.some((token) => token === assigned || normalizeMatchValue(token) === assignedNormalized);
+  });
+}
+
+/** True when no technician is recorded anywhere on the job. */
+function jobHasNoTech(job: Job) {
+  return (
+    [job.assignedTechId, job.fieldRoutesServicedBy, job.fieldRoutesServicedById, job.preferredTech]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean).length === 0
+  );
+}
+
 function assignedTechBlockReason(job: Job, tech: Technician) {
   const assigned = String(job.assignedTechId || job.fieldRoutesServicedBy || job.fieldRoutesServicedById || "").trim();
   if (!assigned) return "";
@@ -1195,7 +1230,7 @@ export default function RoutesPage() {
     return Object.values(allJobs)
       .filter((job) => {
         if (selectedJobPoolTechs.length === 0) return false;
-        if (!selectedJobPoolTechs.some((tech) => jobAssignedToTech(job, tech))) return false;
+        if (!selectedJobPoolTechs.some((tech) => jobPoolTechMatch(job, tech))) return false;
         if (routedJobIds.has(job.id)) return false;
         if (typeof job.lat !== "number" || typeof job.lng !== "number") return false;
         // Only the routable pool: pending or overdue (both bucket to status
@@ -1222,6 +1257,11 @@ export default function RoutesPage() {
         return String(a.customerName || a.id).localeCompare(String(b.customerName || b.id));
       });
   }, [allJobs, jobPoolDueEnd, jobPoolDueStart, jobPoolPastDueOnly, routedJobIds, selectedJobPoolTechs]);
+
+  // Jobs carrying no technician at all — a sync/data gap rather than shared work,
+  // since every FieldRoutes subscription has one. They stay in the pool (never
+  // hide work) but are counted so the gap is visible.
+  const jobPoolNoTechCount = useMemo(() => jobPoolBase.filter(jobHasNoTech).length, [jobPoolBase]);
 
   // Service lines present in the pool, with counts so the size of each bucket is
   // visible before clicking.
@@ -3272,7 +3312,13 @@ export default function RoutesPage() {
             </Button>
             <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
               {jobPoolJobs.length} in pool
-              {jobPoolJobs.length !== jobPoolBase.length && ` of ${jobPoolBase.length}`} · zoom in to work an area
+              {jobPoolJobs.length !== jobPoolBase.length && ` of ${jobPoolBase.length}`}
+              {/* Every FieldRoutes subscription should carry a technician; any
+                  that don't show for every tech, so make that visible. */}
+              {jobPoolNoTechCount > 0 && (
+                <span className="text-amber-400"> · {jobPoolNoTechCount} with no technician</span>
+              )}
+              {" "}· zoom in to work an area
             </span>
           </div>
         )}

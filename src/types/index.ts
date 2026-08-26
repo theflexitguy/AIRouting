@@ -89,6 +89,10 @@ export interface Job {
   fieldRoutesScheduledDate?: string;
   fieldRoutesServicedBy?: string;
   fieldRoutesServicedById?: string;
+  // The subscription's own FieldRoutes technician. Unlike the fields above —
+  // which are only stamped once a job has an appointment — this is present on
+  // every subscription, so it is the assignment for UNROUTED work.
+  preferredTech?: string;
   fieldRoutesRouteId?: string;
   fieldRoutesRouteGroup?: string; // route.groupTitle for the scheduled route
   revenue?: string;
