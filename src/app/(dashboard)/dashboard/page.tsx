@@ -35,6 +35,7 @@ import {
   weeklyPace,
   monthlyPace,
   monthlyTargetsByLine,
+  targetAuditForLine,
   completedByLineFromRoutes,
   routesCoverRange,
   isTrackedServiceLine,
@@ -52,6 +53,7 @@ import {
   TARGET_SERVICE_LINE_LABELS,
   type DashboardPeriod,
   type LineTarget,
+  type TargetServiceLine,
   MONTH_WORKING_DAYS,
   meetsTarget,
   STOPS_PER_ROUTE_TARGET,
@@ -1019,6 +1021,19 @@ export default function DashboardPage() {
     };
   }, [scopedRoutes, jobsByDocId, today]);
 
+  // ── Targets by Service drill-down ───────────────────────────────────────
+  // Each line's target uses a DIFFERENT model, so the audit reports which one
+  // ran, the formula with real numbers, the grouped inputs, and every
+  // subscription considered — including those that contributed nothing and why.
+  const [targetDrill, setTargetDrill] = useState<TargetServiceLine | null>(null);
+  const targetAudit = useMemo(
+    () =>
+      targetDrill
+        ? targetAuditForLine(rawJobs, targetDrill, bounds.monthIndex, bounds.monthStart, bounds.monthEnd, today)
+        : null,
+    [targetDrill, rawJobs, bounds.monthIndex, bounds.monthStart, bounds.monthEnd, today],
+  );
+
   // ── Overdue Stops drill-down ────────────────────────────────────────────
   // The card counts DISTINCT CUSTOMERS whose in-scope subscription carries a
   // stamped overdueActionable flag. This rebuilds that per subscription and,
@@ -1535,6 +1550,114 @@ export default function DashboardPage() {
               </DialogContent>
             </Dialog>
 
+            {/* TARGETS BY SERVICE — how the number was calculated */}
+            <Dialog open={targetDrill !== null} onOpenChange={(open) => { if (!open) setTargetDrill(null); }}>
+              <DialogContent className="max-w-5xl">
+                <DialogHeader>
+                  <DialogTitle>
+                    {targetDrill && `${TARGET_SERVICE_LINE_LABELS[targetDrill]} target — how it's calculated`}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {bounds.monthStart} → {bounds.monthEnd} · company-wide · ignores the technician/route filters
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="max-h-[65vh] overflow-y-auto space-y-5">
+                  {targetAudit && (() => {
+                    const card = stats.lineTargets.find((lt) => lt.line === targetDrill);
+                    // Rows recomputed here must land on the same number the card
+                    // shows; surface it either way rather than hiding a drift.
+                    const reconciles = card ? card.target === targetAudit.rowsTarget : true;
+                    const CAP = 250;
+                    const sorted = [...targetAudit.rows].sort(
+                      (a, b) => b.contribution - a.contribution || a.customerName.localeCompare(b.customerName),
+                    );
+                    const shown = sorted.slice(0, CAP);
+                    return (
+                      <>
+                        <div className="rounded-lg border border-border/40 bg-accent/20 p-4 space-y-2">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60">Method</p>
+                          <p className="text-sm text-foreground">{targetAudit.formula}</p>
+                          <p className="text-xs text-muted-foreground/70">
+                            {targetAudit.considered.toLocaleString()} subscriptions on this line were examined ·{" "}
+                            {targetAudit.contributing.toLocaleString()} contributed to the target.
+                          </p>
+                          <p className={`text-xs ${reconciles ? "text-emerald-400" : "text-red-400"}`}>
+                            {reconciles
+                              ? `Rows below add up to ${targetAudit.rowsTarget.toLocaleString()} — matches the card.`
+                              : `Rows add up to ${targetAudit.rowsTarget.toLocaleString()} but the card shows ${card?.target.toLocaleString()} — mismatch, please report this.`}
+                          </p>
+                        </div>
+
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60 mb-2">Breakdown</p>
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                                <th className="py-2 pr-4 font-medium">Group</th>
+                                <th className="py-2 pr-4 font-medium text-right">Subs</th>
+                                <th className="py-2 pr-4 font-medium text-right">Adds to target</th>
+                                <th className="py-2 font-medium">How</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {targetAudit.groups.map((g) => (
+                                <tr key={g.label} className="border-b border-border/20 last:border-0">
+                                  <td className="py-2 pr-4 text-foreground">{g.label}</td>
+                                  <td className="py-2 pr-4 text-right tabular-nums text-muted-foreground">{g.count.toLocaleString()}</td>
+                                  <td className="py-2 pr-4 text-right tabular-nums text-foreground">{g.contribution.toFixed(2)}</td>
+                                  <td className="py-2 text-xs text-muted-foreground/70">{g.note || "—"}</td>
+                                </tr>
+                              ))}
+                              {targetAudit.groups.length === 0 && (
+                                <tr><td colSpan={4} className="py-4 text-center text-muted-foreground/60 text-sm">Nothing contributed this month.</td></tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/60 mb-2">
+                            Subscriptions {shown.length < sorted.length ? `(showing ${shown.length} of ${sorted.length.toLocaleString()}, biggest contribution first)` : `(${sorted.length.toLocaleString()})`}
+                          </p>
+                          <table className="w-full text-sm">
+                            <thead className="sticky top-0 bg-background">
+                              <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+                                <th className="py-2 pr-4 font-medium">Customer</th>
+                                <th className="py-2 pr-4 font-medium">Service</th>
+                                <th className="py-2 pr-4 font-medium">Interval</th>
+                                <th className="py-2 pr-4 font-medium">Next due</th>
+                                <th className="py-2 pr-4 font-medium">Last serviced</th>
+                                <th className="py-2 pr-4 font-medium text-right">Adds</th>
+                                <th className="py-2 font-medium">Status</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {shown.map((r, i) => (
+                                <tr key={`${r.key}-${i}`} className="border-b border-border/20 last:border-0">
+                                  <td className="py-2 pr-4 text-foreground">{r.customerName || "—"}</td>
+                                  <td className="py-2 pr-4 text-muted-foreground">{r.serviceType || "—"}</td>
+                                  <td className="py-2 pr-4 text-muted-foreground/70 whitespace-nowrap">
+                                    {r.frequencyDays > 0 ? `${r.frequencyDays}d` : "—"}
+                                    {r.frequencyLabel && <span className="block text-[10px] text-muted-foreground/50">{r.frequencyLabel}</span>}
+                                  </td>
+                                  <td className="py-2 pr-4 tabular-nums text-muted-foreground whitespace-nowrap">{r.scheduledDate || "—"}</td>
+                                  <td className="py-2 pr-4 tabular-nums text-muted-foreground/70 whitespace-nowrap">{r.lastCompleted || "—"}</td>
+                                  <td className={`py-2 pr-4 text-right tabular-nums ${r.contribution > 0 ? "text-foreground" : "text-muted-foreground/40"}`}>
+                                    {r.contribution > 0 ? r.contribution.toFixed(3) : "0"}
+                                  </td>
+                                  <td className={`py-2 text-xs ${r.status.startsWith("skipped") ? "text-amber-400/80" : "text-muted-foreground/70"}`}>{r.status}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              </DialogContent>
+            </Dialog>
+
             {/* OVERDUE STOPS — its own thing (company-wide) */}
             <Card
               className="border-red-500/30 bg-red-500/[0.04] animate-fade-in cursor-pointer transition-colors hover:border-red-500/50 hover:bg-red-500/[0.07]"
@@ -1742,13 +1865,23 @@ export default function DashboardPage() {
                   const doneW = lt.target > 0 ? Math.min(100, (lt.pace.done / lt.target) * 100) : 0;
                   const bookedW = lt.target > 0 ? Math.min(100 - doneW, (booked / lt.target) * 100) : 0;
                   return (
-                    <Card key={lt.line} className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : ""}`}>
+                    <Card
+                      key={lt.line}
+                      className={`border-border/40 animate-fade-in ${isTotal ? "ring-1 ring-blue-500/40 bg-blue-500/[0.03]" : "cursor-pointer transition-colors hover:border-blue-500/40 hover:bg-accent/20"}`}
+                      onClick={isTotal ? undefined : () => setTargetDrill(lt.line as TargetServiceLine)}
+                      role={isTotal ? undefined : "button"}
+                      tabIndex={isTotal ? undefined : 0}
+                      onKeyDown={isTotal ? undefined : (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setTargetDrill(lt.line as TargetServiceLine); } }}
+                    >
                       <CardContent className="p-5 space-y-3">
                         <div className="flex items-start justify-between">
                           <div>
                             <p className="text-[13px] text-muted-foreground font-medium">{isTotal ? "Total (All)" : lt.label}</p>
                             <p className="text-3xl font-bold text-foreground tracking-tight">{lt.target.toLocaleString()}</p>
-                            <p className="text-xs text-muted-foreground/70">{lt.pace.done.toLocaleString()} done · {booked.toLocaleString()} booked · {lt.pace.remaining.toLocaleString()} left</p>
+                            <p className="text-xs text-muted-foreground/70">
+                              {lt.pace.done.toLocaleString()} done · {booked.toLocaleString()} booked · {lt.pace.remaining.toLocaleString()} left
+                              {!isTotal && " · click to audit"}
+                            </p>
                             {lt.line === "lawn" && lt.rounds && lt.rounds.length > 1 && (
                               // Straddle month: a round ends mid-month and the next begins — show each.
                               <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5">
