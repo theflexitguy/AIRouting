@@ -22,6 +22,10 @@ import {
   lawnRoundNumberFromServiceType,
   lawnRoundNumberForWindow,
 } from "@/lib/routing/service-line";
+// Same constants the SYNC used to stamp overdueActionable — imported rather
+// than restated so the audit view can never drift from the real thresholds.
+// (scope.ts has no imports of its own, so it is safe on the client.)
+import { BALANCE_GATE, MAX_OVERDUE_DAYS, pastDueGraceDays } from "@/lib/fieldroutes/scope";
 import type { MonthlyDone } from "@/lib/fieldroutes/monthly-done";
 import {
   stopsPerRoute,
@@ -165,10 +169,84 @@ interface RouteRec extends RouteLike {
   stops?: RouteStopDetail[]; // light per-stop detail persisted by the sync/reconcile
   driveTimeSource?: string; // "routes_api_matrix" = real Google drive time, else straight-line estimate
 }
+/** One past-due subscription in the Overdue Stops audit view. */
+interface OverdueRow {
+  docId: string;
+  customerId: string;
+  customerName: string;
+  address: string;
+  balance: number;
+  serviceType: string;
+  frequencyLabel: string;
+  serviceLine: string;
+  dueDate: string;
+  daysOverdue: number;
+  graceDays: number; // the frequency-scaled window this sub had to be serviced in
+  lastCompleted: string;
+  reasons: string[]; // empty when counted; why it did NOT count otherwise
+}
+
+/**
+ * One table for both halves of the Overdue audit. `showReason` swaps the last
+ * column for why a row did NOT count.
+ */
+function OverdueTable({ rows, showReason }: { rows: OverdueRow[]; showReason?: boolean }) {
+  return (
+    <table className="w-full text-sm">
+      <thead className="sticky top-0 bg-background">
+        <tr className="text-left text-xs text-muted-foreground/60 border-b border-border/40">
+          <th className="py-2 pr-4 font-medium">Customer</th>
+          <th className="py-2 pr-4 font-medium">Subscription</th>
+          <th className="py-2 pr-4 font-medium">Due</th>
+          <th className="py-2 pr-4 font-medium text-right">Days over</th>
+          <th className="py-2 pr-4 font-medium">Last serviced</th>
+          <th className="py-2 pr-4 font-medium text-right">Balance</th>
+          {showReason && <th className="py-2 font-medium">Why not counted</th>}
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.docId || `${r.customerId}-${r.dueDate}`} className="border-b border-border/20 last:border-0">
+            <td className="py-2 pr-4">
+              <span className="text-foreground">{r.customerName}</span>
+              <span className="block text-[10px] text-muted-foreground/50">{r.address || r.customerId}</span>
+            </td>
+            <td className="py-2 pr-4">
+              <span className="text-muted-foreground">{r.serviceType || r.serviceLine || "—"}</span>
+              {r.frequencyLabel && <span className="block text-[10px] text-muted-foreground/50">{r.frequencyLabel}</span>}
+            </td>
+            <td className="py-2 pr-4 tabular-nums text-muted-foreground whitespace-nowrap">{r.dueDate}</td>
+            <td className="py-2 pr-4 text-right tabular-nums text-foreground">
+              {r.daysOverdue}
+              {/* the window this sub actually had, so a 6-day monthly row explains itself */}
+              <span className="block text-[10px] text-muted-foreground/50">{r.graceDays}d window</span>
+            </td>
+            <td className="py-2 pr-4 tabular-nums text-muted-foreground/70 whitespace-nowrap">{r.lastCompleted || "—"}</td>
+            <td className={`py-2 pr-4 text-right tabular-nums ${r.balance > BALANCE_GATE ? "text-amber-400" : "text-muted-foreground"}`}>
+              {formatCurrency(r.balance)}
+            </td>
+            {showReason && (
+              <td className="py-2 text-xs text-amber-400/90">{r.reasons.join(" · ")}</td>
+            )}
+          </tr>
+        ))}
+        {rows.length === 0 && (
+          <tr><td colSpan={showReason ? 7 : 6} className="py-6 text-center text-muted-foreground/60 text-sm">Nothing here.</td></tr>
+        )}
+      </tbody>
+    </table>
+  );
+}
+
 interface JobRec extends JobLike {
   docId?: string; // Firestore doc id (sub_<subscriptionId>), stamped at load
   status?: string;
   overdueActionable?: boolean;
+  // Audit fields behind the Overdue Stops drill-down. All already stored on the
+  // job docs by the sync; declared here so the drill can read them typed.
+  subscriptionBalance?: string; // stored as a string
+  schedulingRequest?: string; // special-scheduling note; any text blocks routing
+  potentialCustomer?: boolean;
   serviceType?: string;
   fieldRoutesRouteGroup?: string;
   fieldRoutesRouteTemplate?: string;
@@ -851,7 +929,7 @@ export default function DashboardPage() {
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
   // view of the exact routes/stops behind that number.
   const [drill, setDrill] = useState<
-    "routes" | "stops" | "completed" | "remaining" | "drive" | "value" | "stopsHour" | null
+    "routes" | "stops" | "completed" | "remaining" | "drive" | "value" | "stopsHour" | "overdue" | null
   >(null);
 
   const drillData = useMemo(() => {
@@ -940,6 +1018,88 @@ export default function DashboardPage() {
       hasEstimatedDrive: routeRows.some((r) => r.driveEstimated),
     };
   }, [scopedRoutes, jobsByDocId, today]);
+
+  // ── Overdue Stops drill-down ────────────────────────────────────────────
+  // The card counts DISTINCT CUSTOMERS whose in-scope subscription carries a
+  // stamped overdueActionable flag. This rebuilds that per subscription and,
+  // for auditing, also lists past-due subscriptions the count EXCLUDES with the
+  // reason — that is where the collections and constraint backlog hides.
+  // Thresholds come from scope.ts (the same ones the sync stamped with), never
+  // restated here, so this view can't drift from the real rule.
+  const overdueDrill = useMemo(() => {
+    const daysBetweenISO = (from: string, to: string) =>
+      Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
+
+    const counted: OverdueRow[] = [];
+    const excluded: OverdueRow[] = [];
+
+    for (const j of rawJobs) {
+      const dueDate = String(j.scheduledDate || "");
+      const daysOverdue = dueDate ? daysBetweenISO(dueDate, today) : 0;
+      // Grace scales with service frequency: a monthly sub is "past due" at 5
+      // days, a quarterly one at 15.
+      const graceDays = pastDueGraceDays(j.frequency);
+      const balance = Number(j.subscriptionBalance ?? 0) || 0;
+      const note = String(j.schedulingRequest || "").trim();
+      const row: OverdueRow = {
+        docId: String(j.docId || ""),
+        customerId: String(j.customerId || ""),
+        customerName: String(j.customerName || j.customerId || ""),
+        address: String(j.address || ""),
+        balance,
+        serviceType: String(j.serviceType || ""),
+        frequencyLabel: String(j.recurringFrequency || ""),
+        serviceLine: String(j.serviceLine || ""),
+        dueDate,
+        daysOverdue,
+        graceDays,
+        lastCompleted: String(j.subscriptionLastCompletedDate || ""),
+        reasons: [],
+      };
+
+      // Counted rows are EXACTLY the stamped flag, with no re-filtering on the
+      // dates — otherwise this list would disagree with the card whenever the
+      // flag is older than the data (it is refreshed by sync, not live). Such a
+      // row still shows its real due date and day count, which is the point.
+      if (j.overdueActionable === true) {
+        counted.push(row);
+        continue;
+      }
+
+      // Everything below is the EXCLUDED half: genuinely past its own window,
+      // but not carrying the flag.
+      if (!dueDate || dueDate >= today) continue;
+      if (daysOverdue <= graceDays) continue; // still inside its window — Pending, not overdue
+
+      // Say which gate it failed, in the order scope.ts applies them. A row can
+      // fail several.
+      const reasons: string[] = [];
+      if (daysOverdue > MAX_OVERDUE_DAYS) reasons.push(`stale — due ${daysOverdue} days ago`);
+      if (balance > BALANCE_GATE) reasons.push(`balance ${formatCurrency(balance)} (over ${formatCurrency(BALANCE_GATE)})`);
+      if (note) reasons.push(`scheduling note: ${note}`);
+      if (j.alreadyScheduled === true) {
+        reasons.push(`already booked${j.fieldRoutesScheduledDate ? ` ${j.fieldRoutesScheduledDate}` : ""}`);
+      }
+      if (j.pendingCancel === true) reasons.push("pending cancel");
+      if (j.potentialCustomer === true) reasons.push("prospect, not a customer");
+      // Nothing else explains it: the stamped flag predates the current dates
+      // (it is refreshed by the sync / recompute-past-due cron, not live).
+      if (reasons.length === 0) reasons.push("flag not refreshed since last sync");
+      excluded.push({ ...row, reasons });
+    }
+
+    const byMostOverdue = (a: OverdueRow, b: OverdueRow) => b.daysOverdue - a.daysOverdue;
+    counted.sort(byMostOverdue);
+    excluded.sort(byMostOverdue);
+    return {
+      counted,
+      excluded,
+      // The card counts customers, not subscriptions — show both so the number
+      // is never ambiguous.
+      customerCount: new Set(counted.map((r) => r.customerId).filter(Boolean)).size,
+      excludedBalanceTotal: excluded.reduce((sum, r) => sum + (r.balance > BALANCE_GATE ? r.balance : 0), 0),
+    };
+  }, [rawJobs, today]);
 
   // Targets by Service rewound to `asOfDate` (null when live). The month's TARGET
   // is unchanged — what moves is how much was done by that date and how far
@@ -1192,18 +1352,50 @@ export default function DashboardPage() {
                     {drill === "drive" && `Drive Time by Route (${formatTime(drillData.routeRows.reduce((s, r) => s + r.driveMinutes, 0))} total)`}
                     {drill === "value" && `Route Value by Route (${formatCurrency(drillData.routeRows.reduce((s, r) => s + r.routeValue, 0))} total)`}
                     {drill === "stopsHour" && "Stops / Hour by Route"}
+                    {drill === "overdue" && `Overdue Stops (${overdueDrill.customerCount} customers · ${overdueDrill.counted.length} subscriptions)`}
                   </DialogTitle>
                   <DialogDescription>
+                    {drill === "overdue" ? (
+                      <>Company-wide · ignores the technician/route filters · flag refreshed by the last sync, not live</>
+                    ) : (
+                      <>
                     {routeWindowLabel}
                     {dateFilterEnabled ? ` · ${dateFrom} to ${dateTo}` : ` · ${today}`}
                     {filterTechs.length > 0 ? ` · ${filterTechs.map(id => techs.find(t => t.id === id)?.name || id).join(", ")}` : ""}
                     {filterGroups.length > 0 ? ` · ${filterGroups.join(", ")}` : ""}
                     {filterTemplates.length > 0 ? ` · ${filterTemplates.join(", ")}` : ""}
                     {filterSubTypes.length > 0 ? ` · ${filterSubTypes.join(", ")}` : ""}
+                      </>
+                    )}
                   </DialogDescription>
                 </DialogHeader>
                 <div className="max-h-[65vh] overflow-y-auto">
-                  {drill === "routes" || drill === "drive" || drill === "value" || drill === "stopsHour" ? (
+                  {drill === "overdue" ? (
+                    <div className="space-y-6">
+                      <div>
+                        <p className="text-xs text-muted-foreground/60 mb-2">
+                          <span className="text-foreground font-medium">Counted ({overdueDrill.counted.length})</span> — past the service window for their
+                          frequency (monthly 5d · bimonthly 10d · quarterly 15d · annual 30d), balance at or under {formatCurrency(BALANCE_GATE)}, no scheduling
+                          note, not already booked, under {MAX_OVERDUE_DAYS} days late.
+                        </p>
+                        <OverdueTable rows={overdueDrill.counted} />
+                      </div>
+                      {overdueDrill.excluded.length > 0 && (
+                        <div>
+                          <p className="text-xs text-muted-foreground/60 mb-2">
+                            <span className="text-amber-400 font-medium">Excluded ({overdueDrill.excluded.length})</span> — past due but NOT in the number above.
+                            {overdueDrill.excludedBalanceTotal > 0 && (
+                              <> {formatCurrency(overdueDrill.excludedBalanceTotal)} of it is blocked on balances.</>
+                            )}
+                          </p>
+                          <OverdueTable rows={overdueDrill.excluded} showReason />
+                        </div>
+                      )}
+                      <p className="text-[11px] text-muted-foreground/50">
+                        Out-of-scope, pending-cancel and prospect subscriptions are not loaded on this page, so they cannot appear even under Excluded.
+                      </p>
+                    </div>
+                  ) : drill === "routes" || drill === "drive" || drill === "value" || drill === "stopsHour" ? (
                     (() => {
                       // Same per-route table for every route-level metric —
                       // sorted by the metric that was clicked (worst/biggest
@@ -1344,7 +1536,13 @@ export default function DashboardPage() {
             </Dialog>
 
             {/* OVERDUE STOPS — its own thing (company-wide) */}
-            <Card className="border-red-500/30 bg-red-500/[0.04] animate-fade-in">
+            <Card
+              className="border-red-500/30 bg-red-500/[0.04] animate-fade-in cursor-pointer transition-colors hover:border-red-500/50 hover:bg-red-500/[0.07]"
+              onClick={() => setDrill("overdue")}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setDrill("overdue"); } }}
+            >
               <CardContent className="p-5 flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   <div className="p-2.5 rounded-lg bg-red-500/10 text-red-400">
@@ -1352,7 +1550,9 @@ export default function DashboardPage() {
                   </div>
                   <div>
                     <p className="text-[13px] text-muted-foreground font-medium">Overdue Stops</p>
-                    <p className="text-xs text-muted-foreground/70">Customers past due 30+ days · company-wide</p>
+                    {/* The old "30+ days" label was wrong: the window scales with
+                        service frequency (monthly 5d, quarterly 15d). */}
+                    <p className="text-xs text-muted-foreground/70">Customers past their service window · company-wide · click to audit</p>
                   </div>
                 </div>
                 <p className="text-4xl font-bold text-red-400 tracking-tight">{stats.overdueStops}</p>
