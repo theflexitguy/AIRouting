@@ -5,6 +5,7 @@ export const maxDuration = 60;
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
+import { loadServiceTypeCatalog, stopKindFor } from "@/lib/fieldroutes/sync";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -86,6 +87,17 @@ async function handle(request: NextRequest) {
       if (id) empName.set(id, name);
     }
 
+    // The serviceType catalog, and the stop kind the sync now derives from it —
+    // the SAME functions the sync uses, so this can't drift from what gets
+    // stored. Use it to audit a day's regular / initial / reservice split.
+    const serviceTypeCatalog = await loadServiceTypeCatalog(client);
+    const stopKindCounts: Record<string, number> = { regular: 0, initial: 0, reservice: 0 };
+    // The day's split BY service type — the check that the type actually
+    // separates the three. Plus any type id the catalog has no row for: those
+    // fall through to "regular", so they should be empty.
+    const byServiceType: Record<string, Record<string, number>> = {};
+    const unknownServiceTypeIds = new Set<string>();
+
     let apptAssignedCount = 0;
     let routeAssignedCount = 0;
     let neitherCount = 0;
@@ -100,9 +112,25 @@ async function handle(request: NextRequest) {
       if (apptHas) apptAssignedCount++;
       if (routeHas) routeAssignedCount++;
       if (!apptHas && !routeHas) neitherCount++;
+      const subscriptionID = str(ar.subscriptionID);
+      const serviceTypeId = str(ar.type);
+      const stopKind = stopKindFor(serviceTypeCatalog, {
+        isInitial: Number(ar.isInitial) === 1,
+        serviceTypeId,
+      });
+      stopKindCounts[stopKind] = (stopKindCounts[stopKind] || 0) + 1;
+      const catalogRow = serviceTypeCatalog.get(serviceTypeId);
+      if (!catalogRow) unknownServiceTypeIds.add(serviceTypeId || "(empty)");
+      const typeLabel = catalogRow?.description || `type ${serviceTypeId || "(empty)"}`;
+      byServiceType[typeLabel] = byServiceType[typeLabel] || {};
+      byServiceType[typeLabel][stopKind] = (byServiceType[typeLabel][stopKind] || 0) + 1;
       return {
         appointmentID: str(ar.appointmentID),
-        subscriptionID: str(ar.subscriptionID),
+        subscriptionID,
+        serviceTypeId,
+        serviceTypeName: catalogRow?.description || "",
+        isInitial: str(ar.isInitial),
+        stopKind,
         customerID: str(ar.customerID),
         date: str(ar.date),
         status: str(ar.status),
@@ -122,11 +150,11 @@ async function handle(request: NextRequest) {
       };
     });
 
-    // Raw field set for ONE appointment. Stop-level classification (regular vs
-    // initial vs reservice) is not on the subscription -- its serviceType is
-    // just "General Pest" -- so it has to come off the appointment, and nothing
-    // in the sync reads an appointment type today. This shows what FieldRoutes
-    // actually offers before any of it is wired in.
+    // Raw field set for ONE appointment, plus the distribution of the fields the
+    // classification rests on. Stop-level classification is not on the
+    // subscription -- its serviceType is just "General Pest" -- so it comes off
+    // the appointment (isInitial / type / subscriptionID). Kept so the raw
+    // FieldRoutes shape can still be checked against what stopKind resolved to.
     const sampleAppointment = appts.length > 0 ? rec(appts[0]) : null;
     const distinctTypeValues: Record<string, Record<string, number>> = {};
     for (const candidate of ["type", "appointmentType", "serviceType", "serviceID", "category", "isInitial", "reservice"]) {
@@ -148,6 +176,10 @@ async function handle(request: NextRequest) {
       apptCount: appts.length,
       appointmentKeys: sampleAppointment ? Object.keys(sampleAppointment).sort() : [],
       distinctTypeValues,
+      stopKindCounts,
+      byServiceType,
+      unknownServiceTypeIds: Array.from(unknownServiceTypeIds),
+      serviceTypes: Array.from(serviceTypeCatalog, ([typeID, row]) => ({ typeID, ...row })),
       sampleAppointment,
       summary: {
         withAppointmentTech: apptAssignedCount,
