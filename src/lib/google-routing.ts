@@ -98,7 +98,25 @@ type ComputeRoutesPayload = {
 const matrixCache = new Map<string, CacheEntry<RouteMatrixResult>>();
 const polylineCache = new Map<string, CacheEntry<RouteGeometryResult>>();
 
+/**
+ * Master kill switch for every BILLABLE Google call — set GOOGLE_APIS_PAUSED=1
+ * to stop spend without pulling credentials or redeploying code changes.
+ *
+ * Paused, the app keeps working: drive times and polylines fall back to
+ * straight-line estimates and geocoding returns null, which are the same paths
+ * that run when no API key is configured. The FieldRoutes sync is unaffected —
+ * it costs nothing on Google — so jobs, targets, overdue counts and the rest of
+ * the dashboard stay current.
+ */
+export function googleApisPaused() {
+  const flag = String(process.env.GOOGLE_APIS_PAUSED || "").trim().toLowerCase();
+  return flag === "1" || flag === "true" || flag === "yes";
+}
+
 export function getGoogleMapsServerApiKey() {
+  // Reporting no key is what makes the pause total: the matrix, polyline and
+  // geocoding paths all gate on this and already degrade gracefully without it.
+  if (googleApisPaused()) return "";
   return (
     process.env.GOOGLE_MAPS_API_KEY ||
     process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
