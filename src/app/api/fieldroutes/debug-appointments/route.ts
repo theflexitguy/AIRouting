@@ -92,6 +92,11 @@ async function handle(request: NextRequest) {
     // stored. Use it to audit a day's regular / initial / reservice split.
     const serviceTypeCatalog = await loadServiceTypeCatalog(client);
     const stopKindCounts: Record<string, number> = { regular: 0, initial: 0, reservice: 0 };
+    // The day's split BY service type — the check that the type actually
+    // separates the three. Plus any type id the catalog has no row for: those
+    // fall through to "regular", so they should be empty.
+    const byServiceType: Record<string, Record<string, number>> = {};
+    const unknownServiceTypeIds = new Set<string>();
 
     let apptAssignedCount = 0;
     let routeAssignedCount = 0;
@@ -112,15 +117,18 @@ async function handle(request: NextRequest) {
       const stopKind = stopKindFor(serviceTypeCatalog, {
         isInitial: Number(ar.isInitial) === 1,
         serviceTypeId,
-        // FieldRoutes sends -1 for stand-alone services and reservices.
-        hasSubscription: subscriptionID !== "" && subscriptionID !== "0" && subscriptionID !== "-1",
       });
       stopKindCounts[stopKind] = (stopKindCounts[stopKind] || 0) + 1;
+      const catalogRow = serviceTypeCatalog.get(serviceTypeId);
+      if (!catalogRow) unknownServiceTypeIds.add(serviceTypeId || "(empty)");
+      const typeLabel = catalogRow?.description || `type ${serviceTypeId || "(empty)"}`;
+      byServiceType[typeLabel] = byServiceType[typeLabel] || {};
+      byServiceType[typeLabel][stopKind] = (byServiceType[typeLabel][stopKind] || 0) + 1;
       return {
         appointmentID: str(ar.appointmentID),
         subscriptionID,
         serviceTypeId,
-        serviceTypeName: serviceTypeCatalog.get(serviceTypeId)?.description || "",
+        serviceTypeName: catalogRow?.description || "",
         isInitial: str(ar.isInitial),
         stopKind,
         customerID: str(ar.customerID),
@@ -169,6 +177,8 @@ async function handle(request: NextRequest) {
       appointmentKeys: sampleAppointment ? Object.keys(sampleAppointment).sort() : [],
       distinctTypeValues,
       stopKindCounts,
+      byServiceType,
+      unknownServiceTypeIds: Array.from(unknownServiceTypeIds),
       serviceTypes: Array.from(serviceTypeCatalog, ([typeID, row]) => ({ typeID, ...row })),
       sampleAppointment,
       summary: {

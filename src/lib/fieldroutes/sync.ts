@@ -212,6 +212,7 @@ export interface ServiceTypeRow {
   description: string;
   initial: boolean;
   reservice: boolean;
+  regularService: boolean;
 }
 
 /**
@@ -227,13 +228,9 @@ function normalizeSubscriptionId(value: unknown): string {
 /**
  * Load the serviceType catalog (a single search — the table is a few dozen rows)
  * and stamp every rebuild-window appointment with its stop kind and service-type
- * name. Sources, most authoritative first:
- *   - `appointment.isInitial === 1`               → initial
- *   - `serviceType.reservice` / `.initial` flags  → reservice / initial
- *   - no subscription behind the appointment      → reservice (FieldRoutes'
- *     documented shape for stand-alone services and reservices)
- * Non-fatal: if the catalog can't be read, the appointment-level derivation
- * still separates initials and reservices from regular stops.
+ * name. The catalog is what actually separates the three (see stopKindFor).
+ * Non-fatal: if it can't be read, appointment.isInitial still picks initials
+ * out and everything else falls back to a regular stop.
  */
 export async function loadServiceTypeCatalog(
   client: FieldRoutesClient,
@@ -248,6 +245,7 @@ export async function loadServiceTypeCatalog(
         description: str(r.description),
         initial: num(r.initial) === 1,
         reservice: num(r.reservice) === 1,
+        regularService: num(r.regularService) === 1,
       });
     }
   } catch (err) {
@@ -256,16 +254,29 @@ export async function loadServiceTypeCatalog(
   return catalog;
 }
 
-/** One appointment's kind, resolved against the catalog. See loadServiceTypeCatalog. */
+/**
+ * One appointment's kind. The service type is the authority: FieldRoutes flags
+ * each catalog row as a reservice, an initial, or a regular service, and the
+ * office picks the type when booking. appointment.isInitial is only a fallback
+ * for a type that carries no flag either way (a catalog row we've never seen,
+ * or one left unflagged), so a type FieldRoutes calls a regular service is
+ * never relabelled behind the office's back.
+ *
+ * Deliberately NOT used: "this appointment has no subscription behind it". The
+ * docs describe subscriptionID -1 for stand-alone services and reservices, but
+ * this office doesn't book that way, so inferring a reservice from a missing
+ * subscription would only mislabel stops whose subscription link is absent for
+ * some other reason.
+ */
 export function stopKindFor(
   catalog: Map<string, ServiceTypeRow>,
-  a: { isInitial: boolean; serviceTypeId: string; hasSubscription: boolean },
+  a: { isInitial: boolean; serviceTypeId: string },
 ): StopKind {
   const t = catalog.get(a.serviceTypeId);
-  if (a.isInitial) return "initial";
   if (t?.reservice) return "reservice";
   if (t?.initial) return "initial";
-  if (!a.hasSubscription) return "reservice";
+  if (t?.regularService) return "regular";
+  if (a.isInitial) return "initial";
   return "regular";
 }
 
@@ -273,7 +284,7 @@ export function stopKindFor(
 function applyStopKinds(catalog: Map<string, ServiceTypeRow>, appts: PastAppt[]): void {
   for (const a of appts) {
     a.serviceTypeName = catalog.get(a.serviceTypeId)?.description || "";
-    a.stopKind = stopKindFor(catalog, { ...a, hasSubscription: Boolean(a.subId) });
+    a.stopKind = stopKindFor(catalog, a);
   }
 }
 
@@ -2065,7 +2076,7 @@ async function buildRunSetup(
   applyStopKinds(serviceTypeCatalog, pastAppts);
   for (const info of Object.values(apptMap)) {
     info.serviceTypeName = serviceTypeCatalog.get(info.serviceTypeId)?.description || "";
-    info.stopKind = stopKindFor(serviceTypeCatalog, { ...info, hasSubscription: true });
+    info.stopKind = stopKindFor(serviceTypeCatalog, info);
   }
 
   // Required skills per service type (e.g. Wildlife Exclusion -> "Wild Life"),
