@@ -5,6 +5,7 @@ export const maxDuration = 60;
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
+import { loadServiceTypeCatalog, stopKindFor } from "@/lib/fieldroutes/sync";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -86,6 +87,12 @@ async function handle(request: NextRequest) {
       if (id) empName.set(id, name);
     }
 
+    // The serviceType catalog, and the stop kind the sync now derives from it —
+    // the SAME functions the sync uses, so this can't drift from what gets
+    // stored. Use it to audit a day's regular / initial / reservice split.
+    const serviceTypeCatalog = await loadServiceTypeCatalog(client);
+    const stopKindCounts: Record<string, number> = { regular: 0, initial: 0, reservice: 0 };
+
     let apptAssignedCount = 0;
     let routeAssignedCount = 0;
     let neitherCount = 0;
@@ -100,9 +107,22 @@ async function handle(request: NextRequest) {
       if (apptHas) apptAssignedCount++;
       if (routeHas) routeAssignedCount++;
       if (!apptHas && !routeHas) neitherCount++;
+      const subscriptionID = str(ar.subscriptionID);
+      const serviceTypeId = str(ar.type);
+      const stopKind = stopKindFor(serviceTypeCatalog, {
+        isInitial: Number(ar.isInitial) === 1,
+        serviceTypeId,
+        // FieldRoutes sends -1 for stand-alone services and reservices.
+        hasSubscription: subscriptionID !== "" && subscriptionID !== "0" && subscriptionID !== "-1",
+      });
+      stopKindCounts[stopKind] = (stopKindCounts[stopKind] || 0) + 1;
       return {
         appointmentID: str(ar.appointmentID),
-        subscriptionID: str(ar.subscriptionID),
+        subscriptionID,
+        serviceTypeId,
+        serviceTypeName: serviceTypeCatalog.get(serviceTypeId)?.description || "",
+        isInitial: str(ar.isInitial),
+        stopKind,
         customerID: str(ar.customerID),
         date: str(ar.date),
         status: str(ar.status),
@@ -122,11 +142,11 @@ async function handle(request: NextRequest) {
       };
     });
 
-    // Raw field set for ONE appointment. Stop-level classification (regular vs
-    // initial vs reservice) is not on the subscription -- its serviceType is
-    // just "General Pest" -- so it has to come off the appointment, and nothing
-    // in the sync reads an appointment type today. This shows what FieldRoutes
-    // actually offers before any of it is wired in.
+    // Raw field set for ONE appointment, plus the distribution of the fields the
+    // classification rests on. Stop-level classification is not on the
+    // subscription -- its serviceType is just "General Pest" -- so it comes off
+    // the appointment (isInitial / type / subscriptionID). Kept so the raw
+    // FieldRoutes shape can still be checked against what stopKind resolved to.
     const sampleAppointment = appts.length > 0 ? rec(appts[0]) : null;
     const distinctTypeValues: Record<string, Record<string, number>> = {};
     for (const candidate of ["type", "appointmentType", "serviceType", "serviceID", "category", "isInitial", "reservice"]) {
@@ -148,6 +168,8 @@ async function handle(request: NextRequest) {
       apptCount: appts.length,
       appointmentKeys: sampleAppointment ? Object.keys(sampleAppointment).sort() : [],
       distinctTypeValues,
+      stopKindCounts,
+      serviceTypes: Array.from(serviceTypeCatalog, ([typeID, row]) => ({ typeID, ...row })),
       sampleAppointment,
       summary: {
         withAppointmentTech: apptAssignedCount,

@@ -158,6 +158,11 @@ interface RouteStopDetail {
   customerName?: string;
   value?: number;
   completed?: boolean; // stamped by the historical reconcile (appointment status 1)
+  // What the stop IS, as opposed to which subscription it hangs off: a General
+  // Pest regular service, a General Pest initial and a General Pest reservice
+  // all share one subscription type, so only the appointment separates them.
+  kind?: string; // "regular" | "initial" | "reservice"
+  serviceType?: string;
 }
 interface RouteRec extends RouteLike {
   date: string;
@@ -250,6 +255,7 @@ interface JobRec extends JobLike {
   schedulingRequest?: string; // special-scheduling note; any text blocks routing
   potentialCustomer?: boolean;
   serviceType?: string;
+  fieldRoutesStopKind?: string; // "regular" | "initial" | "reservice" on the booked appointment
   fieldRoutesRouteGroup?: string;
   fieldRoutesRouteTemplate?: string;
   scheduledTech?: string; // FieldRoutes tech name on the booked appointment
@@ -273,6 +279,20 @@ interface TechOption {
 }
 
 const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+
+// Stop Type filter: a route mixes regular services, initials (a new signup's
+// first visit) and reservices (a return trip, booked with no subscription
+// behind it). FieldRoutes files all three under the same subscription service
+// type, so this is the only way to separate them.
+const STOP_KIND_OPTIONS = [
+  { value: "regular", label: "Regular Stops" },
+  { value: "initial", label: "Initials" },
+  { value: "reservice", label: "Reservices" },
+];
+const stopKindOf = (v: unknown) => {
+  const k = norm(v);
+  return k === "initial" || k === "reservice" ? k : "regular";
+};
 
 /** Saturday/Sunday check for a YYYY-MM-DD date string. */
 const isWeekendISO = (iso: string) => {
@@ -348,6 +368,7 @@ export default function DashboardPage() {
   const [filterGroups, setFilterGroups] = useState<string[]>([]);
   const [filterTemplates, setFilterTemplates] = useState<string[]>([]);
   const [filterSubTypes, setFilterSubTypes] = useState<string[]>([]);
+  const [filterStopKinds, setFilterStopKinds] = useState<string[]>([]);
   const [rangeRoutes, setRangeRoutes] = useState<RouteRec[] | null>(null);
   // Custom-range extras: bump to re-fetch after a live FieldRoutes verification,
   // in-flight indicator for that verification, and the skip-weekends toggle.
@@ -615,7 +636,7 @@ export default function DashboardPage() {
     return keys;
   }, [filterTechs, techs]);
 
-  const filtersActive = dateFilterEnabled || filterTechs.length > 0 || filterGroups.length > 0 || filterTemplates.length > 0 || filterSubTypes.length > 0;
+  const filtersActive = dateFilterEnabled || filterTechs.length > 0 || filterGroups.length > 0 || filterTemplates.length > 0 || filterSubTypes.length > 0 || filterStopKinds.length > 0;
 
   // Route Template options: distinct template titles across every route loaded
   // (8-week window + custom range), synced from FieldRoutes route.title —
@@ -648,16 +669,31 @@ export default function DashboardPage() {
     return m;
   }, [rawJobs]);
 
-  // Apply technician + route-group + route-template + subscription-type filters
-  // to a set of routes. Each filter is a multi-select: empty = all, otherwise
-  // match ANY selection. Tech/group/template include or exclude WHOLE routes;
-  // subscription type is a STOP-level filter — routes mix types, so each route
-  // is rewritten to just its matching stops (stop count, completions, value,
-  // service minutes) and every downstream metric reads the rewritten numbers.
+  // Apply technician + route-group + route-template + subscription-type +
+  // stop-type filters to a set of routes. Each filter is a multi-select: empty =
+  // all, otherwise match ANY selection. Tech/group/template include or exclude
+  // WHOLE routes; subscription type and stop type are STOP-level filters —
+  // routes mix both, so each route is rewritten to just its matching stops (stop
+  // count, completions, value, service minutes) and every downstream metric
+  // reads the rewritten numbers. The two stop-level filters compose: General
+  // Pest + Initials shows only the GP first services on the day.
   const filterRoutes = useMemo(() => {
-    const stopMatchesSubType = (id: string) => {
-      const t = String(jobsByDocId.get(id)?.serviceType || "").trim();
-      return t !== "" && filterSubTypes.includes(t);
+    const stopLevelActive = filterSubTypes.length > 0 || filterStopKinds.length > 0;
+    const stopMatches = (id: string, detail: RouteStopDetail | undefined) => {
+      if (filterSubTypes.length > 0) {
+        // The job doc is the authority on the subscription's type; the stop
+        // detail covers stops with no job doc (stand-alone reservices, and
+        // subscriptions whose doc was purged after a one-time completed).
+        const t = String(jobsByDocId.get(id)?.serviceType || detail?.serviceType || "").trim();
+        if (t === "" || !filterSubTypes.includes(t)) return false;
+      }
+      if (filterStopKinds.length > 0) {
+        const kind = detail?.kind !== undefined
+          ? stopKindOf(detail.kind)
+          : stopKindOf(jobsByDocId.get(id)?.fieldRoutesStopKind);
+        if (!filterStopKinds.includes(kind)) return false;
+      }
+      return true;
     };
     return (routes: RouteRec[]) => {
       const base = routes.filter(r => {
@@ -671,11 +707,12 @@ export default function DashboardPage() {
         if (!routeMatchesTech(r, techKeys)) return false;
         return true;
       });
-      if (filterSubTypes.length === 0) return base;
+      if (!stopLevelActive) return base;
       const rewritten: RouteRec[] = [];
       for (const r of base) {
         const seq = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
-        const keep = seq.filter(stopMatchesSubType);
+        const allById = new Map((Array.isArray(r.stops) ? r.stops : []).map(s => [String(s.id), s]));
+        const keep = seq.filter(id => stopMatches(id, allById.get(id)));
         if (keep.length === 0) continue;
         const keepSet = new Set(keep);
         const detail = (Array.isArray(r.stops) ? r.stops : []).filter(s => keepSet.has(String(s.id)));
@@ -706,7 +743,7 @@ export default function DashboardPage() {
       }
       return rewritten;
     };
-  }, [filterGroups, filterTemplates, filterSubTypes, techKeys, jobsByDocId]);
+  }, [filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, jobsByDocId]);
 
   // Route set for the "Today" cards: the custom range when the date filter is
   // on, otherwise today's routes. Shared with the metric drill-downs so a
@@ -741,6 +778,7 @@ export default function DashboardPage() {
       if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")))) return false;
       if (filterTemplates.length > 0 && !filterTemplates.includes(String(j.fieldRoutesRouteTemplate || "").trim())) return false;
       if (filterSubTypes.length > 0 && !filterSubTypes.includes(String(j.serviceType || "").trim())) return false;
+      if (filterStopKinds.length > 0 && !filterStopKinds.includes(stopKindOf(j.fieldRoutesStopKind))) return false;
       if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
       return true;
     };
@@ -925,7 +963,7 @@ export default function DashboardPage() {
       trend,
       jobsDueThisWeek,
     };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, techKeys, bounds, today, scopedRoutes, jobsByDocId]);
+  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, bounds, today, scopedRoutes, jobsByDocId]);
 
   // ── Metric drill-downs ──────────────────────────────────────────────────
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
@@ -1307,11 +1345,18 @@ export default function DashboardPage() {
                   allLabel="All Subscription Types"
                   className="w-full sm:w-48 h-8 text-xs"
                 />
+                <MultiSelect
+                  options={STOP_KIND_OPTIONS}
+                  selected={filterStopKinds}
+                  onChange={setFilterStopKinds}
+                  allLabel="All Stop Types"
+                  className="w-full sm:w-44 h-8 text-xs"
+                />
                 {filtersActive && (
                   <button
                     type="button"
                     className="text-xs text-muted-foreground/60 hover:text-foreground underline underline-offset-2 ml-auto"
-                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTechs([]); setFilterGroups([]); setFilterTemplates([]); setFilterSubTypes([]); }}
+                    onClick={() => { setDateFilterEnabled(false); setExcludeWeekends(false); setFilterTechs([]); setFilterGroups([]); setFilterTemplates([]); setFilterSubTypes([]); setFilterStopKinds([]); }}
                   >
                     Clear filters
                   </button>
@@ -1380,6 +1425,7 @@ export default function DashboardPage() {
                     {filterGroups.length > 0 ? ` · ${filterGroups.join(", ")}` : ""}
                     {filterTemplates.length > 0 ? ` · ${filterTemplates.join(", ")}` : ""}
                     {filterSubTypes.length > 0 ? ` · ${filterSubTypes.join(", ")}` : ""}
+                    {filterStopKinds.length > 0 ? ` · ${filterStopKinds.map(k => STOP_KIND_OPTIONS.find(o => o.value === k)?.label || k).join(", ")}` : ""}
                       </>
                     )}
                   </DialogDescription>

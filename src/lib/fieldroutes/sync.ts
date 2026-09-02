@@ -119,6 +119,12 @@ interface ApptInfo {
   routeId: string;
   routeGroup: string; // FieldRoutes route.groupTitle (e.g. "GPC", "Specialty")
   routeTemplate: string; // FieldRoutes route.title — the route-template name ("Regular", "Rain Day", "Early Release", …)
+  // Same stop-kind classification as PastAppt, carried onto the job doc so a
+  // FUTURE route's stops can be filtered by kind too (see StopKind).
+  isInitial: boolean;
+  serviceTypeId: string;
+  stopKind?: StopKind;
+  serviceTypeName?: string;
 }
 
 // How many trailing days of PAST routes each sync re-reconciles against actual
@@ -177,6 +183,14 @@ interface PastAppt {
   duration: number;
   status: number;
   customerId: string; // appointment.customerID — key for the coordinate fallback below
+  // Stop-kind inputs. A General Pest regular stop, a General Pest initial and a
+  // General Pest reservice all hang off the SAME subscription service type, so
+  // the subscription alone can't tell them apart — the appointment can.
+  isInitial: boolean; // appointment.isInitial === 1 — the subscription's first service
+  serviceTypeId: string; // appointment.type — joins to the serviceType catalog
+  // Filled in by applyStopKinds() once the catalog is loaded.
+  stopKind?: StopKind;
+  serviceTypeName?: string; // serviceType.description ("General Pest Initial", …)
   // Customer-record fallbacks for stops with no (or a purged) job doc —
   // standalone reservices etc. Without coordinates those stops silently drop
   // out of the drive-time matrix (a far-out stop once cost a route 24 real
@@ -188,6 +202,79 @@ interface PastAppt {
 
 function rec(value: unknown): Record<string, unknown> {
   return (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+}
+
+/** What a stop actually is, independent of which subscription it belongs to. */
+export type StopKind = "regular" | "initial" | "reservice";
+
+/** One row of the FieldRoutes serviceType catalog. */
+export interface ServiceTypeRow {
+  description: string;
+  initial: boolean;
+  reservice: boolean;
+}
+
+/**
+ * FieldRoutes sends `-1` for stand-alone services and reservices, and `0` for
+ * "none" — both mean the appointment has no subscription behind it. Treating
+ * `-1` literally keyed those stops as `sub_-1`, an id no job doc can ever match.
+ */
+function normalizeSubscriptionId(value: unknown): string {
+  const id = str(value);
+  return id === "0" || id === "-1" ? "" : id;
+}
+
+/**
+ * Load the serviceType catalog (a single search — the table is a few dozen rows)
+ * and stamp every rebuild-window appointment with its stop kind and service-type
+ * name. Sources, most authoritative first:
+ *   - `appointment.isInitial === 1`               → initial
+ *   - `serviceType.reservice` / `.initial` flags  → reservice / initial
+ *   - no subscription behind the appointment      → reservice (FieldRoutes'
+ *     documented shape for stand-alone services and reservices)
+ * Non-fatal: if the catalog can't be read, the appointment-level derivation
+ * still separates initials and reservices from regular stops.
+ */
+export async function loadServiceTypeCatalog(
+  client: FieldRoutesClient,
+): Promise<Map<string, ServiceTypeRow>> {
+  const catalog = new Map<string, ServiceTypeRow>();
+  try {
+    for (const row of await client.searchWithData("serviceType")) {
+      const r = rec(row);
+      const id = str(r.typeID);
+      if (!id) continue;
+      catalog.set(id, {
+        description: str(r.description),
+        initial: num(r.initial) === 1,
+        reservice: num(r.reservice) === 1,
+      });
+    }
+  } catch (err) {
+    console.warn("[fieldroutes/sync] serviceType catalog pull failed (non-fatal):", String(err));
+  }
+  return catalog;
+}
+
+/** One appointment's kind, resolved against the catalog. See loadServiceTypeCatalog. */
+export function stopKindFor(
+  catalog: Map<string, ServiceTypeRow>,
+  a: { isInitial: boolean; serviceTypeId: string; hasSubscription: boolean },
+): StopKind {
+  const t = catalog.get(a.serviceTypeId);
+  if (a.isInitial) return "initial";
+  if (t?.reservice) return "reservice";
+  if (t?.initial) return "initial";
+  if (!a.hasSubscription) return "reservice";
+  return "regular";
+}
+
+/** Stamp kind + service-type name onto rebuild-window appointments in place. */
+function applyStopKinds(catalog: Map<string, ServiceTypeRow>, appts: PastAppt[]): void {
+  for (const a of appts) {
+    a.serviceTypeName = catalog.get(a.serviceTypeId)?.description || "";
+    a.stopKind = stopKindFor(catalog, { ...a, hasSubscription: Boolean(a.subId) });
+  }
 }
 
 /**
@@ -655,6 +742,7 @@ async function refreshScheduledAssignments(
       const routeId = str(appt.routeId);
       const routeGroup = str(appt.routeGroup);
       const routeTemplate = str(appt.routeTemplate);
+      const stopKind = str(appt.stopKind) || "regular";
       const date = str(appt.date) || str(d.scheduledDate);
       // Never override a stop FieldRoutes already marked complete for this cycle.
       const completed = str(d.status) === "completed" || Boolean(d.serviceDueAlreadyCompleted);
@@ -670,6 +758,7 @@ async function refreshScheduledAssignments(
         str(d.fieldRoutesRouteId) === routeId &&
         str(d.fieldRoutesRouteGroup) === routeGroup &&
         str(d.fieldRoutesRouteTemplate) === routeTemplate &&
+        str(d.fieldRoutesStopKind) === stopKind &&
         str(d.status) === desiredStatus;
       if (same) continue;
 
@@ -683,6 +772,7 @@ async function refreshScheduledAssignments(
         fieldRoutesRouteId: routeId,
         fieldRoutesRouteGroup: routeGroup,
         fieldRoutesRouteTemplate: routeTemplate,
+        fieldRoutesStopKind: stopKind,
         fieldRoutesScheduleSource: "api_appointment",
         scheduledFor: date,
         scheduledTech: techName,
@@ -806,6 +896,8 @@ async function reconcileScheduledRoutes(
     duration: number;
     scheduledDate: string;
     customerName: string;
+    kind: StopKind;
+    serviceType: string;
   }
 
   const jobsSnap = await db.collection(`companies/${companyId}/jobs`).where("status", "==", "scheduled").get();
@@ -845,6 +937,8 @@ async function reconcileScheduledRoutes(
       duration: Number(d.duration) || 25,
       scheduledDate: str(d.scheduledDate),
       customerName: str(d.customerName),
+      kind: (str(d.fieldRoutesStopKind) || "regular") as StopKind,
+      serviceType: str(d.serviceType),
     });
   });
 
@@ -1011,6 +1105,8 @@ async function reconcileScheduledRoutes(
       id: j.id,
       customerName: j.customerName,
       value: Number(j.value) || 0,
+      kind: j.kind,
+      serviceType: j.serviceType,
     }));
     const existing = existingBySlot.get(key);
 
@@ -1254,6 +1350,8 @@ async function rebuildPastRouteWindow({
       routeGroup: string;
       routeTemplate: string;
       completed: boolean;
+      kind: StopKind;
+      serviceType: string;
     }> = [];
     for (const p of group.appts) {
       let id = "";
@@ -1292,6 +1390,10 @@ async function rebuildPastRouteWindow({
         routeGroup: p.routeGroup,
         routeTemplate: str(p.routeTemplate),
         completed: p.status === 1,
+        kind: p.stopKind || "regular",
+        // The subscription's service type when there is one; the appointment's
+        // own catalog name otherwise (stand-alone reservices have no job doc).
+        serviceType: str(j?.serviceType) || str(p.serviceTypeName),
       });
     }
     // Order like the FieldRoutes board: appointment start time, then name.
@@ -1307,6 +1409,10 @@ async function rebuildPastRouteWindow({
       customerName: s.customerName,
       value: Number(s.value) || 0,
       completed: s.completed,
+      // "regular" | "initial" | "reservice" — the dashboard's Stop Type filter
+      // reads this, since a subscription's type can't distinguish the three.
+      kind: s.kind,
+      serviceType: s.serviceType,
     }));
 
     const existing = pastBySlot.get(key);
@@ -1354,9 +1460,14 @@ async function rebuildPastRouteWindow({
       // Never blank an already-stamped template: a resumed run can rehydrate
       // pastAppts persisted before routeTemplate existed.
       const keptTemplate = routeTemplateTitle || str(existing.data.routeTemplateTitle);
+      // Backfill: docs written before stop kinds existed carry a stops array
+      // with no `kind`. Re-stamping is a metadata-only merge — no Google call —
+      // so any day this window revisits self-heals for the Stop Type filter.
+      const storedStops = Array.isArray(existing.data.stops) ? (existing.data.stops as unknown[]) : null;
+      const stopKindsMissing = !storedStops || storedStops.some((v) => !str(rec(v).kind));
       if (
         num(existing.data.completedStops) !== completedStops ||
-        !Array.isArray(existing.data.stops) ||
+        stopKindsMissing ||
         str(existing.data.routeTemplateTitle) !== keptTemplate
       ) {
         batch.set(
@@ -1565,7 +1676,7 @@ export async function reconcileRouteRange(
     }
     for (const a of appts) {
       const ar = rec(a);
-      const subId = str(ar.subscriptionID);
+      const subId = normalizeSubscriptionId(ar.subscriptionID);
       const apptId = str(ar.appointmentID);
       if (!subId && !apptId) continue;
       const apptStatus = num(ar.status);
@@ -1574,10 +1685,12 @@ export async function reconcileRouteRange(
       if (!date || date < windowStart || date >= endExclusive) continue;
       const routeId = str(ar.routeID);
       pastAppts.push({
-        subId: subId === "0" ? "" : subId,
+        subId,
         apptId,
         date,
         start: str(ar.start),
+        isInitial: num(ar.isInitial) === 1,
+        serviceTypeId: str(ar.type),
         techEmpId: routeTechMap.get(routeId) || "",
         routeGroup: routeGroupMap.get(routeId) || "",
         routeTemplate: routeTemplateMap.get(routeId) || "",
@@ -1589,6 +1702,7 @@ export async function reconcileRouteRange(
     // Coordinate/name fallbacks for stops without a job doc — without them,
     // standalone stops drop out of the drive-time legs.
     await enrichApptsWithCustomerCoords(client, pastAppts);
+    applyStopKinds(await loadServiceTypeCatalog(client), pastAppts);
   } catch (err) {
     await recordApiUsage(db, companyId, { reads: client.readCount });
     if (err instanceof FieldRoutesBudgetError) {
@@ -1884,7 +1998,7 @@ async function buildRunSetup(
   const pastAppts: PastAppt[] = [];
   for (const a of allAppts) {
     const ar = rec(a);
-    const subId = str(ar.subscriptionID);
+    const subId = normalizeSubscriptionId(ar.subscriptionID);
     // Drop Cancelled (-1) and Rescheduled (-2) appointments — they still exist in
     // the appointment table (and would otherwise be treated as live scheduled
     // stops), but FieldRoutes no longer has the customer on that route. Pending
@@ -1905,10 +2019,12 @@ async function buildRunSetup(
     // subscriptions complete and roll forward.
     if (date <= today && date >= historyStart && (subId || apptId)) {
       pastAppts.push({
-        subId: subId === "0" ? "" : subId,
+        subId,
         apptId,
         date,
         start: str(ar.start),
+        isInitial: num(ar.isInitial) === 1,
+        serviceTypeId: str(ar.type),
         techEmpId,
         routeGroup: routeGroupMap.get(routeId) || "",
         routeTemplate: routeTemplateMap.get(routeId) || "",
@@ -1933,6 +2049,8 @@ async function buildRunSetup(
         routeId: routeId && routeId !== "0" ? routeId : "",
         routeGroup: routeGroupMap.get(routeId) || "",
         routeTemplate: routeTemplateMap.get(routeId) || "",
+        isInitial: num(ar.isInitial) === 1,
+        serviceTypeId: str(ar.type),
       };
     }
   }
@@ -1940,6 +2058,15 @@ async function buildRunSetup(
   // Coordinate/name fallbacks for rebuild-window stops without a job doc —
   // without them, standalone stops drop out of the drive-time legs.
   await enrichApptsWithCustomerCoords(client, pastAppts);
+
+  // Stop kinds for both passes off ONE catalog pull: the rebuild window's
+  // appointments, and the forward appointments the job docs are stamped from.
+  const serviceTypeCatalog = await loadServiceTypeCatalog(client);
+  applyStopKinds(serviceTypeCatalog, pastAppts);
+  for (const info of Object.values(apptMap)) {
+    info.serviceTypeName = serviceTypeCatalog.get(info.serviceTypeId)?.description || "";
+    info.stopKind = stopKindFor(serviceTypeCatalog, { ...info, hasSubscription: true });
+  }
 
   // Required skills per service type (e.g. Wildlife Exclusion -> "Wild Life"),
   // keyed by the normalized serviceType description — the same join key the
@@ -1950,16 +2077,13 @@ async function buildRunSetup(
   // the serviceType catalog and resolve through that.
   let requiredSkillsByServiceType: Record<string, string[]> = {};
   try {
-    const serviceTypes = await client.searchWithData("serviceType");
     const typeIdToDescription = new Map<string, string>();
-    for (const st of serviceTypes) {
-      const typeId = str(st.typeID);
-      const description = str(st.description);
-      if (typeId && description) typeIdToDescription.set(typeId, description);
+    for (const [typeId, row] of serviceTypeCatalog) {
+      if (row.description) typeIdToDescription.set(typeId, row.description);
     }
     requiredSkillsByServiceType = requiredSkillsByServiceTypeDescription(skillCatalogRows, typeIdToDescription);
   } catch (err) {
-    console.warn("[fieldroutes/sync] serviceType skill pull failed (non-fatal):", String(err));
+    console.warn("[fieldroutes/sync] serviceType skill join failed (non-fatal):", String(err));
   }
 
   return {
@@ -2346,6 +2470,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
       const scheduledTechId = appt ? str(appt.techId) : "";
       const scheduledRouteGroup = appt ? str(appt.routeGroup) : "";
       const scheduledRouteTemplate = appt ? str(appt.routeTemplate) : "";
+      const scheduledStopKind = appt ? str(appt.stopKind) || "regular" : "";
 
       // Pending cancel comes straight off the customer record (don't derive it
       // from dateCancelled — that field is "0000-00-00 00:00:00" when unset and
@@ -2455,6 +2580,7 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
         fieldRoutesRouteId: alreadyScheduled ? scheduledRouteId : "",
         fieldRoutesRouteGroup: scheduledRouteGroup,
         fieldRoutesRouteTemplate: scheduledRouteTemplate,
+        fieldRoutesStopKind: alreadyScheduled ? scheduledStopKind : "",
         fieldRoutesScheduleSource: alreadyScheduled ? "api_appointment" : "",
         schedulingRequest: specialScheduling,
         // Subscription / billing detail (labels match the FieldRoutes report):
