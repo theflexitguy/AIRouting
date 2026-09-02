@@ -122,10 +122,33 @@ async function handle(request: NextRequest) {
       };
     });
 
+    // Raw field set for ONE appointment. Stop-level classification (regular vs
+    // initial vs reservice) is not on the subscription -- its serviceType is
+    // just "General Pest" -- so it has to come off the appointment, and nothing
+    // in the sync reads an appointment type today. This shows what FieldRoutes
+    // actually offers before any of it is wired in.
+    const sampleAppointment = appts.length > 0 ? rec(appts[0]) : null;
+    const distinctTypeValues: Record<string, Record<string, number>> = {};
+    for (const candidate of ["type", "appointmentType", "serviceType", "serviceID", "category", "isInitial", "reservice"]) {
+      const counts: Record<string, number> = {};
+      let seen = false;
+      for (const a of appts) {
+        const value = rec(a)[candidate];
+        if (value === undefined) continue;
+        seen = true;
+        const k = str(value) || "(empty)";
+        counts[k] = (counts[k] || 0) + 1;
+      }
+      if (seen) distinctTypeValues[candidate] = counts;
+    }
+
     return NextResponse.json({
       success: true,
       date,
       apptCount: appts.length,
+      appointmentKeys: sampleAppointment ? Object.keys(sampleAppointment).sort() : [],
+      distinctTypeValues,
+      sampleAppointment,
       summary: {
         withAppointmentTech: apptAssignedCount,
         withRouteTech: routeAssignedCount,
