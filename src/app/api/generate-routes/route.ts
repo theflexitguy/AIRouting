@@ -9,6 +9,7 @@ import {
   computeRouteGeometry,
   computeRouteMatrix,
   hasGoogleRoutesApiKey,
+  googleApisPaused,
   type MatrixSource,
   type RouteOptimizationShadowResult,
 } from "@/lib/google-routing";
@@ -1844,6 +1845,22 @@ async function buildFastFallbackRoutes({
 }
 
 export async function POST(request: NextRequest) {
+  // Route generation is the most expensive thing the app does: a Route
+  // Optimization solve (billed per stop) plus a drive-time matrix per route.
+  // While paused, refuse before touching anything rather than silently
+  // producing straight-line routes that look real.
+  if (googleApisPaused()) {
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          "Route generation is paused to stop Google API charges (GOOGLE_APIS_PAUSED). " +
+          "The dashboard and job sync are unaffected. Remove the variable in Vercel and redeploy to resume.",
+        paused: true,
+      },
+      { status: 503 },
+    );
+  }
   let lockRef: FirebaseFirestore.DocumentReference | null = null;
   let lockAcquired = false;
   try {

@@ -4,7 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
-import { computeRouteMatrix, hasGoogleRoutesApiKey } from "@/lib/google-routing";
+import { computeRouteMatrix, hasGoogleRoutesApiKey, googleApisPaused } from "@/lib/google-routing";
 import { optimizeTours, routeOptimizationConfig } from "@/lib/google-route-optimization";
 
 // Live health check for the two Google services routing depends on. These are
@@ -116,7 +116,23 @@ export async function GET(request: NextRequest) {
     lastRoutes = { error: error instanceof Error ? error.message : String(error) };
   }
 
+  // A pause is a deliberate state, not a fault — say so plainly so a paused
+  // system is never mistaken for a broken one.
+  const paused = googleApisPaused();
   const healthy = matrixProbe.ok === true && optimizationProbe.ok === true;
+  if (paused) {
+    return NextResponse.json({
+      healthy: false,
+      paused: true,
+      summary:
+        "Google APIs are PAUSED (GOOGLE_APIS_PAUSED). No billable calls are being made: drive times and " +
+        "polylines fall back to straight-line estimates, geocoding is off, and route generation is refused. " +
+        "The FieldRoutes sync and the dashboard are unaffected. Remove the variable in Vercel and redeploy to resume.",
+      routesApi: matrixProbe,
+      routeOptimization: optimizationProbe,
+      recentRoutes: lastRoutes,
+    });
+  }
   return NextResponse.json({
     healthy,
     summary: healthy

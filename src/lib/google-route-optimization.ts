@@ -12,7 +12,7 @@
 
 import { GoogleAuth } from "google-auth-library";
 import { serviceAccountCredentials } from "@/lib/firebase-admin";
-import { departureTimeForRouteDate } from "@/lib/google-routing";
+import { departureTimeForRouteDate, googleApisPaused } from "@/lib/google-routing";
 
 const SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const ENDPOINT = "https://routeoptimization.googleapis.com/v1";
@@ -232,6 +232,13 @@ export async function optimizeTours({
   maxDriveMinutes: number;
   timeoutSeconds?: number;
 }): Promise<OptimizationPlan> {
+  // Route Optimization bills per shipment per solve — the most expensive call
+  // in the app, so the pause is checked before anything else.
+  if (googleApisPaused()) {
+    return emptyPlan("disabled", [
+      "Route Optimization is paused (GOOGLE_APIS_PAUSED). No solve was requested, so nothing was billed.",
+    ]);
+  }
   const credential = resolveCredential();
   if (!credential || !credential.projectId) {
     return emptyPlan("disabled", [
