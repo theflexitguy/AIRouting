@@ -4,7 +4,8 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
-import { computeRouteGeometry, type RoutePoint } from "@/lib/google-routing";
+import { computeRouteGeometry, googleApisPaused, type RoutePoint } from "@/lib/google-routing";
+import { driveTimeSourceKind } from "@/lib/routing/drive-time-honesty";
 
 type RouteGeometryRequest = {
   companyId?: string;
@@ -67,16 +68,22 @@ export async function POST(request: NextRequest) {
       trafficMode: body.trafficMode,
     });
 
+    const paused = googleApisPaused();
+    const estimate = driveTimeSourceKind(result.driveTimeSource) === "estimate";
     return NextResponse.json({
       success: true,
-      encodedPolyline: result.encodedPolyline,
-      path: result.path,
+      encodedPolyline: estimate ? undefined : result.encodedPolyline,
+      // Never return a path that could be mistaken for snapped roads when the
+      // source is an estimate — callers draw a dashed stop-to-stop line instead.
+      path: estimate ? [] : result.path,
       driveMinutes: Math.round(result.driveMinutes * 10) / 10,
-      distanceMeters: result.distanceMeters,
-      status: result.status,
+      distanceMeters: estimate ? undefined : result.distanceMeters,
+      status: paused ? "GOOGLE_APIS_PAUSED" : result.status,
       failedSegments: result.failedSegments,
       driveTimeSource: result.driveTimeSource,
       polylineSource: result.polylineSource,
+      estimate,
+      paused,
       warnings: result.warnings,
     });
   } catch (error) {

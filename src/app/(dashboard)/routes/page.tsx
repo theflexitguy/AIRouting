@@ -19,7 +19,28 @@ import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover
 import { format, addDays } from "date-fns";
 import { toast } from "sonner";
 import { ConstraintBadges } from "@/components/routes/ConstraintBadges";
+import {
+  DriveTimeHonestyBanner,
+  DriveTimeSourceBadge,
+  ExceptionFirstCopy,
+  PausedGenerateEmptyState,
+  RoutingStatusPanel,
+  SensaiGenerateHints,
+  SlinkyWeekWarning,
+  type RoutingStatusSummary,
+} from "@/components/routes/DriveTimeHonesty";
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
+import {
+  SENSAI_DEFAULT_MAX_STOPS,
+  SENSAI_MAX_DRIVE_MINUTES,
+  chicagoTodayIso,
+  driveTimeSourceBadgeHtml,
+  driveTimeSourceBadgeLabel,
+  driveTimeSourceKind,
+  horizonGuidance,
+  isoWeekKey,
+  slinkyWeekWarning,
+} from "@/lib/routing/drive-time-honesty";
 import { canonicalRouteGroup } from "@/lib/route-groups";
 import { deriveServiceLine } from "@/lib/routing/service-line";
 import { TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
@@ -89,6 +110,40 @@ interface RoadRouteResult {
 }
 
 const roadRouteCache = new Map<string, Promise<RoadRouteResult>>();
+
+function styleRoutePolyline(
+  polyline: google.maps.Polyline,
+  color: string,
+  mode: "road" | "estimate",
+) {
+  if (mode === "road") {
+    polyline.setOptions({
+      strokeColor: color,
+      strokeOpacity: 0.95,
+      strokeWeight: 4,
+      icons: [],
+    });
+    return;
+  }
+  // Dashed stop-to-stop: never looks like a snapped road.
+  polyline.setOptions({
+    strokeColor: color,
+    strokeOpacity: 0,
+    strokeWeight: 4,
+    icons: [
+      {
+        icon: {
+          path: "M 0,-1 0,1",
+          strokeOpacity: 0.9,
+          strokeColor: color,
+          scale: 3,
+        },
+        offset: "0",
+        repeat: "16px",
+      },
+    ],
+  });
+}
 
 function routeDropId(routeId: string) {
   return `${ROUTE_DROP_PREFIX}${routeId}`;
@@ -592,7 +647,8 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roa
   const estimated = estimateRouteMetrics(route.stopSequence, jobsById);
   // Prefer a freshly-fetched real Google road drive time when available (synced
   // routes otherwise carry only a straight-line haversine estimate). Fall back to
-  // the stored value, then to the estimate.
+  // the stored value, then to the estimate. Never treat an upgrade as road time
+  // unless the caller passed a trusted Routes API minute count.
   const driveMinutes = Number.isFinite(roadDriveMinutes)
     ? Math.round(Number(roadDriveMinutes))
     : Number.isFinite(Number(route.totalDriveTimeMinutes))
@@ -603,6 +659,9 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roa
   // totalWorkMinutes: on a mixed/merged route it was computed over a subset of
   // stops, which produced the impossible "DAY < SERVICE" the dispatcher saw.
   const workMinutes = driveMinutes + serviceMinutes;
+  const driveTimeSource = Number.isFinite(roadDriveMinutes)
+    ? "routes_api_polyline"
+    : route.driveTimeSource || estimated.driveTimeSource || "haversine_fallback";
 
   return {
     stops: route.stopSequence.length,
@@ -610,6 +669,7 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roa
     serviceMinutes,
     workMinutes,
     productionValue: getRouteProductionValue(route.stopSequence, jobsById),
+    driveTimeSource,
   };
 }
 
@@ -685,7 +745,7 @@ function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>, roadDriveM
     <div style="font-weight:700;margin-bottom:2px">${escapeHtml(tr.tech.name)}</div>
     <div style="color:#666;font-size:12px;margin-bottom:8px">${escapeHtml(tr.route.date)} · ${stats.stops} stops</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">
-      <div><div style="color:#777">Drive</div><div style="font-weight:700">${formatTime(stats.driveMinutes)}</div></div>
+      <div><div style="color:#777">Drive ${driveTimeSourceBadgeHtml(stats.driveTimeSource)}</div><div style="font-weight:700">${formatTime(stats.driveMinutes)}</div></div>
       <div><div style="color:#777">At stops</div><div style="font-weight:700">${formatTime(stats.serviceMinutes)}</div></div>
       <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(stats.productionValue)}</div></div>
       <div style="grid-column:1 / -1;border-top:1px solid #e5e7eb;padding-top:7px">
@@ -734,7 +794,9 @@ function RoutePanelStats({ route, jobsById, roadDriveMinutes }: {
   return (
     <div className="grid grid-cols-2 gap-1.5 p-2 border-b border-border/40 bg-accent/10">
       <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
-        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Drive</p>
+        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50 flex items-center gap-1">
+          Drive <DriveTimeSourceBadge source={stats.driveTimeSource} />
+        </p>
         <p className="text-xs font-semibold text-foreground">{formatTime(stats.driveMinutes)}</p>
       </div>
       <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
@@ -742,7 +804,12 @@ function RoutePanelStats({ route, jobsById, roadDriveMinutes }: {
         <p className="text-xs font-semibold text-foreground">{formatTime(stats.serviceMinutes)}</p>
       </div>
       <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
-        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50">Day</p>
+        <p className="text-[9px] uppercase tracking-wide text-muted-foreground/50 flex items-center gap-1">
+          Day
+          {driveTimeSourceKind(stats.driveTimeSource) === "estimate" && (
+            <DriveTimeSourceBadge source={stats.driveTimeSource} />
+          )}
+        </p>
         <p className="text-xs font-semibold text-foreground">{formatTime(stats.workMinutes)}</p>
       </div>
       <div className="rounded-md border border-border/40 bg-background/70 px-2 py-1.5">
@@ -912,20 +979,28 @@ export default function RoutesPage() {
   const [startDate, setStartDate] = useState(format(new Date(), "yyyy-MM-dd"));
   // Default the Route Builder to today only; widen the range manually as needed.
   const [endDate, setEndDate] = useState(format(new Date(), "yyyy-MM-dd"));
-  const [maxStops, setMaxStops] = useState<number>(16);
-  const [maxDriveTime, setMaxDriveTime] = useState<number>(240);
+  const [maxStops, setMaxStops] = useState<number>(SENSAI_DEFAULT_MAX_STOPS);
+  const [maxDriveTime, setMaxDriveTime] = useState<number>(SENSAI_MAX_DRIVE_MINUTES);
+  const [routingStatus, setRoutingStatus] = useState<RoutingStatusSummary | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
-      const raw = localStorage.getItem("routeiq.generateSettings.v1");
+      const raw =
+        localStorage.getItem("routeiq.generateSettings.v2") ||
+        localStorage.getItem("routeiq.generateSettings.v1");
       if (!raw) return;
       const parsed = JSON.parse(raw) as { maxStops?: number; targetStops?: number; maxDriveTime?: number };
       const targetStops = typeof parsed.targetStops === "number" ? parsed.targetStops : parsed.maxStops;
       if (typeof targetStops === "number" && targetStops > 0) {
         setMaxStops(targetStops);
       }
-      if (typeof parsed.maxDriveTime === "number" && parsed.maxDriveTime > 0) {
+      // v1 defaulted to 240; treat that as unset so SensAI's 60 min cap applies.
+      if (
+        typeof parsed.maxDriveTime === "number" &&
+        parsed.maxDriveTime > 0 &&
+        parsed.maxDriveTime !== 240
+      ) {
         setMaxDriveTime(parsed.maxDriveTime);
       }
     } catch {
@@ -936,7 +1011,7 @@ export default function RoutesPage() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     localStorage.setItem(
-      "routeiq.generateSettings.v1",
+      "routeiq.generateSettings.v2",
       JSON.stringify({ targetStops: maxStops, maxStops, maxDriveTime }),
     );
   }, [maxStops, maxDriveTime]);
@@ -1026,6 +1101,23 @@ export default function RoutesPage() {
   );
 
   const { pushEdit, undo, redo, canUndo, canRedo } = useEditHistory();
+
+  useEffect(() => {
+    let cancelled = false;
+    const companyId = userProfile?.companyId || "";
+    fetch(`/api/admin/routing-status?summary=1${companyId ? `&companyId=${encodeURIComponent(companyId)}` : ""}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled || !data || typeof data !== "object") return;
+        setRoutingStatus(data as RoutingStatusSummary);
+      })
+      .catch(() => {
+        if (!cancelled) setRoutingStatus({ paused: false, summary: "Could not load routing status." });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userProfile?.companyId]);
 
   const actualRoutedJobIds = useMemo(() => {
     const ids = new Set<string>();
@@ -1195,10 +1287,34 @@ export default function RoutesPage() {
   // fetch the map polylines use), so this adds no extra API calls; it just
   // surfaces the real drive into the DRIVE/DAY stats. Uses the route's CURRENT
   // stop order (re-sequencing to reduce drive is a separate, approval-gated step).
+  const routingPaused = routingStatus?.paused === true;
+  const generateHorizon = useMemo(
+    () => horizonGuidance(startDate, chicagoTodayIso()),
+    [startDate],
+  );
+  const slinkyMessage = useMemo(() => {
+    const stopsByWeek: Record<string, number> = {};
+    for (const tr of visibleRoutes) {
+      const week = isoWeekKey(tr.route.date);
+      if (!week) continue;
+      stopsByWeek[week] = (stopsByWeek[week] || 0) + (tr.route.stopSequence?.length || 0);
+    }
+    return slinkyWeekWarning(stopsByWeek);
+  }, [visibleRoutes]);
+  const estimateRouteCount = useMemo(() => {
+    return visibleRoutes.filter((tr) => {
+      if (Number.isFinite(roadDriveByRouteId[tr.route.id])) return false;
+      return driveTimeSourceKind(tr.route.driveTimeSource) !== "road";
+    }).length;
+  }, [roadDriveByRouteId, visibleRoutes]);
+
   useEffect(() => {
     let cancelled = false;
+    // While paused, never request geometry — even the fallback path must not
+    // look like a live road snap.
+    if (routingPaused) return;
     for (const tr of visibleRoutes) {
-      if (tr.route.driveTimeSource === "routes_api_polyline") continue; // stored value already real
+      if (driveTimeSourceKind(tr.route.driveTimeSource) === "road") continue;
       const jobs = getOrderedJobsWithCoordinates(tr.route.stopSequence, allJobs);
       if (!jobs || jobs.length < 2) continue;
       const routeId = tr.route.id;
@@ -1211,7 +1327,7 @@ export default function RoutesPage() {
     }
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visibleRoutes, allJobs]);
+  }, [visibleRoutes, allJobs, routingPaused]);
 
   // Unassigned FieldRoutes routes within the selected dates, for the toggle badge.
   const unassignedRouteCount = displayRoutes.filter(
@@ -1324,9 +1440,11 @@ export default function RoutesPage() {
       return;
     }
     setSelectedDates((prev) => {
+      // Empty means "all dates" (same as the tech filter). Do not snap Clear back to all.
       const stillVisible = prev.filter((date) => dates.includes(date));
-      const next = stillVisible.length > 0 ? stillVisible : dates;
-      return next.length === prev.length && next.every((date, idx) => date === prev[idx]) ? prev : next;
+      return stillVisible.length === prev.length && stillVisible.every((date, idx) => date === prev[idx])
+        ? prev
+        : stillVisible;
     });
   }, [routeDateKey]);
 
@@ -2078,7 +2196,9 @@ export default function RoutesPage() {
       const dates = [...new Set(routes.map((r) => r.route.date))].sort();
       setSelectedDates(prev => {
         const stillVisible = prev.filter((date) => dates.includes(date));
-        return stillVisible.length > 0 ? stillVisible : dates;
+        return stillVisible.length === prev.length && stillVisible.every((d, i) => d === prev[i])
+          ? prev
+          : stillVisible;
       });
     }, () => {
       setAllRoutes([]);
@@ -2096,7 +2216,7 @@ export default function RoutesPage() {
   // ref) so an unresolvable address can never loop.
   useEffect(() => {
     const companyId = userProfile?.companyId;
-    if (!companyId || autoGeocodeInFlightRef.current) return;
+    if (!companyId || autoGeocodeInFlightRef.current || routingPaused) return;
 
     const needIds = new Set<string>();
     const consider = (job?: Job) => {
@@ -2131,7 +2251,7 @@ export default function RoutesPage() {
         autoGeocodeInFlightRef.current = false;
       }
     })();
-  }, [userProfile, displayRoutes, hiddenScheduledStops, allJobs, loadJobsForRange]);
+  }, [userProfile, displayRoutes, hiddenScheduledStops, allJobs, loadJobsForRange, routingPaused]);
 
   useEffect(() => {
     if (!userProfile?.companyId || !showJobPoolLayer) return;
@@ -2152,9 +2272,9 @@ export default function RoutesPage() {
 
     // Use the recommended async loading to avoid console warnings and key exposure
     const callback = `__gmapsInit_${Date.now()}`;
-    (window as Record<string, unknown>)[callback] = () => {
+    (window as unknown as Record<string, unknown>)[callback] = () => {
       setMapLoaded(true);
-      delete (window as Record<string, unknown>)[callback];
+      delete (window as unknown as Record<string, unknown>)[callback];
     };
     const script = document.createElement("script");
     script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=geometry&loading=async&callback=${callback}`;
@@ -2348,7 +2468,7 @@ export default function RoutesPage() {
             <div><div style="color:#777">Last serviced</div><div style="font-weight:700">${escapeHtml(lastServiced || "-")}</div></div>
             <div><div style="color:#777">Stop value</div><div style="font-weight:700">${formatCurrency(stopProduction.value)}</div></div>
             <div><div style="color:#777">Route value</div><div style="font-weight:700">${formatCurrency(routeStats.productionValue)}</div></div>
-            <div><div style="color:#777">Route drive</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>
+            <div><div style="color:#777">Route drive ${driveTimeSourceBadgeHtml(routeStats.driveTimeSource)}</div><div style="font-weight:700">${formatTime(routeStats.driveMinutes)}</div></div>
             <div><div style="color:#777">Full day</div><div style="font-weight:700">${formatTime(routeStats.workMinutes)}</div></div>
           </div>
           <div style="color:${color};font-weight:700;font-size:12px;margin-top:8px">${escapeHtml(tr.tech.name)} · ${escapeHtml(tr.route.date)}</div>
@@ -2440,16 +2560,18 @@ export default function RoutesPage() {
       });
 
       if (path.length > 1) {
+        const estimateHtml = routeStatsHtml(tr, allJobs, roadDriveByRouteId[tr.route.id]);
         const polyline = new window.google.maps.Polyline({
-          path: [],
+          path,
           geodesic: false,
           strokeColor: color,
-          strokeOpacity: 0.95,
+          strokeOpacity: 0,
           strokeWeight: 4,
           map,
         });
+        styleRoutePolyline(polyline, color, "estimate");
         const routeInfoWindow = new window.google.maps.InfoWindow({
-          content: routeStatsHtml(tr, allJobs, roadDriveByRouteId[tr.route.id]),
+          content: `${estimateHtml}<div style="color:#b45309;font-size:11px;font-weight:700;margin-top:6px">ESTIMATE — straight-line, not snapped roads</div>`,
           disableAutoPan: true,
         });
         polyline.addListener("click", (event: google.maps.MapMouseEvent) => {
@@ -2475,9 +2597,20 @@ export default function RoutesPage() {
             )
           : [];
 
-        if (tr.route.polylineSource === "routes_api_polyline" && storedRoadPath.length > 1) {
-          polyline.setPath(storedRoadPath);
-        } else {
+        const promoteToRoad = (roadPath: Array<{ lat: number; lng: number }>) => {
+          if (cancelled || roadPath.length < 2) return;
+          styleRoutePolyline(polyline, color, "road");
+          polyline.setPath(roadPath);
+          routeInfoWindow.setContent(routeStatsHtml(tr, allJobs, roadDriveByRouteId[tr.route.id]));
+        };
+
+        if (
+          !routingPaused &&
+          driveTimeSourceKind(tr.route.polylineSource || tr.route.driveTimeSource) === "road" &&
+          storedRoadPath.length > 1
+        ) {
+          promoteToRoad(storedRoadPath);
+        } else if (!routingPaused) {
           const roadJobs = getOrderedJobsWithCoordinates(tr.route.stopSequence, allJobs);
           if (roadJobs) {
             void getRoadRouteForJobs(roadJobs, tr.route.date).then((roadRoute) => {
@@ -2487,22 +2620,19 @@ export default function RoutesPage() {
                 roadRoute.failedLegs > 0 ||
                 roadRoute.polylineSource !== "routes_api_polyline"
               ) {
-                polyline.setMap(null);
-                warnRoadSnapFailure(
-                  tr.route.id,
-                  `Could not snap ${tr.tech.name}'s ${tr.route.date} route to roads (${roadRoute.status}). ${describeDirectionsStatus(roadRoute.status)}`,
-                );
+                // Keep the dashed estimate line. Toast only when Google was
+                // expected to be live — paused is already a page banner.
+                if (roadRoute.status && roadRoute.status !== "GOOGLE_APIS_PAUSED" && roadRoute.status !== "MISSING_GOOGLE_MAPS_API_KEY") {
+                  warnRoadSnapFailure(
+                    tr.route.id,
+                    `Could not snap ${tr.tech.name}'s ${tr.route.date} route to roads (${roadRoute.status}). Showing ESTIMATE line. ${describeDirectionsStatus(roadRoute.status)}`,
+                  );
+                }
                 return;
               }
-              polyline.setPath(roadRoute.path);
+              promoteToRoad(roadRoute.path);
             });
           } else {
-            polyline.setMap(null);
-            // Stay silent while the missing stops can still self-heal (they have
-            // an address we haven't tried to geocode yet) — the auto-geocode
-            // effect backfills the coords and the path redraws on its own. Only
-            // warn for stops that are genuinely unresolvable (already attempted,
-            // or no address to geocode from), with an actionable message.
             const missing = (tr.route.stopSequence || [])
               .map((id) => allJobs[id])
               .filter(
@@ -2536,7 +2666,7 @@ export default function RoutesPage() {
     return () => {
       cancelled = true;
     };
-  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, roadDriveByRouteId, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
+  }, [allJobs, clickReorderRouteId, clickReorderSequence, editMode, findNearestRouteDropTarget, getJobsForRoute, handleAddPoolJobToRoute, handleClickOrderPick, handleMoveStop, handleRemoveStop, jobPoolJobs, roadDriveByRouteId, routingPaused, setHoveredStop, showJobPoolLayer, visibleRoutes, warnRoadSnapFailure]);
 
   // Job Pool markers — viewport-aware, NOT clustered. Re-renders on pan/zoom
   // (viewportTick) and draws ONLY the stops in the current map bounds as small,
@@ -2623,6 +2753,14 @@ export default function RoutesPage() {
 
   const generateRoutes = async (rebalanceScheduled = false) => {
     if (!userProfile?.companyId) return;
+    if (routingPaused) {
+      const msg =
+        routingStatus?.summary ||
+        "Route generation is paused (GOOGLE_APIS_PAUSED). Refusing rather than returning haversine routes that look real.";
+      setGenError(msg);
+      toast.error("Generate refused — Google APIs are paused.");
+      return;
+    }
     if (rebalanceScheduled) {
       const ok = window.confirm(
         `Optimize This Day re-proposes ${startDate}'s routes: scheduled stops keep their day but may move between the selected technicians, balanced to ${maxStops} stops and ${maxDriveTime} min drive per route. Nothing changes in FieldRoutes until you Approve.`,
@@ -2679,8 +2817,9 @@ export default function RoutesPage() {
         await loadJobsForRange(userProfile.companyId);
       } else {
         const errorText = String(data.error || "Route generation failed");
+        const pausedRefuse = data.paused === true || data.code === "GOOGLE_APIS_PAUSED";
         setGenError(`[${res.status}] ${errorText}`);
-        toast.error(errorText);
+        toast.error(pausedRefuse ? "Generate refused — Google APIs are paused." : errorText);
         setGenResult(null);
       }
     } catch (e) {
@@ -2783,6 +2922,10 @@ export default function RoutesPage() {
 
   const handleGeocodeHiddenStops = async () => {
     if (!userProfile?.companyId || hiddenScheduledStops.length === 0) return;
+    if (routingPaused) {
+      toast.error("Geocoding is paused with Google APIs.");
+      return;
+    }
     setGeocodingStops(true);
     try {
       const res = await fetch("/api/geocode-jobs", {
@@ -3059,7 +3202,7 @@ export default function RoutesPage() {
     w.document.write(`<html><head><title>Route - ${tr.tech.name} - ${tr.route.date}</title>
       <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a1a;padding:32px;max-width:800px;margin:0 auto}.header{border-bottom:2px solid #2563eb;padding-bottom:16px;margin-bottom:24px}.header h1{font-size:24px;font-weight:700;color:#2563eb}.meta{display:flex;gap:24px;margin-top:8px;color:#6b7280;font-size:14px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}.stat{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:12px}.stat .label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}.stat .value{font-size:20px;font-weight:700;margin-top:2px}.stop{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #e5e7eb}.stop:last-child{border-bottom:none}.stop-num{width:28px;height:28px;border-radius:50%;background:#2563eb;color:white;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}.stop-details{flex:1}.stop-name{font-weight:600;font-size:14px}.stop-address{color:#6b7280;font-size:13px;margin-top:2px}.stop-meta{color:#9ca3af;font-size:12px;margin-top:4px}.footer{margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px;text-align:center}</style></head><body>
       <div class="header"><h1>routiq</h1><div class="meta"><span><strong>Technician:</strong> ${tr.tech.name}</span><span><strong>Date:</strong> ${tr.route.date}</span><span><strong>Status:</strong> ${tr.route.approved ? "Approved" : "Pending"}</span></div></div>
-      <div class="stats"><div class="stat"><div class="label">Total Stops</div><div class="value">${stats.stops}</div></div><div class="stat"><div class="label">Drive Time</div><div class="value">${formatTime(stats.driveMinutes)}</div></div><div class="stat"><div class="label">Working Day</div><div class="value">${formatTime(stats.workMinutes)}</div></div><div class="stat"><div class="label">Route Value</div><div class="value">${formatCurrency(stats.productionValue)}</div></div></div>
+      <div class="stats"><div class="stat"><div class="label">Total Stops</div><div class="value">${stats.stops}</div></div><div class="stat"><div class="label">Drive Time (${driveTimeSourceBadgeLabel(stats.driveTimeSource)})</div><div class="value">${formatTime(stats.driveMinutes)}</div></div><div class="stat"><div class="label">Working Day</div><div class="value">${formatTime(stats.workMinutes)}</div></div><div class="stat"><div class="label">Route Value</div><div class="value">${formatCurrency(stats.productionValue)}</div></div></div>
       <h2 style="font-size:16px;font-weight:600;margin-bottom:8px">Stop Sequence</h2>
       ${jobs.map((job, i) => {
         const stopProduction = calculateStopProductionValue(job);
@@ -3131,21 +3274,22 @@ export default function RoutesPage() {
                 min={1}
                 max={30}
                 value={maxStops}
-                onChange={(e) => setMaxStops(Math.max(1, parseInt(e.target.value) || 16))}
+                onChange={(e) => setMaxStops(Math.max(1, parseInt(e.target.value) || SENSAI_DEFAULT_MAX_STOPS))}
                 className="h-9 w-16 text-sm"
-                title="Tuesday routes automatically target 3 fewer stops."
+                title="Office 101: 14–16 typical, Bella Vista ~12. Tuesday −3 stops (~9am start). Saturday half-day."
               />
             </label>
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
               Max drive (min)
               <Input
                 type="number"
-                min={30}
+                min={15}
                 max={600}
                 step={15}
                 value={maxDriveTime}
-                onChange={(e) => setMaxDriveTime(Math.max(30, parseInt(e.target.value) || 240))}
+                onChange={(e) => setMaxDriveTime(Math.max(15, parseInt(e.target.value) || SENSAI_MAX_DRIVE_MINUTES))}
                 className="h-9 w-20 text-sm"
+                title="Office 101: ~60 minutes TOTAL drive for the day."
               />
             </label>
           </div>
@@ -3211,7 +3355,12 @@ export default function RoutesPage() {
             </Button>
             <Button
               onClick={() => generateRoutes()}
-              disabled={generating || selectedTechIds.length === 0}
+              disabled={generating || selectedTechIds.length === 0 || routingPaused}
+              title={
+                routingPaused
+                  ? "Generate is refused while GOOGLE_APIS_PAUSED is set — no silent haversine success."
+                  : "Generate proposed routes from the selected techs and dates"
+              }
               className="bg-blue-500 hover:bg-blue-600 text-white h-9 text-sm"
             >
               {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
@@ -3219,9 +3368,11 @@ export default function RoutesPage() {
             </Button>
             <Button
               onClick={() => generateRoutes(true)}
-              disabled={generating || selectedTechIds.length === 0 || startDate !== endDate}
+              disabled={generating || selectedTechIds.length === 0 || startDate !== endDate || routingPaused}
               title={
-                startDate !== endDate
+                routingPaused
+                  ? "Optimize is refused while GOOGLE_APIS_PAUSED is set."
+                  : startDate !== endDate
                   ? "Pick a single day to optimize (scheduled stops keep their date)"
                   : "Re-propose this day's routes: scheduled stops may move between the selected technicians, balanced to your stop/drive targets. Approval required before anything reaches FieldRoutes."
               }
@@ -3230,6 +3381,13 @@ export default function RoutesPage() {
               {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
               Optimize Day
             </Button>
+          </div>
+        </div>
+        <div className="px-3 lg:px-4 py-1.5 border-b border-border/40 bg-background/80 flex flex-wrap items-start gap-x-4 gap-y-1 no-print">
+          <RoutingStatusPanel status={routingStatus} />
+          <div className="space-y-0.5 min-w-[220px] flex-1">
+            <ExceptionFirstCopy />
+            <SensaiGenerateHints horizon={generateHorizon} />
           </div>
         </div>
 
@@ -3323,6 +3481,13 @@ export default function RoutesPage() {
           </div>
         )}
 
+        <DriveTimeHonestyBanner
+          status={routingStatus}
+          estimateRouteCount={estimateRouteCount}
+          totalRouteCount={visibleRoutes.length}
+        />
+        <SlinkyWeekWarning message={slinkyMessage} />
+
         {genError && (
           <div className="px-4 py-3 border-b border-red-500/20 bg-red-500/8 flex items-center gap-3 no-print animate-scale-in">
             <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
@@ -3353,7 +3518,7 @@ export default function RoutesPage() {
                 options={routeDates.map((d) => ({
                   id: d,
                   label: d,
-                  hint: String(allRoutes.filter((r) => r.route.date === d).length),
+                  hint: String(displayRoutes.filter((r) => r.route.date === d).length),
                 }))}
                 selectedIds={selectedDates}
                 onChange={setSelectedDates}
@@ -3374,7 +3539,8 @@ export default function RoutesPage() {
                     size="sm"
                     className="h-6 text-[10px] px-2 bg-amber-500/20 text-amber-200 border border-amber-500/30 hover:bg-amber-500/30"
                     onClick={handleGeocodeHiddenStops}
-                    disabled={geocodingStops}
+                    disabled={geocodingStops || routingPaused}
+                    title={routingPaused ? "Geocoding is paused with Google APIs." : "Geocode hidden stops"}
                   >
                     {geocodingStops ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
                     Fix coordinates
@@ -3576,6 +3742,16 @@ export default function RoutesPage() {
               </div>
             ) : (
               <div id="route-map" className="absolute inset-0" />
+            )}
+            {routingPaused && !generating && visibleRoutes.length === 0 && !mapError && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/50 backdrop-blur-[1px] p-4">
+                <PausedGenerateEmptyState />
+              </div>
+            )}
+            {routingPaused && !generating && visibleRoutes.length > 0 && (
+              <div className="absolute top-3 left-3 z-10 rounded-md border border-amber-500/40 bg-amber-950/80 px-2 py-1 text-[10px] font-semibold text-amber-100 pointer-events-none">
+                Dashed lines = ESTIMATE (not snapped roads)
+              </div>
             )}
           </div>
 
