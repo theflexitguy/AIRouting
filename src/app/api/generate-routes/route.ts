@@ -4,7 +4,6 @@ export const maxDuration = 300;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
-import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
 import {
   computeRouteGeometry,
   computeRouteMatrix,
@@ -21,15 +20,29 @@ import {
 } from "@/lib/google-route-optimization";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { calculateStopProductionValue } from "@/lib/production-value";
-import { deriveServiceLine, type ServiceLine } from "@/lib/routing/service-line";
 import {
   SENSAI_TUESDAY_STOP_REDUCTION,
-  SHARED_GENERATE_ROUTE_CLASS,
+  chicagoTodayIso,
   clampGenerateMaxDriveMinutes,
   clampGenerateMaxStops,
-  generateRouteClass,
   sensaiMaxStopsForDate,
+  validateGenerateHorizon,
 } from "@/lib/routing/drive-time-honesty";
+import {
+  SHARED_ROUTE_CLASS,
+  canScheduleJobOnDate,
+  compareJobsForGenerate,
+  fillDaysByRouteClass,
+  jobAssignedToTech,
+  jobHasExplicitAssignment,
+  jobScheduleBlockReason,
+  jobServiceLine,
+  placeJobOnTech,
+  routeClassOf,
+  techHasRequiredSkills,
+  techIsPreferredForJob,
+  type GenerateException,
+} from "@/lib/routing/generate-selection";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -38,7 +51,6 @@ const BACKEND_URL =
 // the total estimated duration at or under 8 hours every day is a must).
 const DEFAULT_MAX_DAY_MINUTES = 480;
 const JOB_CAP = 500;
-const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
 const TUESDAY_STOP_REDUCTION = SENSAI_TUESDAY_STOP_REDUCTION;
 const DRIVE_CAP_SLACK_MINUTES = 3;
@@ -69,100 +81,8 @@ function daysBetweenDates(a: string, b: string) {
   return Math.round((aTime - bTime) / 86400000);
 }
 
-function normalizeName(s: string) {
-  return s
-    .toLowerCase()
-    .replace(/['"]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function techMatchTokens(tech: Record<string, unknown> & { id: string }) {
-  return [
-    String(tech.id || "").trim(),
-    String(tech.name || "").trim(),
-    String(tech.employeeId || "").trim(),
-    String(tech.fieldRoutesEmployeeId || "").trim(),
-    String(tech.fieldRoutesTechId || "").trim(),
-  ].filter(Boolean);
-}
-
-function jobAssignedToTech(
-  job: JobDoc,
-  tech: Record<string, unknown> & { id: string },
-) {
-  const assignedValues = [
-    job.assignedTechId,
-    job.fieldRoutesServicedBy,
-    job.fieldRoutesServicedById,
-  ]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean);
-  if (assignedValues.length === 0) return true;
-
-  const tokens = techMatchTokens(tech);
-  return assignedValues.some((assigned) => {
-    const assignedNormalized = normalizeName(assigned);
-    return tokens.some((token) => {
-      return token === assigned || normalizeName(token) === assignedNormalized;
-    });
-  });
-}
-
 function routeSlotKey(date: string, techId: string) {
   return `${date}::${techId}`;
-}
-
-// ── Phase 2: skills + service-line + preferred-tech enforcement ───────────────
-
-/** Lower-cased set of the FieldRoutes skills assigned to a technician. */
-function techSkillSet(tech: Record<string, unknown> & { id: string }): Set<string> {
-  const raw = Array.isArray(tech.skillNames) ? (tech.skillNames as unknown[]) : [];
-  return new Set(raw.map((s) => String(s).trim().toLowerCase()).filter(Boolean));
-}
-
-/** Skills this job's service type requires (stamped by sync from the FieldRoutes skill catalog). */
-function jobRequiredSkills(job: JobDoc): string[] {
-  const raw = Array.isArray(job.requiredSkills) ? (job.requiredSkills as unknown[]) : [];
-  return raw.map((s) => String(s).trim()).filter(Boolean);
-}
-
-/** Does the tech carry every skill this job's service type requires? */
-function techHasRequiredSkills(
-  tech: Record<string, unknown> & { id: string },
-  job: JobDoc,
-): boolean {
-  const required = jobRequiredSkills(job);
-  if (required.length === 0) return true;
-  const skills = techSkillSet(tech);
-  return required.every((skill) => skills.has(skill.toLowerCase()));
-}
-
-/** The job's service line (stamped by sync; derived from serviceType as a fallback). */
-const VALID_SERVICE_LINES = new Set(["general", "gr", "termite", "lawn", "mosquito", "commercial", "wildlife"]);
-function jobServiceLine(job: JobDoc): ServiceLine {
-  const stored = String(job.serviceLine || "").trim().toLowerCase();
-  if (VALID_SERVICE_LINES.has(stored)) return stored as ServiceLine;
-  return deriveServiceLine(job.serviceType);
-}
-
-/**
- * Service-line segregation (Office 101 + Routing v2): specialty
- * (termite / GR / bed bugs / commercial / wildlife / lawn) stays off GPC
- * routes and off each other. Shared class is general pest + mosquito only.
- */
-const SHARED_ROUTE_CLASS = SHARED_GENERATE_ROUTE_CLASS;
-
-/**
- * The class of route a job can live on. Own-route / specialty classes never
- * share; general + mosquito pool into SHARED. Two jobs can ride the same route
- * if and only if their classes are compatible.
- */
-function routeClassOf(job: JobDoc): string {
-  return generateRouteClass({
-    serviceType: String(job.serviceType || ""),
-    serviceLine: jobServiceLine(job),
-  });
 }
 
 function unitCompatibleWithSlotJobs(unitJobsArr: JobDoc[], slotJobs: JobDoc[]): boolean {
@@ -173,34 +93,11 @@ function unitCompatibleWithSlotJobs(unitJobsArr: JobDoc[], slotJobs: JobDoc[]): 
   return Array.from(classes).every((cls) => cls === SHARED_ROUTE_CLASS);
 }
 
-/** Does this tech match the job's preferred technician (a name resolved during sync)? */
-function techIsPreferredForJob(
-  job: JobDoc,
-  tech: Record<string, unknown> & { id: string },
-): boolean {
-  const preferred = String(job.preferredTech || "").trim();
-  if (!preferred) return false;
-  const normalizedPreferred = normalizeName(preferred);
-  return techMatchTokens(tech).some(
-    (token) => token === preferred || normalizeName(token) === normalizedPreferred,
-  );
-}
-
-function jobHasExplicitAssignment(job: JobDoc) {
-  return [job.assignedTechId, job.fieldRoutesServicedBy, job.fieldRoutesServicedById]
-    .some((value) => String(value || "").trim().length > 0);
-}
-
 // Every job must belong to exactly ONE technician. Without this, unassigned
 // jobs (which match every tech) get routed once per tech — duplicate stops.
-// Order of precedence: pinned route slot > explicit assignment > preferred
-// technician (Flex rule: start with the customer's preferred tech) > nearest
-// qualified tech with a load penalty so unassigned work spreads evenly.
-// Technicians must carry every skill the job's service type requires; jobs no
-// selected tech is qualified for are returned as skillBlocked (deferred), never
-// silently assigned to an unqualified tech.
-const PREFERRED_TECH_BONUS_MINUTES = 45;
-
+// Order of precedence: pinned route slot > preferred/assigned tech (Office 101:
+// start with the customer's preferred tech; spill only when skills or capacity
+// block) > nearest skilled tech. Never place on a tech missing required skills.
 function partitionJobsAmongTechs(
   jobs: JobDoc[],
   techs: Array<Record<string, unknown> & { id: string }>,
@@ -211,6 +108,7 @@ function partitionJobsAmongTechs(
   techs.forEach((tech) => byTech.set(tech.id, []));
   const unassigned: JobDoc[] = [];
   const skillBlocked: Array<{ job: JobDoc; reason: string }> = [];
+  const exceptions: GenerateException[] = [];
   const seen = new Set<string>();
 
   for (const job of jobs) {
@@ -222,73 +120,54 @@ function partitionJobsAmongTechs(
       const pinnedTechId = pinnedSlot.split("::")[1] || "";
       const bucket = byTech.get(pinnedTechId);
       if (bucket) {
+        const pinnedTech = techs.find((candidate) => candidate.id === pinnedTechId);
+        if (pinnedTech && !techHasRequiredSkills(pinnedTech, job)) {
+          exceptions.push({
+            kind: "skill_blocked",
+            jobId: job.docId,
+            customerName: String(job.customerName || job.docId),
+            reason: `pinned to ${String(pinnedTech.name || pinnedTech.id)} who is missing required skill(s) — left on the FieldRoutes slot for human review`,
+            requiredSkills: Array.isArray(job.requiredSkills)
+              ? (job.requiredSkills as unknown[]).map((s) => String(s).trim()).filter(Boolean)
+              : [],
+          });
+        }
         bucket.push(job);
         continue;
       }
     }
-    // Explicit assignments (FieldRoutes / dispatcher) are honored as committed
-    // decisions even when the skill matrix disagrees — mirroring FieldRoutes,
-    // which warns on a mismatch but lets the office schedule anyway. In
-    // rebalance mode (softAssignments) the current assignment is a PREFERENCE,
-    // not a commitment — the whole point is letting stops move between techs.
-    if (!opts.softAssignments && jobHasExplicitAssignment(job)) {
-      const tech = techs.find((candidate) => jobAssignedToTech(job, candidate));
-      if (tech) byTech.get(tech.id)!.push(job);
-      continue;
-    }
     unassigned.push(job);
   }
 
-  // Hard per-tech stop budget (route stop target × days). Without it a dense
-  // area snowballs onto one tech: nearest-stop scoring keeps piling stops onto
-  // whoever is already working the cluster, the per-slot limit then rejects the
-  // overflow, and the rebalance guardrail dumps it all back on the original
-  // tech — the exact 43-stop/22-hour route this guards against. A tech at
-  // capacity stops receiving while any qualified tech has room; if every
-  // qualified tech is full, least-loaded takes it (over-cap surfaces as a
-  // route warning rather than a dropped stop).
   const perTechCapacity =
     Number.isFinite(opts.perTechCapacity) && (opts.perTechCapacity as number) > 0
       ? Math.floor(opts.perTechCapacity as number)
       : Number.POSITIVE_INFINITY;
 
   for (const job of unassigned) {
-    const qualified = techs.filter((tech) => techHasRequiredSkills(tech, job));
-    if (qualified.length === 0) {
-      skillBlocked.push({
-        job,
-        reason: `requires skill(s) ${jobRequiredSkills(job).join(", ")} — no selected technician has them`,
-      });
+    const loadByTechId = new Map<string, number>();
+    techs.forEach((tech) => loadByTechId.set(tech.id, (byTech.get(tech.id) || []).length));
+    const placed = placeJobOnTech({
+      job,
+      techs,
+      loadByTechId,
+      perTechCapacity,
+      nearestDriveMinutes: (techId) => {
+        const current = byTech.get(techId) || [];
+        if (current.length === 0) return 0;
+        return Math.min(...current.map((existing) => estimateDriveMinutes(job, existing)));
+      },
+    });
+    if (placed.kind === "skill_blocked") {
+      skillBlocked.push({ job, reason: placed.exception.reason });
+      exceptions.push(placed.exception);
       continue;
     }
-    const withRoom = qualified.filter(
-      (tech) => (byTech.get(tech.id) || []).length < perTechCapacity,
-    );
-    const candidates = withRoom.length > 0 ? withRoom : qualified;
-    let bestTechId = candidates[0]?.id || "";
-    let bestScore = Number.POSITIVE_INFINITY;
-    for (const tech of candidates) {
-      const current = byTech.get(tech.id) || [];
-      const nearestMinutes = current.length
-        ? Math.min(...current.map((existing) => estimateDriveMinutes(job, existing)))
-        : 0;
-      let score = nearestMinutes + current.length * 4;
-      // Preferred technician wins unless they are far away or heavily loaded.
-      if (techIsPreferredForJob(job, tech)) score -= PREFERRED_TECH_BONUS_MINUTES;
-      // Rebalance: the tech who already has the stop keeps a home-field bonus,
-      // so stops only move when the move genuinely improves the day.
-      if (opts.softAssignments && jobHasExplicitAssignment(job) && jobAssignedToTech(job, tech)) {
-        score -= PREFERRED_TECH_BONUS_MINUTES;
-      }
-      if (score < bestScore) {
-        bestScore = score;
-        bestTechId = tech.id;
-      }
-    }
-    byTech.get(bestTechId)?.push(job);
+    byTech.get(placed.techId)?.push(job);
+    if (placed.spill) exceptions.push(placed.spill);
   }
 
-  return { byTech, skillBlocked };
+  return { byTech, skillBlocked, exceptions };
 }
 
 function isFieldRoutesScheduledJob(job: JobDoc) {
@@ -360,49 +239,8 @@ function dateMovePenaltyPerDay(job: JobDoc) {
   return 2;
 }
 
-function weekdayLabelForDate(dateStr: string) {
-  const date = new Date(`${dateStr}T00:00:00Z`);
-  const day = date.getUTCDay();
-  return WEEKDAY_LABEL_BY_JS_DAY[Number.isFinite(day) ? day : 0];
-}
-
 function maxStopsForRouteDate(baseMaxStops: number, routeDate: string) {
   return sensaiMaxStopsForDate(baseMaxStops, routeDate);
-}
-
-function weekdaySet(value: string) {
-  return new Set(
-    value
-      .split(",")
-      .map((part) => part.trim().toUpperCase())
-      .filter(Boolean),
-  );
-}
-
-function jobScheduleBlockReason(job: JobDoc, slotDate: string) {
-  const parsed = parseSchedulingRequest(String(job.schedulingRequest || ""));
-  if (!parsed.schedulingRequestClass) return "";
-
-  if (CRITICAL_CLASSES.has(parsed.schedulingRequestClass)) {
-    return parsed.schedulingConstraintNote || parsed.schedulingRequestClass;
-  }
-
-  const weekday = weekdayLabelForDate(slotDate);
-  const allowed = weekdaySet(parsed.schedulingAllowedWeekdays);
-  if (allowed.size > 0 && !allowed.has(weekday)) {
-    return `requires ${parsed.schedulingAllowedWeekdays}`;
-  }
-
-  const blocked = weekdaySet(parsed.schedulingBlockedWeekdays);
-  if (blocked.has(weekday)) {
-    return `no ${weekday}`;
-  }
-
-  return "";
-}
-
-function canScheduleJobOnDate(job: JobDoc, slotDate: string) {
-  return !jobScheduleBlockReason(job, slotDate);
 }
 
 function dateTier(job: JobDoc, rangeStart: string, rangeEnd: string) {
@@ -442,31 +280,20 @@ function routingTier(job: JobDoc, windowStart: string, windowEnd: string) {
   return 3;
 }
 
-function jobPriorityComparator(rangeStart: string, rangeEnd: string) {
+function jobPriorityComparator(rangeStart: string, rangeEnd: string, poolBehind = false) {
   const windowStart = _dateOffset(rangeStart, -PENDING_WINDOW_DAYS);
   const windowEnd = _dateOffset(rangeEnd, PENDING_WINDOW_DAYS);
   return (a: JobDoc, b: JobDoc) => {
-    // 1) FieldRoutes-scheduled stops always first (locked to their slot).
     const scheduledDiff = Number(Boolean(isFieldRoutesScheduledJob(b))) - Number(Boolean(isFieldRoutesScheduledJob(a)));
     if (scheduledDiff !== 0) return scheduledDiff;
 
-    // 2) Tier: overdue → pending in-window → pending beyond window.
+    const generateCmp = compareJobsForGenerate(a, b, { poolBehind });
+    if (generateCmp !== 0) return generateCmp;
+
     const tierA = routingTier(a, windowStart, windowEnd);
     const tierB = routingTier(b, windowStart, windowEnd);
     if (tierA !== tierB) return tierA - tierB;
 
-    // 3) Within overdue, oldest due first; within pending, highest value first.
-    if (tierA === 1) {
-      const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
-      if (dateDiff !== 0) return dateDiff;
-    } else {
-      const valueDiff = jobRouteValue(b) - jobRouteValue(a);
-      if (Math.abs(valueDiff) > 0.005) return valueDiff;
-    }
-
-    // 4) Tiebreakers: earlier due date, then more frequent service, then name.
-    const dateDiff = String(a.scheduledDate || "").localeCompare(String(b.scheduledDate || ""));
-    if (dateDiff !== 0) return dateDiff;
     const freqDiff = serviceFrequencyDays(a) - serviceFrequencyDays(b);
     if (freqDiff !== 0) return freqDiff;
     return String(a.customerName || a.docId).localeCompare(String(b.customerName || b.docId));
@@ -1657,6 +1484,9 @@ async function buildFastFallbackRoutes({
     deferredJobIds.add(entry.job.docId);
     constraintDeferrals.push(entry);
   });
+  for (const exception of partition.exceptions) {
+    routeWarnings.add(`${exception.kind}: ${exception.customerName} — ${exception.reason}`);
+  }
   const serviceMinutesOf = (jobs: JobDoc[]) =>
     jobs.reduce((sum, job) => sum + Number(job.duration || 25), 0);
   const techEndPoint = (tech: Record<string, unknown> & { id: string }) => {
@@ -1917,6 +1747,21 @@ export async function POST(request: NextRequest) {
         { error: "Optimize This Day requires a single-day date range" },
         { status: 400 },
       );
+    }
+
+    if (!rebalance) {
+      const horizon = validateGenerateHorizon(rangeStart, rangeEnd, chicagoTodayIso());
+      if (!horizon.ok) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: horizon.errors[0] || "Generate date range is outside the Office 101 build window.",
+            code: "GENERATE_HORIZON",
+            horizon,
+          },
+          { status: 400 },
+        );
+      }
     }
 
     const maxStops = clampGenerateMaxStops(rawMaxStops);
@@ -2235,87 +2080,39 @@ export async function POST(request: NextRequest) {
     const tuesdayMaxStops = Math.max(1, maxStops - TUESDAY_STOP_REDUCTION);
     const totalSlots = selectedTechs.length * numDays;
     const capacity = Math.min(JOB_CAP, selectedTechs.length * perTechCapacity);
-    const prioritySort = jobPriorityComparator(rangeStart, rangeEnd);
+    const poolBehind = overdue.length > 0;
+    const prioritySort = jobPriorityComparator(rangeStart, rangeEnd, poolBehind);
 
     const selectedByTech = new Map<string, JobDoc[]>();
     const deferredByTech = new Map<string, JobDoc[]>();
-    // partitionJobsAmongTechs returns { byTech, skillBlocked } — take the Map for
-    // the capacity split, and keep the skill-blocked jobs so they surface as a
-    // warning instead of silently vanishing (no selected tech carries their skill).
-    const { byTech: partitionedByTech, skillBlocked: skillBlockedByTech } =
-      partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId, {
-        softAssignments: rebalance,
-        perTechCapacity,
-      });
-    // Own-route lines (termite / lawn / GR / wildlife) may never share a route,
-    // so a DAY has to be filled from one class. Taking the top-priority jobs
-    // across all lines produced days whose picks were mostly incompatible and
-    // got deferred downstream — a 23-candidate day that routed 2 stops. Pick a
-    // class per day, then fill that day from it.
+    const {
+      byTech: partitionedByTech,
+      skillBlocked: skillBlockedByTech,
+      exceptions: partitionExceptions,
+    } = partitionJobsAmongTechs(allJobDocs, selectedTechs, pinnedSlotByJobId, {
+      softAssignments: rebalance,
+      perTechCapacity,
+    });
+    const generateExceptions: GenerateException[] = [...partitionExceptions];
+    // Own-route lines never share a GPC/mosquito day. Fill toward 14–16 from
+    // one class per day (weekday-eligible jobs only) so mixed leftover picks
+    // cannot collapse into a 2-stop underfill.
     const classPicks: Array<{ tech: string; date: string; routeClass: string; filled: number }> = [];
     for (const tech of selectedTechs) {
       const techJobs = (partitionedByTech.get(tech.id) || []).sort(prioritySort);
-      // Protected (already-routed / FieldRoutes-scheduled / rebalanced) jobs
-      // always make the cut; remaining capacity fills with the highest-priority
-      // unprotected jobs OF THE DAY'S CLASS.
-      const pinned = techJobs.filter((job) => isProtectedJob(job.docId));
-      const unpinned = techJobs.filter((job) => !isProtectedJob(job.docId));
-
-      // Candidates grouped by class; each list keeps the priority sort above.
-      const byClass = new Map<string, JobDoc[]>();
-      for (const job of unpinned) {
-        const key = routeClassOf(job);
-        if (!byClass.has(key)) byClass.set(key, []);
-        byClass.get(key)!.push(job);
-      }
-
-      const taken: JobDoc[] = [];
-      const takenIds = new Set<string>();
-      for (const routeDate of dates) {
-        const cap = maxStopsForRouteDate(maxStops, routeDate);
-        const pinnedToday = pinned.filter((job) =>
-          String(pinnedSlotByJobId.get(job.docId) || "").startsWith(`${routeDate}::`),
-        );
-        // A stop already committed to the day dictates that day's class.
-        let dayClass = "";
-        for (const job of pinnedToday) {
-          const cls = routeClassOf(job);
-          if (cls !== SHARED_ROUTE_CLASS) { dayClass = cls; break; }
-        }
-        if (!dayClass && pinnedToday.length > 0) dayClass = SHARED_ROUTE_CLASS;
-        if (!dayClass) {
-          // Nothing committed: take the class that fills the day best, breaking
-          // ties toward the class holding the highest-priority job (the lists
-          // are already priority-sorted, so the first entry is that job).
-          let bestScore = -1;
-          let bestHead: JobDoc | null = null;
-          for (const [cls, jobs] of byClass) {
-            const remaining = jobs.filter((job) => !takenIds.has(job.docId));
-            if (remaining.length === 0) continue;
-            const score = Math.min(remaining.length, cap);
-            const head = remaining[0]; // priority-sorted, so this is the class's most urgent job
-            if (score > bestScore || (score === bestScore && bestHead && prioritySort(head, bestHead) < 0)) {
-              bestScore = score;
-              bestHead = head;
-              dayClass = cls;
-            }
-          }
-        }
-        if (!dayClass) continue;
-        let room = Math.max(0, cap - pinnedToday.length);
-        const beforeRoom = room;
-        for (const job of byClass.get(dayClass) || []) {
-          if (room <= 0) break;
-          if (takenIds.has(job.docId)) continue;
-          taken.push(job);
-          takenIds.add(job.docId);
-          room--;
-        }
-        classPicks.push({ tech: tech.id, date: routeDate, routeClass: dayClass, filled: beforeRoom - room + pinnedToday.length });
-      }
-
-      selectedByTech.set(tech.id, [...pinned, ...taken]);
-      deferredByTech.set(tech.id, unpinned.filter((job) => !takenIds.has(job.docId)));
+      const filled = fillDaysByRouteClass({
+        techId: tech.id,
+        jobs: techJobs,
+        dates,
+        pinnedSlotByJobId,
+        isProtected: (id) => isProtectedJob(id),
+        capForDate: (routeDate) => maxStopsForRouteDate(maxStops, routeDate),
+        poolBehind,
+      });
+      selectedByTech.set(tech.id, filled.selected);
+      deferredByTech.set(tech.id, filled.deferred);
+      classPicks.push(...filled.classPicks);
+      generateExceptions.push(...filled.exceptions);
     }
 
     let jobsToRoute = selectedTechs.flatMap((tech) => selectedByTech.get(tech.id) || []);
@@ -2965,6 +2762,16 @@ export async function POST(request: NextRequest) {
 
     const backendDeferred = new Set(result.deferredJobIds || []);
     const totalDeferred = jobsDeferred + backendDeferred.size;
+    const uniqueExceptions = Array.from(
+      new Map(generateExceptions.map((entry) => [entry.jobId + ":" + entry.kind, entry])).values(),
+    ).slice(0, 80);
+    const exceptionCounts = uniqueExceptions.reduce(
+      (acc, entry) => {
+        acc[entry.kind] = (acc[entry.kind] || 0) + 1;
+        return acc;
+      },
+      {} as Record<string, number>,
+    );
 
     return NextResponse.json({
       success: true,
@@ -2982,6 +2789,7 @@ export async function POST(request: NextRequest) {
       },
       params: { targetStops: maxStops, maxStops, maxDriveTime, maxDayMinutes },
       deferredCount: totalDeferred,
+      exceptions: uniqueExceptions,
       warnings: [
         ...(replacedRouteCount > 0
           ? [
@@ -3001,7 +2809,22 @@ export async function POST(request: NextRequest) {
           : []),
         ...(skillBlockedByTech.length > 0
           ? [
-              `${skillBlockedByTech.length} job(s) skipped — their service requires a skill no selected technician has. Select a qualified tech to route them.`,
+              `${skillBlockedByTech.length} job(s) skill-blocked — listed in the exception queue, not placed on an unqualified tech.`,
+            ]
+          : []),
+        ...(exceptionCounts.preferred_tech_spill
+          ? [
+              `${exceptionCounts.preferred_tech_spill} job(s) spilled from the preferred/assigned tech (capacity or skills).`,
+            ]
+          : []),
+        ...(exceptionCounts.preferred_day_conflict
+          ? [
+              `${exceptionCounts.preferred_day_conflict} job(s) need a preferred weekday that is not in this generate window.`,
+            ]
+          : []),
+        ...(exceptionCounts.specialty_review
+          ? [
+              `${exceptionCounts.specialty_review} specialty job(s) held for a dedicated day (not mixed onto GPC/mosquito).`,
             ]
           : []),
         ...(routeOptimizationShadow.status === "failed"

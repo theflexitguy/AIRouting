@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   SHARED_GENERATE_ROUTE_CLASS,
+  addDaysIso,
   clampGenerateMaxDriveMinutes,
   clampGenerateMaxStops,
+  defaultGenerateHorizon,
   displayDriveTimeSource,
   driveTimeSourceBadgeLabel,
   driveTimeSourceKind,
@@ -20,6 +22,7 @@ import {
   sensaiMaxStopsForDate,
   slinkyWeekWarning,
   trustedRoadMinutes,
+  validateGenerateHorizon,
   weekdayLabelForIsoDate,
 } from "./drive-time-honesty.ts";
 
@@ -128,6 +131,17 @@ describe("drive-time honesty", () => {
     assert.equal(horizonGuidance("2026-09-11", "2026-09-09").level, "prefer_week");
     assert.equal(horizonGuidance("2026-09-16", "2026-09-09").level, "ok");
     assert.equal(horizonGuidance("2026-09-24", "2026-09-09").level, "too_far");
+  });
+
+  it("defaults generate to today+2 through ~1 week and validates the cap", () => {
+    assert.deepEqual(defaultGenerateHorizon("2026-09-09"), {
+      startDate: "2026-09-11",
+      endDate: "2026-09-16",
+    });
+    assert.equal(addDaysIso("2026-09-09", 2), "2026-09-11");
+    assert.equal(validateGenerateHorizon("2026-09-09", "2026-09-16", "2026-09-09").ok, false);
+    assert.equal(validateGenerateHorizon("2026-09-11", "2026-09-16", "2026-09-09").ok, true);
+    assert.equal(validateGenerateHorizon("2026-09-11", "2026-09-24", "2026-09-09").ok, false);
   });
 
   it("warns when one week is piled (slinky)", () => {

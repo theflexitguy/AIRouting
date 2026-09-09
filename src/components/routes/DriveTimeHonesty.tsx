@@ -5,9 +5,11 @@ import { cn } from "@/lib/utils";
 import {
   SENSAI_EXCEPTION_COPY,
   SENSAI_GENERATE_HELP,
+  SENSAI_HORIZON_COPY,
   driveTimeSourceBadgeLabel,
   type HorizonGuidance,
 } from "@/lib/routing/drive-time-honesty";
+import type { GenerateException, GenerateExceptionKind } from "@/lib/routing/generate-selection";
 
 export type RoutingStatusSummary = {
   paused?: boolean;
@@ -120,17 +122,22 @@ export function RoutingStatusPanel({ status }: { status: RoutingStatusSummary | 
 export function SensaiGenerateHints({
   horizon,
   overrideWarning,
+  horizonErrors,
 }: {
   horizon: HorizonGuidance | null;
   overrideWarning?: string | null;
+  horizonErrors?: string[];
 }) {
   return (
-    <div className="text-[10px] text-muted-foreground/80 leading-snug max-w-md">
+    <div className="text-[10px] text-muted-foreground/80 leading-snug max-w-xl">
       <p>{SENSAI_GENERATE_HELP}</p>
+      <p className="mt-0.5">{SENSAI_HORIZON_COPY}</p>
       {overrideWarning ? (
         <p className="mt-0.5 font-semibold text-amber-300">{overrideWarning}</p>
       ) : null}
-      {horizon?.message ? (
+      {horizonErrors && horizonErrors.length > 0 ? (
+        <p className="mt-0.5 font-medium text-amber-300">{horizonErrors[0]}</p>
+      ) : horizon?.message ? (
         <p
           className={cn(
             "mt-0.5 font-medium",
@@ -173,7 +180,88 @@ export function PausedGenerateEmptyState() {
         Route generation refuses under GOOGLE_APIS_PAUSED so we never return a
         silent haversine success. Existing routes still show — every drive minute
         is badged ESTIMATE and map lines are dashed straight-line, not fake roads.
+        Horizon defaults and validation still apply on this panel.
       </p>
+    </div>
+  );
+}
+
+const EXCEPTION_KIND_ORDER: GenerateExceptionKind[] = [
+  "skill_blocked",
+  "specialty_review",
+  "preferred_day_conflict",
+  "preferred_tech_spill",
+  "preferred_tech_missing",
+];
+
+const EXCEPTION_KIND_LABELS: Record<GenerateExceptionKind, string> = {
+  skill_blocked: "Skill-blocked",
+  preferred_tech_spill: "Preferred tech spill",
+  preferred_tech_missing: "Preferred tech not selected",
+  preferred_day_conflict: "Preferred-day conflict",
+  specialty_review: "Specialty review",
+};
+
+export function GenerateExceptionQueue({
+  exceptions,
+  onDismiss,
+}: {
+  exceptions: GenerateException[] | null;
+  onDismiss?: () => void;
+}) {
+  if (!exceptions || exceptions.length === 0) return null;
+  const grouped = EXCEPTION_KIND_ORDER
+    .map((kind) => ({
+      kind,
+      items: exceptions.filter((entry) => entry.kind === kind),
+    }))
+    .filter((group) => group.items.length > 0);
+
+  return (
+    <div className="px-3 lg:px-4 py-2 border-b border-violet-500/25 bg-violet-500/8 no-print">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[11px] font-semibold text-violet-100">
+            Exception queue from last generate ({exceptions.length})
+          </p>
+          <p className="text-[10px] text-violet-200/80 mt-0.5">
+            Skill-blocked, specialty, and preferred-day conflicts stay here for a human — they are not silent drops.
+          </p>
+        </div>
+        {onDismiss ? (
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="text-[10px] text-violet-200/80 hover:text-violet-100 underline"
+          >
+            Dismiss
+          </button>
+        ) : null}
+      </div>
+      <div className="mt-2 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+        {grouped.map((group) => (
+          <div
+            key={group.kind}
+            className="rounded-md border border-violet-500/20 bg-background/40 px-2.5 py-2"
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-violet-200">
+              {EXCEPTION_KIND_LABELS[group.kind]} ({group.items.length})
+            </p>
+            <ul className="mt-1 space-y-1">
+              {group.items.slice(0, 6).map((entry) => (
+                <li key={`${entry.kind}-${entry.jobId}`} className="text-[10px] text-muted-foreground leading-snug">
+                  <span className="text-foreground/90 font-medium">{entry.customerName}</span>
+                  {" — "}
+                  {entry.reason}
+                </li>
+              ))}
+              {group.items.length > 6 ? (
+                <li className="text-[10px] text-muted-foreground/70">+{group.items.length - 6} more</li>
+              ) : null}
+            </ul>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

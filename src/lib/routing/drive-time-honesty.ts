@@ -217,8 +217,86 @@ export function daysBetweenIso(from: string, to: string): number | null {
   return Math.round((b - a) / 86400000);
 }
 
+/** Add (or subtract) whole days on an ISO date using UTC, matching daysBetweenIso. */
+export function addDaysIso(iso: string, days: number): string {
+  if (!isIsoDate(iso)) return "";
+  const ms = Date.parse(`${iso}T00:00:00Z`);
+  if (!Number.isFinite(ms)) return "";
+  return new Date(ms + days * 86400000).toISOString().slice(0, 10);
+}
+
 export function chicagoTodayIso(): string {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/Chicago" });
+}
+
+export interface GenerateHorizonDefaults {
+  startDate: string;
+  endDate: string;
+}
+
+/**
+ * Default generate window: earliest today+2, prefer targeting ~1 week ahead,
+ * never past today+14.
+ */
+export function defaultGenerateHorizon(today: string): GenerateHorizonDefaults {
+  const startDate = addDaysIso(today, SENSAI_HORIZON_MIN_DAYS);
+  const preferredEnd = addDaysIso(today, SENSAI_HORIZON_PREFER_DAYS);
+  const latest = addDaysIso(today, SENSAI_HORIZON_MAX_DAYS);
+  let endDate = preferredEnd || startDate;
+  if (latest && endDate > latest) endDate = latest;
+  if (startDate && endDate < startDate) endDate = startDate;
+  return { startDate, endDate };
+}
+
+export interface HorizonValidation {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  startDaysAhead: number | null;
+  endDaysAhead: number | null;
+}
+
+/**
+ * Validate a generate date range against Office 101.
+ * Optimize-day (rebalance) skips this — it may target an already-built day.
+ */
+export function validateGenerateHorizon(
+  startDate: string,
+  endDate: string,
+  today: string,
+): HorizonValidation {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const startDaysAhead = daysBetweenIso(today, startDate);
+  const endDaysAhead = daysBetweenIso(today, endDate);
+  const earliest = addDaysIso(today, SENSAI_HORIZON_MIN_DAYS);
+  const latest = addDaysIso(today, SENSAI_HORIZON_MAX_DAYS);
+
+  if (startDaysAhead === null || endDaysAhead === null) {
+    errors.push("Generate dates must be YYYY-MM-DD.");
+    return { ok: false, errors, warnings, startDaysAhead, endDaysAhead };
+  }
+  if (startDate > endDate) {
+    errors.push("Start date must be on or before end date.");
+  }
+  if (startDaysAhead < SENSAI_HORIZON_MIN_DAYS) {
+    errors.push(
+      `Office 101: earliest generate day is ${earliest} (today+${SENSAI_HORIZON_MIN_DAYS}). Routes must be built at least 2 days out.`,
+    );
+  }
+  if (startDaysAhead > SENSAI_HORIZON_MAX_DAYS || endDaysAhead > SENSAI_HORIZON_MAX_DAYS) {
+    errors.push(
+      `Office 101: don't schedule more than 2 weeks out (latest ${latest}).`,
+    );
+  }
+  if (
+    errors.length === 0 &&
+    startDaysAhead >= SENSAI_HORIZON_MIN_DAYS &&
+    startDaysAhead < 5
+  ) {
+    warnings.push("Routing v2: aim to stay ~1 week ahead.");
+  }
+  return { ok: errors.length === 0, errors, warnings, startDaysAhead, endDaysAhead };
 }
 
 export function horizonGuidance(startDate: string, today: string): HorizonGuidance {
@@ -290,5 +368,8 @@ export function isBedBugServiceType(serviceType?: string | null): boolean {
 export const SENSAI_GENERATE_HELP =
   "Office 101: ~14–16 stops/day (Bella Vista ~12), max ~60 min total drive, ~2 stops/hour. Tuesday ~9am start (3 fewer stops). Saturday half-day. Specialty (termite / GR / bed bugs / commercial / wildlife / lawn) stays off GPC routes. Generate hard-caps at 18 stops / 90 min; values above 16 / 60 are outside SensAI standard.";
 
+export const SENSAI_HORIZON_COPY =
+  "Build window: earliest 2 days out, prefer ~1 week ahead, never more than 2 weeks. Generate defaults to day-after-tomorrow through +1 week. Change dates to view other days — Generate still enforces the window.";
+
 export const SENSAI_EXCEPTION_COPY =
-  "Recurring GPC work should fill automatically. Use this tab for exceptions: specialty, holds, preferred-day conflicts, and rebalance.";
+  "Recurring GPC work should fill automatically. Use this tab for exceptions: skill-blocked, specialty, preferred-tech spills, preferred-day conflicts, and rebalance.";
