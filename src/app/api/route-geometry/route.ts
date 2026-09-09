@@ -4,7 +4,8 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
-import { computeRouteGeometry, type RoutePoint } from "@/lib/google-routing";
+import { computeRouteGeometry, googleApisPaused, type RoutePoint } from "@/lib/google-routing";
+import { publicRouteGeometryPayload } from "@/lib/routing/drive-time-honesty";
 
 type RouteGeometryRequest = {
   companyId?: string;
@@ -69,15 +70,18 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      encodedPolyline: result.encodedPolyline,
-      path: result.path,
-      driveMinutes: Math.round(result.driveMinutes * 10) / 10,
-      distanceMeters: result.distanceMeters,
-      status: result.status,
-      failedSegments: result.failedSegments,
-      driveTimeSource: result.driveTimeSource,
-      polylineSource: result.polylineSource,
-      warnings: result.warnings,
+      ...publicRouteGeometryPayload({
+        driveTimeSource: result.driveTimeSource,
+        polylineSource: result.polylineSource,
+        encodedPolyline: result.encodedPolyline,
+        path: result.path,
+        driveMinutes: result.driveMinutes,
+        distanceMeters: result.distanceMeters,
+        status: result.status,
+        failedSegments: result.failedSegments,
+        warnings: result.warnings,
+        paused: googleApisPaused(),
+      }),
     });
   } catch (error) {
     console.error("Route geometry API error:", error);

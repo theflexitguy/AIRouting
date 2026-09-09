@@ -21,20 +21,26 @@ import {
 } from "@/lib/google-route-optimization";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { calculateStopProductionValue } from "@/lib/production-value";
-import { deriveServiceLine, serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, type ServiceLine } from "@/lib/routing/service-line";
+import {
+  SENSAI_TUESDAY_STOP_REDUCTION,
+  SHARED_GENERATE_ROUTE_CLASS,
+  clampGenerateMaxDriveMinutes,
+  clampGenerateMaxStops,
+  generateRouteClass,
+  sensaiMaxStopsForDate,
+} from "@/lib/routing/drive-time-honesty";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
-const DEFAULT_MAX_STOPS = 16;
-const DEFAULT_MAX_DRIVE_MINUTES = 240;
 // Hard cap on a technician's day: drive + service minutes (Flex rule: keeping
 // the total estimated duration at or under 8 hours every day is a must).
 const DEFAULT_MAX_DAY_MINUTES = 480;
 const JOB_CAP = 500;
 const WEEKDAY_LABEL_BY_JS_DAY = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 const ROUTE_SPREAD_WEIGHT = 1.35;
-const TUESDAY_STOP_REDUCTION = 3;
+const TUESDAY_STOP_REDUCTION = SENSAI_TUESDAY_STOP_REDUCTION;
 const DRIVE_CAP_SLACK_MINUTES = 3;
 // Pending fill window: jobs due within this many days on either side of the
 // route date range are the preferred fill pool (jobs beyond it are last resort).
@@ -141,31 +147,30 @@ function jobServiceLine(job: JobDoc): ServiceLine {
 }
 
 /**
- * Service-line segregation (Flex rule: GR, Termite, Lawn, and Wildlife ride
- * their own certified routes — they never mix onto a general pest route, or
- * with each other). A route may carry EITHER one own-route line exclusively,
- * or any mix of the shared lines (general / mosquito / commercial).
+ * Service-line segregation (Office 101 + Routing v2): specialty
+ * (termite / GR / bed bugs / commercial / wildlife / lawn) stays off GPC
+ * routes and off each other. Shared class is general pest + mosquito only.
  */
-/** Shared-line class: general / mosquito / commercial all mix on one route. */
-const SHARED_ROUTE_CLASS = "__shared";
+const SHARED_ROUTE_CLASS = SHARED_GENERATE_ROUTE_CLASS;
 
 /**
- * The class of route a job can live on. Every own-route line is its own class
- * (they can never share); everything else pools into one shared class. Two jobs
- * can ride the same route if and only if their classes match.
+ * The class of route a job can live on. Own-route / specialty classes never
+ * share; general + mosquito pool into SHARED. Two jobs can ride the same route
+ * if and only if their classes are compatible.
  */
 function routeClassOf(job: JobDoc): string {
-  const line = jobServiceLine(job);
-  return serviceLineMeta(line).requiresOwnRoute ? line : SHARED_ROUTE_CLASS;
+  return generateRouteClass({
+    serviceType: String(job.serviceType || ""),
+    serviceLine: jobServiceLine(job),
+  });
 }
 
 function unitCompatibleWithSlotJobs(unitJobsArr: JobDoc[], slotJobs: JobDoc[]): boolean {
-  const lines = new Set<ServiceLine>();
-  for (const job of unitJobsArr) lines.add(jobServiceLine(job));
-  for (const job of slotJobs) lines.add(jobServiceLine(job));
-  const ownRouteLines = Array.from(lines).filter((line) => serviceLineMeta(line).requiresOwnRoute);
-  if (ownRouteLines.length === 0) return true; // shared lines mix freely
-  return lines.size === 1; // an own-route line must be the ONLY line on the route
+  const classes = new Set<string>();
+  for (const job of unitJobsArr) classes.add(routeClassOf(job));
+  for (const job of slotJobs) classes.add(routeClassOf(job));
+  if (classes.size <= 1) return true;
+  return Array.from(classes).every((cls) => cls === SHARED_ROUTE_CLASS);
 }
 
 /** Does this tech match the job's preferred technician (a name resolved during sync)? */
@@ -362,12 +367,7 @@ function weekdayLabelForDate(dateStr: string) {
 }
 
 function maxStopsForRouteDate(baseMaxStops: number, routeDate: string) {
-  return Math.max(
-    1,
-    weekdayLabelForDate(routeDate) === "TUE"
-      ? baseMaxStops - TUESDAY_STOP_REDUCTION
-      : baseMaxStops,
-  );
+  return sensaiMaxStopsForDate(baseMaxStops, routeDate);
 }
 
 function weekdaySet(value: string) {
@@ -1854,9 +1854,11 @@ export async function POST(request: NextRequest) {
       {
         success: false,
         error:
-          "Route generation is paused to stop Google API charges (GOOGLE_APIS_PAUSED). " +
-          "The dashboard and job sync are unaffected. Remove the variable in Vercel and redeploy to resume.",
+          "Route generation is paused (GOOGLE_APIS_PAUSED). Refusing rather than returning " +
+          "straight-line (haversine) routes that look real. The dashboard and job sync are unaffected. " +
+          "Remove the variable in Vercel and redeploy to resume.",
         paused: true,
+        code: "GOOGLE_APIS_PAUSED",
       },
       { status: 503 },
     );
@@ -1917,15 +1919,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const maxStops =
-      Number.isFinite(rawMaxStops) && (rawMaxStops as number) > 0
-        ? Math.min(30, Math.floor(rawMaxStops as number))
-        : DEFAULT_MAX_STOPS;
-
-    const maxDriveTime =
-      Number.isFinite(rawMaxDriveTime) && (rawMaxDriveTime as number) > 0
-        ? Math.min(600, Math.floor(rawMaxDriveTime as number))
-        : DEFAULT_MAX_DRIVE_MINUTES;
+    const maxStops = clampGenerateMaxStops(rawMaxStops);
+    const maxDriveTime = clampGenerateMaxDriveMinutes(rawMaxDriveTime);
 
     const maxDayMinutes =
       Number.isFinite(rawMaxDayMinutes) && (rawMaxDayMinutes as number) > 0
@@ -2482,22 +2477,21 @@ export async function POST(request: NextRequest) {
             }
           }
           if (!violation) {
-            // Google has no concept of our service-line rule: an own-route line
-            // (termite / lawn / GR / wildlife) may never share a route with any
-            // other line. Enforce it here so a Google plan can't quietly break
-            // it — same rule as unitCompatibleWithSlotJobs.
-            const linesBySlot = new Map<string, Set<ServiceLine>>();
+            // Google has no concept of our specialty-off-GPC rule. Enforce the
+            // same classes as routeClassOf so a Google plan can't mix specialty
+            // onto a general pest route.
+            const classBySlot = new Map<string, Set<string>>();
             const jobByDocId = new Map(jobsToRoute.map((job) => [job.docId, job]));
             for (const [jobId, slotKey] of planned.slotKeyByJobId) {
               const job = jobByDocId.get(jobId);
               if (!job) continue;
-              if (!linesBySlot.has(slotKey)) linesBySlot.set(slotKey, new Set());
-              linesBySlot.get(slotKey)!.add(jobServiceLine(job));
+              if (!classBySlot.has(slotKey)) classBySlot.set(slotKey, new Set());
+              classBySlot.get(slotKey)!.add(routeClassOf(job));
             }
-            for (const [slotKey, lines] of linesBySlot) {
-              const ownRoute = Array.from(lines).filter((line) => serviceLineMeta(line).requiresOwnRoute);
-              if (ownRoute.length > 0 && lines.size > 1) {
-                violation = `slot ${slotKey} mixes ${ownRoute.join("/")} with other lines`;
+            for (const [slotKey, classes] of classBySlot) {
+              const specialty = Array.from(classes).filter((cls) => cls !== SHARED_ROUTE_CLASS);
+              if (specialty.length > 0 && classes.size > 1) {
+                violation = `slot ${slotKey} mixes ${specialty.join("/")} with other lines`;
                 break;
               }
             }
@@ -2544,8 +2538,8 @@ export async function POST(request: NextRequest) {
           ...(classPicks.length > 0
             ? [
                 `Route lines: ${classPicks
-                  .map((pick) => `${pick.date} ${pick.routeClass === SHARED_ROUTE_CLASS ? "general/mosquito/commercial" : pick.routeClass} (${pick.filled} stops)`)
-                  .join("; ")}. Termite, lawn, GR and wildlife each require their own route, so other lines were left for another day.`,
+                  .map((pick) => `${pick.date} ${pick.routeClass === SHARED_ROUTE_CLASS ? "general/mosquito" : pick.routeClass} (${pick.filled} stops)`)
+                  .join("; ")}. Specialty (termite / GR / bed bugs / commercial / wildlife / lawn) stays off GPC routes, so other lines were left for another day.`,
               ]
             : []),
           optimizerEngine === "google_route_optimization"

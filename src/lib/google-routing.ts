@@ -102,15 +102,35 @@ const polylineCache = new Map<string, CacheEntry<RouteGeometryResult>>();
  * Master kill switch for every BILLABLE Google call — set GOOGLE_APIS_PAUSED=1
  * to stop spend without pulling credentials or redeploying code changes.
  *
- * Paused, the app keeps working: drive times and polylines fall back to
- * straight-line estimates and geocoding returns null, which are the same paths
- * that run when no API key is configured. The FieldRoutes sync is unaffected —
- * it costs nothing on Google — so jobs, targets, overdue counts and the rest of
- * the dashboard stay current.
+ * Paused: getGoogleMapsServerApiKey() returns empty so matrix / polyline /
+ * geocode make no Google request. Callers that still compute a number get an
+ * ESTIMATE (haversine) and MUST label it — never present it as a road time.
+ * Route generation refuses entirely (see /api/generate-routes). FieldRoutes
+ * sync does not call Google, so jobs, targets, and dashboard KPIs stay current.
  */
 export function googleApisPaused() {
   const flag = String(process.env.GOOGLE_APIS_PAUSED || "").trim().toLowerCase();
   return flag === "1" || flag === "true" || flag === "yes";
+}
+
+/** True when a Maps key is present in env — does NOT bypass GOOGLE_APIS_PAUSED. */
+export function googleMapsApiKeyConfigured() {
+  return (
+    process.env.GOOGLE_MAPS_API_KEY ||
+    process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
+    ""
+  ).trim().length > 0;
+}
+
+function pausedOrMissingKeyWarning(kind: "matrix" | "geometry") {
+  if (googleApisPaused()) {
+    return kind === "geometry"
+      ? "GOOGLE_APIS_PAUSED: no Routes API call. Geometry is ESTIMATE (straight-line), not snapped roads."
+      : "GOOGLE_APIS_PAUSED: no Routes API call. Drive times are ESTIMATE (haversine), not road minutes.";
+  }
+  return kind === "geometry"
+    ? "GOOGLE_MAPS_API_KEY is not configured; route geometry cannot be snapped to roads."
+    : "GOOGLE_MAPS_API_KEY is not configured; using haversine_fallback drive estimates.";
 }
 
 export function getGoogleMapsServerApiKey() {
@@ -324,7 +344,7 @@ export async function computeRouteMatrix(
       matrix: fallback,
       source: "haversine_fallback",
       failedElements: Math.max(0, points.length * points.length - points.length),
-      warnings: ["GOOGLE_MAPS_API_KEY is not configured; using haversine_fallback drive estimates."],
+      warnings: [pausedOrMissingKeyWarning("matrix")],
     };
   }
   if (points.some((point) => !isValidPoint(point))) {
@@ -569,7 +589,7 @@ export async function computeRouteGeometry(
       failedSegments: Math.max(0, points.length - 1),
       driveTimeSource: "haversine_fallback",
       polylineSource: "haversine_fallback",
-      warnings: ["GOOGLE_MAPS_API_KEY is not configured; route geometry cannot be snapped to roads."],
+      warnings: [pausedOrMissingKeyWarning("geometry")],
     };
   }
   if (points.some((point) => !isValidPoint(point))) {
