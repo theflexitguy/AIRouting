@@ -6,7 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
-import { computeMonthlyDone } from "@/lib/fieldroutes/monthly-done";
+import { computeMonthlyDone, MONTHLY_DONE_VERSION } from "@/lib/fieldroutes/monthly-done";
 import { centralTodayISO } from "@/lib/fieldroutes/scope";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
@@ -85,8 +85,9 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
 
     const today = centralTodayISO();
     // Which months to compute: an explicit month, a backfill of the last N, or
-    // just the current month. Only backfill months not already cached (unless a
-    // specific month was requested, which always recomputes).
+    // just the current month. A backfill fills gaps and refreshes months cached
+    // under an older classifier (unless a specific month was requested, which
+    // always recomputes).
     let monthsToCompute: string[];
     const backfillN = Math.min(24, Math.max(0, Number(monthsParam) || 0));
     if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
@@ -96,8 +97,15 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
       const existing = await Promise.all(
         keys.map((k) => db.doc(`companies/${companyId}/monthlyDone/${k}`).get()),
       );
-      // Always refresh the current month; only fill gaps for prior months.
-      monthsToCompute = keys.filter((k, i) => k === today.slice(0, 7) || !existing[i].exists);
+      // Always refresh the current month; for prior months fill gaps AND redo any
+      // month cached under an older classifier. The dashboard's history range only
+      // ever sums these documents, so a stale one would report the old bucketing
+      // forever. The budget guard below stops a large re-lift cleanly and the rest
+      // is picked up on the next call.
+      monthsToCompute = keys.filter((k, i) => {
+        if (k === today.slice(0, 7) || !existing[i].exists) return true;
+        return Number(existing[i].data()?.version || 0) < MONTHLY_DONE_VERSION;
+      });
     } else {
       monthsToCompute = [today.slice(0, 7)];
     }

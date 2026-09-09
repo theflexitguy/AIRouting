@@ -72,7 +72,19 @@ export function classifyServiceForTracking(description: string): TrackingClass {
   return { line, isInitial, isFollowup, isReservice, isWildlife, isSpecialty };
 }
 
+/**
+ * Bump whenever the bucketing changes. Cached monthlyDone documents are the ONLY
+ * source the dashboard's history range reads (it never recomputes), so without a
+ * version a definition change silently applies to the current month alone and
+ * every past month keeps reporting the old numbers forever.
+ *
+ * 2: unrecognized service types no longer count as General Pest (matchServiceLine).
+ */
+export const MONTHLY_DONE_VERSION = 2;
+
 export interface MonthlyDone {
+  /** MONTHLY_DONE_VERSION this document was computed under. Absent = pre-versioning. */
+  version: number;
   month: string; // YYYY-MM
   monthStart: string;
   monthEnd: string; // last day of the month (or today, for the current month)
@@ -261,6 +273,7 @@ export async function computeMonthlyDone(
   const newSubscriptions = await countCreated("subscription");
 
   const done: MonthlyDone = {
+    version: MONTHLY_DONE_VERSION,
     month,
     monthStart,
     monthEnd,
