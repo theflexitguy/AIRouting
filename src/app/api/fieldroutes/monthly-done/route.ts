@@ -10,6 +10,13 @@ import { computeMonthlyDone, MONTHLY_DONE_VERSION } from "@/lib/fieldroutes/mont
 import { centralTodayISO } from "@/lib/fieldroutes/scope";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
+
+// FieldRoutesClient paces requests MIN_REQUEST_INTERVAL_MS (1.1s) apart and a
+// month costs ~5 of them, so ~12 months is already past this route's
+// maxDuration of 60s. Stop well short and hand the rest back as
+// remainingMonths so the caller can continue, rather than being killed
+// mid-migration with the cache half-updated.
+const TIME_BUDGET_MS = 40_000;
 const clean = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
 // Computes completed-appointment aggregates (Initials / Specialty / Wildlife /
@@ -36,7 +43,12 @@ function recentMonthKeys(today: string, n: number): string[] {
   return keys;
 }
 
-async function handle(companyIdParam: string | undefined, monthParam?: string, monthsParam?: string) {
+async function handle(
+  companyIdParam: string | undefined,
+  monthParam?: string,
+  monthsParam?: string,
+  monthKeysParam?: string[],
+) {
   try {
     const db = adminDb();
 
@@ -90,10 +102,15 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
     // always recomputes).
     let monthsToCompute: string[];
     const backfillN = Math.min(24, Math.max(0, Number(monthsParam) || 0));
+    // Explicit keys win: a period like "last month" or "last quarter" is a
+    // specific set of months, and deriving it from a COUNT of trailing months
+    // silently refreshes the wrong ones (in September, "last month" is 2026-08,
+    // but a count of 1 resolves to 2026-09 and leaves August stale).
+    const explicitKeys = (monthKeysParam || []).filter((k) => /^\d{4}-\d{2}$/.test(k)).slice(0, 24);
     if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
       monthsToCompute = [monthParam];
-    } else if (backfillN > 0) {
-      const keys = recentMonthKeys(today, backfillN);
+    } else if (explicitKeys.length > 0 || backfillN > 0) {
+      const keys = explicitKeys.length > 0 ? explicitKeys : recentMonthKeys(today, backfillN);
       const existing = await Promise.all(
         keys.map((k) => db.doc(`companies/${companyId}/monthlyDone/${k}`).get()),
       );
@@ -111,9 +128,16 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
     }
 
     const results: Array<Record<string, unknown>> = [];
+    const remainingMonths: string[] = [];
+    const startedAt = Date.now();
     try {
       for (const mk of monthsToCompute) {
-        if (client.readCount >= budget.remaining) break; // out of budget — stop cleanly
+        // Out of API budget, or close enough to the route timeout that another
+        // month would not finish: hand the rest back instead of being killed.
+        if (client.readCount >= budget.remaining || Date.now() - startedAt > TIME_BUDGET_MS) {
+          remainingMonths.push(mk);
+          continue;
+        }
         const { done, sample } = await computeMonthlyDone(client, today, mk);
         await db.doc(`companies/${companyId}/monthlyDone/${done.month}`).set(done);
         if (done.month === today.slice(0, 7)) {
@@ -127,6 +151,9 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
 
     return NextResponse.json({
       computedMonths: results.map((r) => r.month),
+      // Non-empty when this invocation ran out of time or API budget. Call again
+      // with monthKeys set to these to continue; the work already done is saved.
+      remainingMonths,
       results,
       apiReads: client.readCount,
     });
@@ -138,11 +165,23 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
 }
 
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as { companyId?: string; month?: string; months?: string | number };
-  return handle(body.companyId, body.month, body.months !== undefined ? String(body.months) : undefined);
+  const body = (await request.json().catch(() => ({}))) as {
+    companyId?: string;
+    month?: string;
+    months?: string | number;
+    monthKeys?: unknown;
+  };
+  const keys = Array.isArray(body.monthKeys) ? body.monthKeys.map((k) => String(k)) : undefined;
+  return handle(body.companyId, body.month, body.months !== undefined ? String(body.months) : undefined, keys);
 }
 
 export async function GET(request: NextRequest) {
   const params = new URL(request.url).searchParams;
-  return handle(params.get("companyId") || undefined, params.get("month") || undefined, params.get("months") || undefined);
+  const keys = (params.get("monthKeys") || "").split(",").map((k) => k.trim()).filter(Boolean);
+  return handle(
+    params.get("companyId") || undefined,
+    params.get("month") || undefined,
+    params.get("months") || undefined,
+    keys.length > 0 ? keys : undefined,
+  );
 }

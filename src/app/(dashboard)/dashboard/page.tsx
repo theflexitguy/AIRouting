@@ -517,18 +517,34 @@ export default function DashboardPage() {
     if (!companyId) return;
     setRangeRefreshing(true);
     try {
-      const months = monthKeysForPeriod(period, today).length;
-      const res = await fetch("/api/fieldroutes/monthly-done", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ companyId, months }),
-      });
-      if (!res.ok) {
+      // Send the period's actual month keys, not just how many there are: in
+      // September "last month" is 2026-08, and a count of 1 would refresh
+      // 2026-09 instead, leaving the month being viewed stale.
+      let pending = monthKeysForPeriod(period, today);
+      let failed = "";
+      // The endpoint stops short of its timeout on a long re-lift and returns
+      // what it did not reach; continue until nothing is left (bounded).
+      for (let i = 0; i < 8 && pending.length > 0; i++) {
+        const res = await fetch("/api/fieldroutes/monthly-done", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ companyId, monthKeys: pending }),
+        });
         const d = await res.json().catch(() => ({}));
-        toast.error(d.error || "Couldn't refresh history — check API budget.");
+        if (!res.ok) {
+          failed = d.error || "Couldn't refresh history — check API budget.";
+          break;
+        }
+        const remaining: string[] = Array.isArray(d.remainingMonths) ? d.remainingMonths.map(String) : [];
+        // No forward progress (out of API budget, say) — stop rather than spin.
+        if (remaining.length >= pending.length) { pending = remaining; break; }
+        pending = remaining;
+      }
+      if (failed) {
+        toast.error(failed);
       } else {
         await loadRangeDone();
-        toast.success("History refreshed");
+        toast.success(pending.length > 0 ? `History refreshed — ${pending.length} month(s) still pending` : "History refreshed");
       }
     } catch {
       toast.error("Couldn't refresh history.");
