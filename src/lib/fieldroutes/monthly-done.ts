@@ -162,6 +162,12 @@ export async function computeMonthlyDone(
     // Catalog optional; we fall back to any description on the appointment itself.
     degraded = true;
   }
+  // A successful-but-empty response does not throw, so the catch above never
+  // fires -- but an empty catalog is just as unusable. Appointments carry their
+  // service type as the numeric `type` id and no text field, so describe() would
+  // return "" for every one and the whole month would bucket as unclassified,
+  // then persist as if it were complete. An office always has service types.
+  if (catalog.size === 0) degraded = true;
 
   // 2) Completed appointments in [monthStart, monthEnd] (status 1 = Completed).
   const apptIds = await client.searchIds("appointment", {
