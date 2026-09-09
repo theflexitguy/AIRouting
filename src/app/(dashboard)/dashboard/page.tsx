@@ -395,6 +395,18 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userProfile]);
 
+  // Trailing 15 months of cached aggregates, feeding the Technicians Needed
+  // forecast. Shared by the initial load and by Refresh -- a refresh that
+  // recomputed these documents must re-read them, or the forecast keeps using
+  // the superseded numbers while the UI reports success.
+  async function loadRecentDone(companyId: string) {
+    const histKeys = trailingMonthKeys(today, 15);
+    const doneSnaps = await Promise.all(
+      histKeys.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
+    );
+    setRecentDone(doneSnaps.filter((s2) => s2.exists()).map((s2) => s2.data() as MonthlyDoneLike));
+  }
+
   async function loadDashboardData(companyId: string) {
     try {
       // One routes read covering the 8-week trend through end of this week (which
@@ -447,17 +459,12 @@ export default function DashboardPage() {
       const g = companySnap.exists() ? Number(companySnap.data().forecastMonthlyGrowthPct) : 0;
       setGrowthPct(Number.isFinite(g) && g !== 0 ? String(g) : "0");
 
-      // Trailing 15 months of cached completed-appointment aggregates — the
-      // Technicians Needed forecast reads them two ways: recent run rates AND
-      // year-over-year seasonality (same calendar month a year ago for each of
-      // the next 12 forecast months, plus the year-ago comparison for the recent
-      // trend). Missing docs just mean a fallback to flat recent-3mo until the
-      // history is backfilled via Refresh.
-      const histKeys = trailingMonthKeys(today, 15);
-      const doneSnaps = await Promise.all(
-        histKeys.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
-      );
-      setRecentDone(doneSnaps.filter((s2) => s2.exists()).map((s2) => s2.data() as MonthlyDoneLike));
+      // The Technicians Needed forecast reads these two ways: recent run rates
+      // AND year-over-year seasonality (same calendar month a year ago for each
+      // of the next 12 forecast months, plus the year-ago comparison for the
+      // recent trend). Missing docs just mean a fallback to flat recent-3mo
+      // until the history is backfilled via Refresh.
+      await loadRecentDone(companyId);
     } catch (error) {
       console.error("Dashboard data error:", error);
       setRawRoutes([]);
@@ -543,7 +550,9 @@ export default function DashboardPage() {
       if (failed) {
         toast.error(failed);
       } else {
-        await loadRangeDone();
+        // Both readers of these documents, not just the range cards: the forecast
+        // reads recentDone, which would otherwise keep the superseded totals.
+        await Promise.all([loadRangeDone(), loadRecentDone(companyId)]);
         toast.success(pending.length > 0 ? `History refreshed — ${pending.length} month(s) still pending` : "History refreshed");
       }
     } catch {

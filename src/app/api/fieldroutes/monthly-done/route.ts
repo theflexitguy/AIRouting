@@ -17,6 +17,11 @@ const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 // remainingMonths so the caller can continue, rather than being killed
 // mid-migration with the cache half-updated.
 const TIME_BUDGET_MS = 40_000;
+
+// A month costs ~5 FieldRoutes reads. Starting one with less headroom than this
+// risks the cap landing mid-computation, which computeMonthlyDone reports as
+// degraded rather than failing -- don't begin a month we can't finish.
+const MONTH_READ_ESTIMATE = 8;
 const clean = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
 // Computes completed-appointment aggregates (Initials / Specialty / Wildlife /
@@ -132,14 +137,24 @@ async function handle(
     const startedAt = Date.now();
     try {
       for (const mk of monthsToCompute) {
-        // Out of API budget, or close enough to the route timeout that another
-        // month would not finish: hand the rest back instead of being killed.
-        if (client.readCount >= budget.remaining || Date.now() - startedAt > TIME_BUDGET_MS) {
+        // Not enough API headroom to finish a month, or close enough to the route
+        // timeout that another would not finish: hand the rest back instead of
+        // starting work that can only end up partial.
+        if (
+          budget.remaining - client.readCount < MONTH_READ_ESTIMATE ||
+          Date.now() - startedAt > TIME_BUDGET_MS
+        ) {
           remainingMonths.push(mk);
           continue;
         }
-        const { done, sample } = await computeMonthlyDone(client, today, mk);
-        await db.doc(`companies/${companyId}/monthlyDone/${done.month}`).set(done);
+        const { done, sample, degraded } = await computeMonthlyDone(client, today, mk);
+        // Save a degraded month so the dashboard still has something to show, but
+        // NEVER stamp it current: its zeros are missing counts, not real ones, and
+        // a versioned document is never recomputed. version 0 keeps it eligible.
+        await db
+          .doc(`companies/${companyId}/monthlyDone/${done.month}`)
+          .set(degraded ? { ...done, version: 0 } : done);
+        if (degraded) remainingMonths.push(mk);
         if (done.month === today.slice(0, 7)) {
           await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(done);
         }

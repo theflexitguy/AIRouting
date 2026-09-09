@@ -135,7 +135,14 @@ export async function computeMonthlyDone(
   client: FieldRoutesClient,
   today: string = centralTodayISO(),
   monthKey?: string,
-): Promise<{ done: MonthlyDone; sample: { keys: string[]; rows: Record<string, unknown>[]; serviceTypeFieldUsed: string } }> {
+) : Promise<{
+  done: MonthlyDone;
+  sample: { keys: string[]; rows: Record<string, unknown>[]; serviceTypeFieldUsed: string };
+  /** True when part of the aggregate could not be read (API cap hit mid-run, catalog
+   *  unavailable). The counts are then INCOMPLETE and must not be treated as final. */
+  degraded: boolean;
+}> {
+  let degraded = false;
   const month = monthKey && /^\d{4}-\d{2}$/.test(monthKey) ? monthKey : today.slice(0, 7);
   const monthStart = `${month}-01`;
   const isCurrentMonth = month === today.slice(0, 7);
@@ -153,6 +160,7 @@ export async function computeMonthlyDone(
     }
   } catch {
     // Catalog optional; we fall back to any description on the appointment itself.
+    degraded = true;
   }
 
   // 2) Completed appointments in [monthStart, monthEnd] (status 1 = Completed).
@@ -266,6 +274,9 @@ export async function computeMonthlyDone(
       return ids.length;
     } catch (err) {
       console.warn(`[monthly-done] ${module} new-business count failed for ${month}:`, String(err));
+      // A zero here is a MISSING count, not a real one -- the caller must not
+      // persist this month as final (it feeds the forecast's growth rate).
+      degraded = true;
       return 0;
     }
   };
@@ -311,5 +322,5 @@ export async function computeMonthlyDone(
     serviceTypeFieldUsed: serviceTypeFieldUsed || "(none resolved)",
   };
 
-  return { done, sample };
+  return { done, sample, degraded };
 }
