@@ -67,6 +67,13 @@ const RULES: Array<{ line: ServiceLine; test: (n: string) => boolean }> = [
   { line: "commercial", test: (n) => n.includes("commercial") || n.startsWith("comm") || n === "wei" },
 ];
 
+// A label that positively names the general-pest line. deriveServiceLine has never
+// needed this — anything unmatched already falls through to "general" there — but
+// matchServiceLine below has to tell "this IS general pest" apart from "this names
+// no line at all".
+const generalPestTest = (n: string): boolean =>
+  n.includes("generalpest") || n === "gpc" || n === "gp";
+
 // Canonical route-group → service line, used only as a fallback when the
 // serviceType label alone doesn't match a keyword. (Specialty is intentionally
 // omitted — it carries mixed work, so we don't force a line from it.)
@@ -97,6 +104,30 @@ export function deriveServiceLine(serviceType: unknown, routeGroupTitle?: unknow
   const group = canonicalRouteGroup(String(routeGroupTitle ?? ""));
   if (group && GROUP_TO_LINE[group]) return GROUP_TO_LINE[group];
   return "general";
+}
+
+/**
+ * Positively identify a service line from its label, or null when the label names
+ * none. Deliberately does NOT consult the route group and does NOT default.
+ *
+ * deriveServiceLine() defaults an unrecognized label to "general". That is right
+ * for ROUTING — an unknown stop has to ride some route, and the general routes are
+ * the catch-all — but wrong for a METRIC, where it silently folds work that isn't
+ * general pest into the General Pest completed count. At Flex that meant "Balance
+ * Forward", "Cancelation Fee", "Technician Tip", "Fly treatments" and two leftover
+ * test service types all counting as completed General Pest services, inflating the
+ * number the owner paces against.
+ *
+ * Anything reporting a per-line NUMBER should use this and surface the nulls.
+ * Anything deciding where a stop RIDES should keep using deriveServiceLine.
+ */
+export function matchServiceLine(serviceType: unknown): ServiceLine | null {
+  const n = normalize(serviceType);
+  if (!n) return null;
+  for (const r of RULES) {
+    if (r.test(n)) return r.line;
+  }
+  return generalPestTest(n) ? "general" : null;
 }
 
 export function serviceLineMeta(line: ServiceLine): ServiceLineMeta {

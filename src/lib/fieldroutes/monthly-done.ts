@@ -17,7 +17,7 @@
 
 import { FieldRoutesClient } from "./client";
 import { centralTodayISO, toDateOnly, num } from "./scope";
-import { deriveServiceLine, ServiceLine } from "@/lib/routing/service-line";
+import { matchServiceLine, ServiceLine } from "@/lib/routing/service-line";
 
 const str = (v: unknown): string => String(v ?? "").trim();
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
@@ -48,7 +48,8 @@ const isReserviceLabel = (n: string): boolean =>
   n.includes("callback");
 
 export interface TrackingClass {
-  line: ServiceLine;
+  /** null when the label names no service line — see matchServiceLine. */
+  line: ServiceLine | null;
   isInitial: boolean;
   isFollowup: boolean;
   isReservice: boolean;
@@ -58,7 +59,9 @@ export interface TrackingClass {
 
 /** Classify a service-type description for the dashboard trackers. */
 export function classifyServiceForTracking(description: string): TrackingClass {
-  const line = deriveServiceLine(description);
+  // matchServiceLine, NOT deriveServiceLine: an unrecognized label must stay
+  // unattributed here instead of defaulting into General Pest (see that function).
+  const line = matchServiceLine(description);
   const n = normalize(description);
   const isInitial = isInitialLabel(description);
   const isFollowup = !isInitial && isFollowupLabel(n);
@@ -93,6 +96,9 @@ export interface MonthlyDone {
   newCustomers: number;
   newSubscriptions: number;
   unclassified: number;
+  /** Completed appointments whose service type names no line, by label. Empty is
+   *  the healthy state; entries here are work NOT counted in any line's done. */
+  unclassifiedTypes: Record<string, number>;
 }
 
 const RECURRING_LINES: ServiceLine[] = ["general", "mosquito", "lawn", "termite", "commercial"];
@@ -177,6 +183,12 @@ export async function computeMonthlyDone(
   let grDone = 0;
   let wildlifeDone = 0;
   let unclassified = 0;
+  const unclassifiedTypes: Record<string, number> = {};
+  const dropUnclassified = (label: string) => {
+    unclassified++;
+    const k = label || "(no service type)";
+    unclassifiedTypes[k] = (unclassifiedTypes[k] || 0) + 1;
+  };
   let completed = 0;
 
   for (const a of appts) {
@@ -188,12 +200,19 @@ export async function computeMonthlyDone(
 
     const desc = describe(ar);
     if (!desc) {
-      unclassified++;
+      dropUnclassified("");
       continue;
     }
     const c = classifyServiceForTracking(desc);
     if (c.isInitial) {
-      const base = c.line === "wildlife" ? "wildlife" : c.line;
+      // An initial still has to belong to a line to be counted as one. "Bait Box
+      // Initial" names none, so it lands in unclassifiedTypes rather than being
+      // reported as a General Pest initial.
+      if (!c.line) {
+        dropUnclassified(desc);
+        continue;
+      }
+      const base = c.line;
       if (base in initialsByLine) initialsByLine[base]++;
       else initialsByLine[base] = (initialsByLine[base] || 0) + 1;
       continue;
@@ -215,8 +234,8 @@ export async function computeMonthlyDone(
       if (c.line === "gr") grDone++;
       continue;
     }
-    if (c.line in recurringDoneByLine) recurringDoneByLine[c.line]++;
-    else unclassified++;
+    if (c.line && c.line in recurringDoneByLine) recurringDoneByLine[c.line]++;
+    else dropUnclassified(desc);
   }
 
   const recurringDoneTotal = RECURRING_LINES.reduce((s, l) => s + recurringDoneByLine[l], 0);
@@ -260,6 +279,7 @@ export async function computeMonthlyDone(
     newCustomers,
     newSubscriptions,
     unclassified,
+    unclassifiedTypes,
   };
 
   const sample = {
