@@ -148,13 +148,16 @@ async function handle(
           continue;
         }
         const { done, sample, degraded } = await computeMonthlyDone(client, today, mk);
-        // Save a degraded month so the dashboard still has something to show, but
-        // NEVER stamp it current: its zeros are missing counts, not real ones, and
-        // a versioned document is never recomputed. version 0 keeps it eligible.
-        await db
-          .doc(`companies/${companyId}/monthlyDone/${done.month}`)
-          .set(degraded ? { ...done, version: 0 } : done);
-        if (degraded) remainingMonths.push(mk);
+        // A degraded month is never persisted. Its zeros are MISSING counts, not
+        // real ones, so writing it would replace a good cached month with partial
+        // data that every reader consumes immediately. Leaving the previous
+        // document in place and reporting the month as pending is strictly better:
+        // stale-but-complete beats fresh-but-wrong, and the next pass redoes it.
+        if (degraded) {
+          remainingMonths.push(mk);
+          continue;
+        }
+        await db.doc(`companies/${companyId}/monthlyDone/${done.month}`).set(done);
         if (done.month === today.slice(0, 7)) {
           await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(done);
         }

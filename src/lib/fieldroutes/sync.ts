@@ -2766,9 +2766,17 @@ export async function runSync(mode: SyncMode): Promise<SyncResult> {
   if (done) {
     try {
       const md = await computeMonthlyDone(client, today);
-      // Legacy single-doc (current-month card) + per-month doc (history selector).
-      await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(md.done);
-      await db.doc(`companies/${companyId}/monthlyDone/${md.done.month}`).set(md.done);
+      // Same rule as the monthly-done route: never persist a degraded aggregate.
+      // A sync that runs its API budget down near the end is exactly when this
+      // happens, and the counts it fell back to are missing, not zero -- storing
+      // them would overwrite a good month and, being versioned, look current.
+      if (md.degraded) {
+        console.warn(`[fieldroutes/sync] monthly-done for ${md.done.month} was incomplete — not stored`);
+      } else {
+        // Legacy single-doc (current-month card) + per-month doc (history selector).
+        await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(md.done);
+        await db.doc(`companies/${companyId}/monthlyDone/${md.done.month}`).set(md.done);
+      }
     } catch (err) {
       console.warn("[fieldroutes/sync] monthly-done refresh skipped:", String(err));
     }

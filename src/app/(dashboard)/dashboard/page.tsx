@@ -395,6 +395,18 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userProfile]);
 
+  // The legacy single-doc current-month aggregate behind the "Completed This
+  // Month" cards. A refresh whose period includes the current month recomputes
+  // this document too, so Refresh has to re-read it or those cards keep the
+  // superseded numbers when the user switches back to This month.
+  async function loadMonthlyDone(companyId: string) {
+    const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
+    const md = mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null;
+    // Ignore a doc left over from a previous month — showing last month's numbers
+    // under "Completed This Month" would be misleading on the 1st.
+    setMonthlyDone(md && md.month === today.slice(0, 7) ? md : null);
+  }
+
   // Trailing 15 months of cached aggregates, feeding the Technicians Needed
   // forecast. Shared by the initial load and by Refresh -- a refresh that
   // recomputed these documents must re-read them, or the forecast keeps using
@@ -435,11 +447,7 @@ export default function DashboardPage() {
       }));
 
       // Cached completed-this-month aggregate (Initials / Specialty / Wildlife).
-      // Ignore a doc left over from a previous month — showing last month's
-      // numbers under "Completed This Month" would be misleading on the 1st.
-      const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
-      const md = mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null;
-      setMonthlyDone(md && md.month === today.slice(0, 7) ? md : null);
+      await loadMonthlyDone(companyId);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
       setTechs(techSnap.docs.map(d => {
@@ -552,7 +560,9 @@ export default function DashboardPage() {
       } else {
         // Both readers of these documents, not just the range cards: the forecast
         // reads recentDone, which would otherwise keep the superseded totals.
-        await Promise.all([loadRangeDone(), loadRecentDone(companyId)]);
+        // Every reader of these documents: the range cards, the forecast, and the
+        // current-month cards (a period covering this month rewrites that doc too).
+        await Promise.all([loadRangeDone(), loadRecentDone(companyId), loadMonthlyDone(companyId)]);
         toast.success(pending.length > 0 ? `History refreshed — ${pending.length} month(s) still pending` : "History refreshed");
       }
     } catch {
