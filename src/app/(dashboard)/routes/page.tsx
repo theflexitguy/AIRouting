@@ -23,6 +23,7 @@ import {
   DriveTimeHonestyBanner,
   DriveTimeSourceBadge,
   ExceptionFirstCopy,
+  GenerateExceptionQueue,
   PausedGenerateEmptyState,
   RoutingStatusPanel,
   SensaiGenerateHints,
@@ -41,6 +42,7 @@ import {
   chicagoTodayIso,
   clampGenerateMaxDriveMinutes,
   clampGenerateMaxStops,
+  defaultGenerateHorizon,
   displayDriveTimeSource,
   driveTimeSourceBadgeHtml,
   driveTimeSourceBadgeLabel,
@@ -50,7 +52,9 @@ import {
   outsideSensaiStandard,
   slinkyWeekWarning,
   trustedRoadMinutes,
+  validateGenerateHorizon,
 } from "@/lib/routing/drive-time-honesty";
+import type { GenerateException } from "@/lib/routing/generate-selection";
 import { canonicalRouteGroup } from "@/lib/route-groups";
 import { deriveServiceLine } from "@/lib/routing/service-line";
 import { TARGET_SERVICE_LINE_LABELS } from "@/lib/metrics/operational";
@@ -1021,9 +1025,10 @@ function DroppableStopList({ routeId, enabled, children }: {
 
 export default function RoutesPage() {
   const { userProfile } = useAuth();
-  const [startDate, setStartDate] = useState(format(new Date(), "yyyy-MM-dd"));
-  // Default the Route Builder to today only; widen the range manually as needed.
-  const [endDate, setEndDate] = useState(format(new Date(), "yyyy-MM-dd"));
+  const horizonDefaults = defaultGenerateHorizon(chicagoTodayIso());
+  const [startDate, setStartDate] = useState(horizonDefaults.startDate);
+  // Default generate window: today+2 through ~1 week (Office 101).
+  const [endDate, setEndDate] = useState(horizonDefaults.endDate);
   const [maxStops, setMaxStops] = useState<number>(SENSAI_DEFAULT_MAX_STOPS);
   const [maxDriveTime, setMaxDriveTime] = useState<number>(SENSAI_MAX_DRIVE_MINUTES);
   const [routingStatus, setRoutingStatus] = useState<RoutingStatusSummary | null>(null);
@@ -1060,6 +1065,18 @@ export default function RoutesPage() {
       JSON.stringify({ targetStops: maxStops, maxStops, maxDriveTime }),
     );
   }, [maxStops, maxDriveTime]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = sessionStorage.getItem("routeiq.generateExceptions.v1");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as GenerateException[];
+      if (Array.isArray(parsed)) setGenerateExceptions(parsed);
+    } catch {
+      // ignore
+    }
+  }, []);
   const [selectedDates, setSelectedDates] = useState<string[]>([]); // which days to show (multi-select)
   const [techs, setTechs] = useState<Technician[]>([]);
   const [selectedTechIds, setSelectedTechIds] = useState<string[]>([]);
@@ -1075,6 +1092,7 @@ export default function RoutesPage() {
   const [genStage, setGenStage] = useState("");
   const [genResult, setGenResult] = useState<string | null>(null);
   const [genError, setGenError] = useState<string | null>(null);
+  const [generateExceptions, setGenerateExceptions] = useState<GenerateException[] | null>(null);
   const [approving, setApproving] = useState<string | null>(null);
   const [geocodingStops, setGeocodingStops] = useState(false);
   const [mapLoaded, setMapLoaded] = useState(false);
@@ -1336,6 +1354,11 @@ export default function RoutesPage() {
     () => horizonGuidance(startDate, chicagoTodayIso()),
     [startDate],
   );
+  const generateHorizonCheck = useMemo(
+    () => validateGenerateHorizon(startDate, endDate, chicagoTodayIso()),
+    [startDate, endDate],
+  );
+  const generateHorizonBlocked = !generateHorizonCheck.ok;
   const slinkyMessage = useMemo(() => {
     const stopsByWeek: Record<string, number> = {};
     for (const tr of visibleRoutes) {
@@ -2807,6 +2830,15 @@ export default function RoutesPage() {
       toast.error("Generate refused — Google APIs are paused.");
       return;
     }
+    if (!rebalanceScheduled) {
+      const horizon = validateGenerateHorizon(startDate, endDate, chicagoTodayIso());
+      if (!horizon.ok) {
+        const msg = horizon.errors[0] || "Generate dates are outside the Office 101 build window.";
+        setGenError(msg);
+        toast.error(msg);
+        return;
+      }
+    }
     if (rebalanceScheduled) {
       const ok = window.confirm(
         `Optimize This Day re-proposes ${startDate}'s routes: scheduled stops keep their day but may move between the selected technicians, balanced to ${maxStops} stops and ${maxDriveTime} min drive per route. Nothing changes in FieldRoutes until you Approve.`,
@@ -2860,6 +2892,13 @@ export default function RoutesPage() {
         setGenResult(null);
         const warnings = Array.isArray(data.warnings) ? data.warnings : [];
         warnings.forEach((w) => toast.warning(String(w), { duration: 8000 }));
+        const exceptions = Array.isArray(data.exceptions) ? (data.exceptions as GenerateException[]) : [];
+        setGenerateExceptions(exceptions);
+        try {
+          sessionStorage.setItem("routeiq.generateExceptions.v1", JSON.stringify(exceptions));
+        } catch {
+          // ignore quota
+        }
         await loadJobsForRange(userProfile.companyId);
       } else {
         const errorText = String(data.error || "Route generation failed");
@@ -3308,9 +3347,19 @@ export default function RoutesPage() {
         {/* Controls bar */}
         <div className="p-3 lg:p-4 border-b border-border/60 flex flex-wrap gap-2.5 items-center bg-background/95 backdrop-blur-sm no-print">
           <div className="flex items-center gap-2">
-            <DatePicker value={startDate} onChange={setStartDate} placeholder="Start date" className="h-9" />
+            <DatePicker
+              value={startDate}
+              onChange={setStartDate}
+              placeholder="Start date"
+              className="h-9"
+            />
             <span className="text-muted-foreground text-sm">to</span>
-            <DatePicker value={endDate} onChange={setEndDate} placeholder="End date" className="h-9" />
+            <DatePicker
+              value={endDate}
+              onChange={setEndDate}
+              placeholder="End date"
+              className="h-9"
+            />
           </div>
           <div className="flex items-center gap-3 border-l border-border/60 pl-3">
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -3401,10 +3450,12 @@ export default function RoutesPage() {
             </Button>
             <Button
               onClick={() => generateRoutes()}
-              disabled={generating || selectedTechIds.length === 0 || routingPaused}
+              disabled={generating || selectedTechIds.length === 0 || routingPaused || generateHorizonBlocked}
               title={
                 routingPaused
                   ? "Generate is refused while GOOGLE_APIS_PAUSED is set — no silent haversine success."
+                  : generateHorizonBlocked
+                  ? generateHorizonCheck.errors[0] || "Generate dates must be 2 days–2 weeks out."
                   : "Generate proposed routes from the selected techs and dates"
               }
               className="bg-blue-500 hover:bg-blue-600 text-white h-9 text-sm"
@@ -3438,9 +3489,21 @@ export default function RoutesPage() {
               overrideWarning={
                 outsideSensaiStandard(maxStops, maxDriveTime) ? SENSAI_OVERRIDE_WARNING : null
               }
+              horizonErrors={generateHorizonBlocked ? generateHorizonCheck.errors : undefined}
             />
           </div>
         </div>
+        <GenerateExceptionQueue
+          exceptions={generateExceptions}
+          onDismiss={() => {
+            setGenerateExceptions(null);
+            try {
+              sessionStorage.removeItem("routeiq.generateExceptions.v1");
+            } catch {
+              // ignore
+            }
+          }}
+        />
 
         {showJobPoolLayer && (
           <div className="px-3 lg:px-4 py-2 border-b border-cyan-500/20 bg-cyan-500/5 flex flex-wrap items-center gap-2 no-print">
