@@ -11,6 +11,7 @@ import {
   hasGoogleRoutesApiKey,
 } from "@/lib/google-routing";
 import { optimizeTours, routeOptimizationConfig } from "@/lib/google-route-optimization";
+import { routingStatusSummaryPayload } from "@/lib/routing/drive-time-honesty";
 
 // Live health check for the two Google services routing depends on. These are
 // DIFFERENT products with DIFFERENT auth, which is easy to get wrong:
@@ -18,19 +19,26 @@ import { optimizeTours, routeOptimizationConfig } from "@/lib/google-route-optim
 //   Route Optimization API -> assignment + sequencing, OAuth service account
 //                             (a Maps API key does NOT work here)
 //
-//   GET /api/admin/routing-status[?companyId=...][&summary=1]
+//   GET /api/admin/routing-status?summary=1
+//     Public, cheap: { paused, probed, generateRefused, summary } only.
+//     No company data, no GCP identity, no Google calls.
 //
-// summary=1 (or GOOGLE_APIS_PAUSED) never makes a billable Google call — the
-// Routes tab uses that mode so loading the panel cannot spend.
+//   GET /api/admin/routing-status[?companyId=...]
+//     Full probe + recentRoutes. Requires CRON_SECRET (same as other admin
+//     cron routes). Never returns this payload to unauthenticated callers.
 
 const PROBE_A = { lat: 36.3729, lng: -94.2088 };
 const PROBE_B = { lat: 36.3345, lng: -94.1574 };
 
-const PAUSED_SUMMARY =
-  "Google APIs are PAUSED (GOOGLE_APIS_PAUSED). No billable calls are being made. " +
-  "Drive times on Routes are ESTIMATE (straight-line), polylines are dashed stop-to-stop — never fake snapped roads. " +
-  "Route generation is refused so we never return a silent haversine success. " +
-  "The FieldRoutes sync and the dashboard are unaffected. Remove the variable in Vercel and redeploy to resume.";
+function authorized(request: NextRequest): boolean {
+  const secret = (process.env.CRON_SECRET || "").trim();
+  if (!secret) return false;
+  const auth = request.headers.get("authorization") || "";
+  if (auth === `Bearer ${secret}`) return true;
+  if ((request.headers.get("x-cron-secret") || "") === secret) return true;
+  if (new URL(request.url).searchParams.get("secret") === secret) return true;
+  return false;
+}
 
 async function loadRecentRoutes(companyIdParam: string) {
   try {
@@ -68,10 +76,18 @@ async function loadRecentRoutes(companyIdParam: string) {
 
 export async function GET(request: NextRequest) {
   const url = new URL(request.url);
-  const companyIdParam = url.searchParams.get("companyId") || "";
   const summaryOnly = url.searchParams.get("summary") === "1" || url.searchParams.get("probe") === "0";
   const paused = googleApisPaused();
-  const skipProbes = paused || summaryOnly;
+
+  if (summaryOnly) {
+    return NextResponse.json(routingStatusSummaryPayload(paused));
+  }
+
+  if (!authorized(request)) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+
+  const companyIdParam = url.searchParams.get("companyId") || "";
   const config = routeOptimizationConfig();
   const lastRoutes = await loadRecentRoutes(companyIdParam);
 
@@ -86,22 +102,18 @@ export async function GET(request: NextRequest) {
     serviceAccountEmail: config.serviceAccountEmail,
   };
 
-  if (skipProbes) {
+  if (paused) {
     return NextResponse.json({
       healthy: false,
-      paused,
+      paused: true,
       probed: false,
-      generateRefused: paused,
-      summary: paused
-        ? PAUSED_SUMMARY
-        : "Summary only — live Google probes skipped so this request cannot bill. Pass without ?summary=1 to probe (unpaused deployments only).",
+      generateRefused: true,
+      summary: routingStatusSummaryPayload(true).summary,
       routesApi: routesApiBase,
       routeOptimization: {
         ...optimizationBase,
         ok: false,
-        hint: paused
-          ? "Route Optimization is not called while GOOGLE_APIS_PAUSED is set."
-          : "Live probe skipped (summary mode).",
+        hint: "Route Optimization is not called while GOOGLE_APIS_PAUSED is set.",
       },
       recentRoutes: lastRoutes,
     });

@@ -32,14 +32,24 @@ import {
 import { parseSchedulingRequest, CRITICAL_CLASSES } from "@/lib/scheduling-constraints";
 import {
   SENSAI_DEFAULT_MAX_STOPS,
+  SENSAI_HARD_MAX_DRIVE_MINUTES,
+  SENSAI_HARD_MAX_STOPS,
   SENSAI_MAX_DRIVE_MINUTES,
+  SENSAI_MIN_DRIVE_MINUTES,
+  SENSAI_MIN_STOPS,
+  SENSAI_OVERRIDE_WARNING,
   chicagoTodayIso,
+  clampGenerateMaxDriveMinutes,
+  clampGenerateMaxStops,
+  displayDriveTimeSource,
   driveTimeSourceBadgeHtml,
   driveTimeSourceBadgeLabel,
   driveTimeSourceKind,
   horizonGuidance,
   isoWeekKey,
+  outsideSensaiStandard,
   slinkyWeekWarning,
+  trustedRoadMinutes,
 } from "@/lib/routing/drive-time-honesty";
 import { canonicalRouteGroup } from "@/lib/route-groups";
 import { deriveServiceLine } from "@/lib/routing/service-line";
@@ -643,14 +653,21 @@ function getRouteProductionValue(stopSequence: string[], jobsById: Record<string
   }, 0);
 }
 
-function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roadDriveMinutes?: number) {
+function getRouteDisplayMetrics(
+  route: Route,
+  jobsById: Record<string, Job>,
+  opts: { roadDriveMinutes?: number; roadDriveSource?: string; paused?: boolean } = {},
+) {
   const estimated = estimateRouteMetrics(route.stopSequence, jobsById);
-  // Prefer a freshly-fetched real Google road drive time when available (synced
-  // routes otherwise carry only a straight-line haversine estimate). Fall back to
-  // the stored value, then to the estimate. Never treat an upgrade as road time
-  // unless the caller passed a trusted Routes API minute count.
-  const driveMinutes = Number.isFinite(roadDriveMinutes)
-    ? Math.round(Number(roadDriveMinutes))
+  // ROAD minutes only when the caller passes a trusted Routes API source and
+  // Google is not paused. A bare minute count never mints a ROAD badge.
+  const upgradeMinutes = trustedRoadMinutes(
+    opts.roadDriveMinutes,
+    opts.roadDriveSource,
+    opts.paused,
+  );
+  const driveMinutes = upgradeMinutes !== undefined
+    ? Math.round(upgradeMinutes)
     : Number.isFinite(Number(route.totalDriveTimeMinutes))
       ? Math.round(Number(route.totalDriveTimeMinutes))
       : estimated.totalDriveTimeMinutes;
@@ -659,9 +676,10 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roa
   // totalWorkMinutes: on a mixed/merged route it was computed over a subset of
   // stops, which produced the impossible "DAY < SERVICE" the dispatcher saw.
   const workMinutes = driveMinutes + serviceMinutes;
-  const driveTimeSource = Number.isFinite(roadDriveMinutes)
-    ? "routes_api_polyline"
-    : route.driveTimeSource || estimated.driveTimeSource || "haversine_fallback";
+  const storedSource = upgradeMinutes !== undefined
+    ? opts.roadDriveSource
+    : route.driveTimeSource || estimated.driveTimeSource;
+  const driveTimeSource = displayDriveTimeSource(storedSource, opts.paused);
 
   return {
     stops: route.stopSequence.length,
@@ -670,6 +688,19 @@ function getRouteDisplayMetrics(route: Route, jobsById: Record<string, Job>, roa
     workMinutes,
     productionValue: getRouteProductionValue(route.stopSequence, jobsById),
     driveTimeSource,
+  };
+}
+
+function roadDisplayOpts(
+  routeId: string,
+  roadDriveByRouteId: Record<string, number>,
+  paused?: boolean,
+) {
+  const minutes = roadDriveByRouteId[routeId];
+  return {
+    paused,
+    roadDriveMinutes: minutes,
+    roadDriveSource: Number.isFinite(minutes) ? "routes_api_polyline" : undefined,
   };
 }
 
@@ -739,8 +770,16 @@ function escapeHtml(value: unknown) {
     .replace(/'/g, "&#39;");
 }
 
-function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>, roadDriveMinutes?: number) {
-  const stats = getRouteDisplayMetrics(tr.route, jobsById, roadDriveMinutes);
+function routeStatsHtml(
+  tr: TechRoute,
+  jobsById: Record<string, Job>,
+  opts: { roadDriveMinutes?: number; roadDriveSource?: string; paused?: boolean } = {},
+) {
+  const stats = getRouteDisplayMetrics(tr.route, jobsById, opts);
+  const estimate = driveTimeSourceKind(stats.driveTimeSource) === "estimate";
+  const estimateFooter = estimate
+    ? `<div style="color:#b45309;font-size:11px;font-weight:700;margin-top:6px">ESTIMATE — ${opts.paused ? "Google paused; stored road times labeled ESTIMATE" : "straight-line, not snapped roads"}</div>`
+    : "";
   return `<div style="color:#111;padding:8px;min-width:220px;max-width:280px">
     <div style="font-weight:700;margin-bottom:2px">${escapeHtml(tr.tech.name)}</div>
     <div style="color:#666;font-size:12px;margin-bottom:8px">${escapeHtml(tr.route.date)} · ${stats.stops} stops</div>
@@ -753,6 +792,7 @@ function routeStatsHtml(tr: TechRoute, jobsById: Record<string, Job>, roadDriveM
         <div style="font-size:18px;font-weight:800">${formatTime(stats.workMinutes)}</div>
       </div>
     </div>
+    ${estimateFooter}
   </div>`;
 }
 
@@ -782,12 +822,17 @@ interface TechRoute {
 
 interface StopMenuTarget { routeId: string; techName: string; color: string; date: string; }
 
-function RoutePanelStats({ route, jobsById, roadDriveMinutes }: {
+function RoutePanelStats({ route, jobsById, roadDriveMinutes, paused }: {
   route: Route;
   jobsById: Record<string, Job>;
   roadDriveMinutes?: number;
+  paused?: boolean;
 }) {
-  const stats = getRouteDisplayMetrics(route, jobsById, roadDriveMinutes);
+  const stats = getRouteDisplayMetrics(route, jobsById, {
+    roadDriveMinutes,
+    roadDriveSource: Number.isFinite(roadDriveMinutes) ? "routes_api_polyline" : undefined,
+    paused,
+  });
   const routeWithMetrics = route as RouteWithMetrics;
   const sync = routeWithMetrics.fieldRoutesSync;
 
@@ -993,7 +1038,7 @@ export default function RoutesPage() {
       const parsed = JSON.parse(raw) as { maxStops?: number; targetStops?: number; maxDriveTime?: number };
       const targetStops = typeof parsed.targetStops === "number" ? parsed.targetStops : parsed.maxStops;
       if (typeof targetStops === "number" && targetStops > 0) {
-        setMaxStops(targetStops);
+        setMaxStops(clampGenerateMaxStops(targetStops));
       }
       // v1 defaulted to 240; treat that as unset so SensAI's 60 min cap applies.
       if (
@@ -1001,7 +1046,7 @@ export default function RoutesPage() {
         parsed.maxDriveTime > 0 &&
         parsed.maxDriveTime !== 240
       ) {
-        setMaxDriveTime(parsed.maxDriveTime);
+        setMaxDriveTime(clampGenerateMaxDriveMinutes(parsed.maxDriveTime));
       }
     } catch {
       // ignore malformed localStorage
@@ -1104,8 +1149,7 @@ export default function RoutesPage() {
 
   useEffect(() => {
     let cancelled = false;
-    const companyId = userProfile?.companyId || "";
-    fetch(`/api/admin/routing-status?summary=1${companyId ? `&companyId=${encodeURIComponent(companyId)}` : ""}`)
+    fetch("/api/admin/routing-status?summary=1")
       .then((res) => res.json())
       .then((data) => {
         if (cancelled || !data || typeof data !== "object") return;
@@ -1117,7 +1161,7 @@ export default function RoutesPage() {
     return () => {
       cancelled = true;
     };
-  }, [userProfile?.companyId]);
+  }, []);
 
   const actualRoutedJobIds = useMemo(() => {
     const ids = new Set<string>();
@@ -1302,11 +1346,12 @@ export default function RoutesPage() {
     return slinkyWeekWarning(stopsByWeek);
   }, [visibleRoutes]);
   const estimateRouteCount = useMemo(() => {
+    if (routingPaused) return visibleRoutes.length;
     return visibleRoutes.filter((tr) => {
       if (Number.isFinite(roadDriveByRouteId[tr.route.id])) return false;
       return driveTimeSourceKind(tr.route.driveTimeSource) !== "road";
     }).length;
-  }, [roadDriveByRouteId, visibleRoutes]);
+  }, [roadDriveByRouteId, routingPaused, visibleRoutes]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2431,7 +2476,7 @@ export default function RoutesPage() {
             ? clickReorderSequence.indexOf(job.id) + 1
             : 0;
         const clickOrderActive = clickReorderRouteId === routeId;
-        const routeStats = getRouteDisplayMetrics(tr.route, allJobs, roadDriveByRouteId[tr.route.id]);
+        const routeStats = getRouteDisplayMetrics(tr.route, allJobs, roadDisplayOpts(tr.route.id, roadDriveByRouteId, routingPaused));
         const stopProduction = calculateStopProductionValue(job);
         const lastServiced = getSubscriptionLastServiced(job);
 
@@ -2560,7 +2605,8 @@ export default function RoutesPage() {
       });
 
       if (path.length > 1) {
-        const estimateHtml = routeStatsHtml(tr, allJobs, roadDriveByRouteId[tr.route.id]);
+        const displayOpts = roadDisplayOpts(tr.route.id, roadDriveByRouteId, routingPaused);
+        const estimateHtml = routeStatsHtml(tr, allJobs, displayOpts);
         const polyline = new window.google.maps.Polyline({
           path,
           geodesic: false,
@@ -2571,7 +2617,7 @@ export default function RoutesPage() {
         });
         styleRoutePolyline(polyline, color, "estimate");
         const routeInfoWindow = new window.google.maps.InfoWindow({
-          content: `${estimateHtml}<div style="color:#b45309;font-size:11px;font-weight:700;margin-top:6px">ESTIMATE — straight-line, not snapped roads</div>`,
+          content: estimateHtml,
           disableAutoPan: true,
         });
         polyline.addListener("click", (event: google.maps.MapMouseEvent) => {
@@ -2601,7 +2647,7 @@ export default function RoutesPage() {
           if (cancelled || roadPath.length < 2) return;
           styleRoutePolyline(polyline, color, "road");
           polyline.setPath(roadPath);
-          routeInfoWindow.setContent(routeStatsHtml(tr, allJobs, roadDriveByRouteId[tr.route.id]));
+          routeInfoWindow.setContent(routeStatsHtml(tr, allJobs, roadDisplayOpts(tr.route.id, roadDriveByRouteId, false)));
         };
 
         if (
@@ -3196,7 +3242,7 @@ export default function RoutesPage() {
 
   const handlePrint = (tr: TechRoute) => {
     const jobs = getJobsForRoute(tr);
-    const stats = getRouteDisplayMetrics(tr.route, allJobs);
+    const stats = getRouteDisplayMetrics(tr.route, allJobs, { paused: routingPaused });
     const w = window.open("", "_blank");
     if (!w) return;
     w.document.write(`<html><head><title>Route - ${tr.tech.name} - ${tr.route.date}</title>
@@ -3216,7 +3262,7 @@ export default function RoutesPage() {
   const handleShare = async (tr: TechRoute) => {
     if (!userProfile?.companyId) return;
     const jobs = getJobsForRoute(tr);
-    const stats = getRouteDisplayMetrics(tr.route, allJobs);
+    const stats = getRouteDisplayMetrics(tr.route, allJobs, { paused: routingPaused });
     const token = crypto.randomUUID();
     const expires = new Date();
     expires.setDate(expires.getDate() + 7);
@@ -3271,25 +3317,25 @@ export default function RoutesPage() {
               Target stops
               <Input
                 type="number"
-                min={1}
-                max={30}
+                min={SENSAI_MIN_STOPS}
+                max={SENSAI_HARD_MAX_STOPS}
                 value={maxStops}
-                onChange={(e) => setMaxStops(Math.max(1, parseInt(e.target.value) || SENSAI_DEFAULT_MAX_STOPS))}
+                onChange={(e) => setMaxStops(clampGenerateMaxStops(e.target.value))}
                 className="h-9 w-16 text-sm"
-                title="Office 101: 14–16 typical, Bella Vista ~12. Tuesday −3 stops (~9am start). Saturday half-day."
+                title="Office 101: 14–16 typical, Bella Vista ~12. Hard-capped at 18. Tuesday −3 stops (~9am start). Saturday half-day."
               />
             </label>
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
               Max drive (min)
               <Input
                 type="number"
-                min={15}
-                max={600}
+                min={SENSAI_MIN_DRIVE_MINUTES}
+                max={SENSAI_HARD_MAX_DRIVE_MINUTES}
                 step={15}
                 value={maxDriveTime}
-                onChange={(e) => setMaxDriveTime(Math.max(15, parseInt(e.target.value) || SENSAI_MAX_DRIVE_MINUTES))}
+                onChange={(e) => setMaxDriveTime(clampGenerateMaxDriveMinutes(e.target.value))}
                 className="h-9 w-20 text-sm"
-                title="Office 101: ~60 minutes TOTAL drive for the day."
+                title="Office 101: ~60 minutes TOTAL drive. Hard-capped at 90."
               />
             </label>
           </div>
@@ -3387,7 +3433,12 @@ export default function RoutesPage() {
           <RoutingStatusPanel status={routingStatus} />
           <div className="space-y-0.5 min-w-[220px] flex-1">
             <ExceptionFirstCopy />
-            <SensaiGenerateHints horizon={generateHorizon} />
+            <SensaiGenerateHints
+              horizon={generateHorizon}
+              overrideWarning={
+                outsideSensaiStandard(maxStops, maxDriveTime) ? SENSAI_OVERRIDE_WARNING : null
+              }
+            />
           </div>
         </div>
 
@@ -3632,7 +3683,7 @@ export default function RoutesPage() {
                     <Calendar className="w-2.5 h-2.5" /> Already scheduled in FieldRoutes
                   </div>
                 )}
-                <RoutePanelStats route={tr.route} jobsById={allJobs} roadDriveMinutes={roadDriveByRouteId[tr.route.id]} />
+                <RoutePanelStats route={tr.route} jobsById={allJobs} roadDriveMinutes={roadDriveByRouteId[tr.route.id]} paused={routingPaused} />
                 <DroppableStopList routeId={tr.route.id} enabled={editMode && !routeReadOnly}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {
@@ -3783,7 +3834,7 @@ export default function RoutesPage() {
                     <Calendar className="w-2.5 h-2.5" /> Already scheduled in FieldRoutes
                   </div>
                 )}
-                <RoutePanelStats route={tr.route} jobsById={allJobs} roadDriveMinutes={roadDriveByRouteId[tr.route.id]} />
+                <RoutePanelStats route={tr.route} jobsById={allJobs} roadDriveMinutes={roadDriveByRouteId[tr.route.id]} paused={routingPaused} />
                 <DroppableStopList routeId={tr.route.id} enabled={editMode && !routeReadOnly}>
                   <SortableContext items={tr.route.stopSequence} strategy={verticalListSortingStrategy}>
                     {panelJobs.map((job, idx) => {

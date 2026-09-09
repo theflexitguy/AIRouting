@@ -21,20 +21,19 @@ import {
 } from "@/lib/google-route-optimization";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { calculateStopProductionValue } from "@/lib/production-value";
-import { deriveServiceLine, serviceLineMeta, type ServiceLine } from "@/lib/routing/service-line";
+import { deriveServiceLine, type ServiceLine } from "@/lib/routing/service-line";
 import {
-  SENSAI_DEFAULT_MAX_STOPS,
-  SENSAI_MAX_DRIVE_MINUTES,
   SENSAI_TUESDAY_STOP_REDUCTION,
-  isBedBugServiceType,
+  SHARED_GENERATE_ROUTE_CLASS,
+  clampGenerateMaxDriveMinutes,
+  clampGenerateMaxStops,
+  generateRouteClass,
   sensaiMaxStopsForDate,
 } from "@/lib/routing/drive-time-honesty";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
-const DEFAULT_MAX_STOPS = SENSAI_DEFAULT_MAX_STOPS;
-const DEFAULT_MAX_DRIVE_MINUTES = SENSAI_MAX_DRIVE_MINUTES;
 // Hard cap on a technician's day: drive + service minutes (Flex rule: keeping
 // the total estimated duration at or under 8 hours every day is a must).
 const DEFAULT_MAX_DAY_MINUTES = 480;
@@ -152,7 +151,7 @@ function jobServiceLine(job: JobDoc): ServiceLine {
  * (termite / GR / bed bugs / commercial / wildlife / lawn) stays off GPC
  * routes and off each other. Shared class is general pest + mosquito only.
  */
-const SHARED_ROUTE_CLASS = "__shared";
+const SHARED_ROUTE_CLASS = SHARED_GENERATE_ROUTE_CLASS;
 
 /**
  * The class of route a job can live on. Own-route / specialty classes never
@@ -160,10 +159,10 @@ const SHARED_ROUTE_CLASS = "__shared";
  * if and only if their classes are compatible.
  */
 function routeClassOf(job: JobDoc): string {
-  if (isBedBugServiceType(String(job.serviceType || ""))) return "bed_bugs";
-  const line = jobServiceLine(job);
-  if (line === "commercial") return "commercial";
-  return serviceLineMeta(line).requiresOwnRoute ? line : SHARED_ROUTE_CLASS;
+  return generateRouteClass({
+    serviceType: String(job.serviceType || ""),
+    serviceLine: jobServiceLine(job),
+  });
 }
 
 function unitCompatibleWithSlotJobs(unitJobsArr: JobDoc[], slotJobs: JobDoc[]): boolean {
@@ -1920,15 +1919,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const maxStops =
-      Number.isFinite(rawMaxStops) && (rawMaxStops as number) > 0
-        ? Math.min(30, Math.floor(rawMaxStops as number))
-        : DEFAULT_MAX_STOPS;
-
-    const maxDriveTime =
-      Number.isFinite(rawMaxDriveTime) && (rawMaxDriveTime as number) > 0
-        ? Math.min(600, Math.floor(rawMaxDriveTime as number))
-        : DEFAULT_MAX_DRIVE_MINUTES;
+    const maxStops = clampGenerateMaxStops(rawMaxStops);
+    const maxDriveTime = clampGenerateMaxDriveMinutes(rawMaxDriveTime);
 
     const maxDayMinutes =
       Number.isFinite(rawMaxDayMinutes) && (rawMaxDayMinutes as number) > 0

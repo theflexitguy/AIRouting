@@ -1,15 +1,25 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  SHARED_GENERATE_ROUTE_CLASS,
+  clampGenerateMaxDriveMinutes,
+  clampGenerateMaxStops,
+  displayDriveTimeSource,
   driveTimeSourceBadgeLabel,
   driveTimeSourceKind,
+  generateRouteClass,
   horizonGuidance,
   isBedBugServiceType,
   isTrustedDriveTimeSource,
   isoWeekKey,
+  outsideSensaiStandard,
   polylineRenderMode,
+  publicRouteGeometryPayload,
+  routingStatusSummaryKeys,
+  routingStatusSummaryPayload,
   sensaiMaxStopsForDate,
   slinkyWeekWarning,
+  trustedRoadMinutes,
   weekdayLabelForIsoDate,
 } from "./drive-time-honesty.ts";
 
@@ -27,6 +37,81 @@ describe("drive-time honesty", () => {
     assert.equal(driveTimeSourceBadgeLabel("routes_api_polyline"), "ROAD");
     assert.equal(polylineRenderMode("haversine_fallback"), "estimate");
     assert.equal(polylineRenderMode("routes_api_polyline"), "road");
+  });
+
+  it("forces ESTIMATE for stored road sources while paused", () => {
+    assert.equal(displayDriveTimeSource("routes_api_polyline", true), "haversine_fallback");
+    assert.equal(driveTimeSourceKind("routes_api_polyline", true), "estimate");
+    assert.equal(driveTimeSourceBadgeLabel("routes_api_polyline", true), "ESTIMATE");
+    assert.equal(polylineRenderMode("routes_api_polyline", true), "estimate");
+    assert.equal(trustedRoadMinutes(42, "routes_api_polyline", true), undefined);
+    assert.equal(trustedRoadMinutes(42, "routes_api_polyline", false), 42);
+    assert.equal(trustedRoadMinutes(42, undefined, false), undefined);
+    assert.equal(trustedRoadMinutes(42, "haversine_fallback", false), undefined);
+  });
+
+  it("strips geometry path when estimate or paused", () => {
+    const road = publicRouteGeometryPayload({
+      driveTimeSource: "routes_api_polyline",
+      polylineSource: "routes_api_polyline",
+      encodedPolyline: "abc",
+      path: [{ lat: 1, lng: 2 }],
+      driveMinutes: 12.34,
+      distanceMeters: 1000,
+      status: "OK",
+      failedSegments: 0,
+      paused: false,
+    });
+    assert.equal(road.estimate, false);
+    assert.deepEqual(road.path, [{ lat: 1, lng: 2 }]);
+
+    const pausedStoredRoad = publicRouteGeometryPayload({
+      driveTimeSource: "routes_api_polyline",
+      polylineSource: "routes_api_polyline",
+      encodedPolyline: "abc",
+      path: [{ lat: 1, lng: 2 }],
+      driveMinutes: 12.34,
+      status: "OK",
+      failedSegments: 0,
+      paused: true,
+    });
+    assert.equal(pausedStoredRoad.estimate, true);
+    assert.equal(pausedStoredRoad.paused, true);
+    assert.deepEqual(pausedStoredRoad.path, []);
+    assert.equal(pausedStoredRoad.encodedPolyline, undefined);
+    assert.equal(pausedStoredRoad.driveTimeSource, "haversine_fallback");
+  });
+
+  it("keeps routing-status summary to four public fields", () => {
+    const payload = routingStatusSummaryPayload(true);
+    assert.deepEqual(Object.keys(payload).sort(), routingStatusSummaryKeys());
+    assert.equal(payload.paused, true);
+    assert.equal(payload.probed, false);
+    assert.equal(payload.generateRefused, true);
+    assert.equal("recentRoutes" in payload, false);
+    assert.equal("serviceAccountEmail" in payload, false);
+    assert.equal("projectId" in payload, false);
+  });
+
+  it("hard-caps generate stops/drive at 18/90", () => {
+    assert.equal(clampGenerateMaxStops(30), 18);
+    assert.equal(clampGenerateMaxStops(16), 16);
+    assert.equal(clampGenerateMaxStops(undefined), 16);
+    assert.equal(clampGenerateMaxDriveMinutes(600), 90);
+    assert.equal(clampGenerateMaxDriveMinutes(60), 60);
+    assert.equal(clampGenerateMaxDriveMinutes(undefined), 60);
+    assert.equal(outsideSensaiStandard(16, 60), false);
+    assert.equal(outsideSensaiStandard(17, 60), true);
+    assert.equal(outsideSensaiStandard(16, 75), true);
+  });
+
+  it("classes commercial and bed bugs off shared GPC", () => {
+    assert.equal(generateRouteClass({ serviceLine: "general" }), SHARED_GENERATE_ROUTE_CLASS);
+    assert.equal(generateRouteClass({ serviceLine: "mosquito" }), SHARED_GENERATE_ROUTE_CLASS);
+    assert.equal(generateRouteClass({ serviceLine: "commercial" }), "commercial");
+    assert.equal(generateRouteClass({ serviceType: "Bed Bugs", serviceLine: "general" }), "bed_bugs");
+    assert.equal(generateRouteClass({ serviceLine: "termite" }), "termite");
+    assert.equal(generateRouteClass({ serviceLine: "gr" }), "gr");
   });
 
   it("applies Tuesday and Saturday SensAI stop caps", () => {

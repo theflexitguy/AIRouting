@@ -11,19 +11,9 @@ import {
 
 export type RoutingStatusSummary = {
   paused?: boolean;
-  healthy?: boolean;
   probed?: boolean;
   summary?: string;
   generateRefused?: boolean;
-  routesApi?: {
-    apiKeyConfigured?: boolean;
-    mapsKeyPresent?: boolean;
-  };
-  routeOptimization?: {
-    configured?: boolean;
-    credentialSource?: string;
-    projectId?: string;
-  };
 };
 
 export function DriveTimeSourceBadge({
@@ -85,13 +75,13 @@ export function DriveTimeHonestyBanner({
       <div className="min-w-0 space-y-1">
         <p className="text-sm font-semibold text-amber-100">
           {paused
-            ? "Google routing is PAUSED — drive times are estimates, not roads"
+            ? "Google routing is PAUSED — every drive time is ESTIMATE"
             : "Some drive times are ESTIMATE (straight-line), not road-snapped"}
         </p>
         <p className="text-xs text-amber-200/90 leading-relaxed">
           {paused
             ? status?.summary ||
-              "GOOGLE_APIS_PAUSED is on. Generate is refused so RouteIQ never silently shows haversine as a real drive. Dashed map lines are stop-to-stop estimates — not snapped roads."
+              "While paused, panel / print / map / day stats all badge ESTIMATE — including stored routes_api_* minutes from before the pause (those values may be stale). Dashed lines are stop-to-stop, not snapped roads. Generate is refused."
             : `${estimateRouteCount} of ${totalRouteCount} visible route${totalRouteCount === 1 ? "" : "s"} ${estimateRouteCount === 1 ? "uses" : "use"} straight-line minutes. Badge every drive metric ESTIMATE until Routes API returns a road time.`}
         </p>
       </div>
@@ -108,9 +98,7 @@ export function RoutingStatusPanel({ status }: { status: RoutingStatusSummary | 
         "rounded-md border px-2.5 py-1.5 text-[11px] leading-snug max-w-xl",
         paused
           ? "border-amber-500/30 bg-amber-500/8 text-amber-100"
-          : status.healthy
-            ? "border-emerald-500/25 bg-emerald-500/8 text-emerald-200"
-            : "border-border/60 bg-accent/20 text-muted-foreground",
+          : "border-border/60 bg-accent/20 text-muted-foreground",
       )}
     >
       <div className="flex items-start gap-1.5">
@@ -131,12 +119,17 @@ export function RoutingStatusPanel({ status }: { status: RoutingStatusSummary | 
 
 export function SensaiGenerateHints({
   horizon,
+  overrideWarning,
 }: {
   horizon: HorizonGuidance | null;
+  overrideWarning?: string | null;
 }) {
   return (
     <div className="text-[10px] text-muted-foreground/80 leading-snug max-w-md">
       <p>{SENSAI_GENERATE_HELP}</p>
+      {overrideWarning ? (
+        <p className="mt-0.5 font-semibold text-amber-300">{overrideWarning}</p>
+      ) : null}
       {horizon?.message ? (
         <p
           className={cn(
