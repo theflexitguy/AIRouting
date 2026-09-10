@@ -6,10 +6,22 @@ import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
-import { computeMonthlyDone } from "@/lib/fieldroutes/monthly-done";
+import { computeMonthlyDone, MONTHLY_DONE_VERSION } from "@/lib/fieldroutes/monthly-done";
 import { centralTodayISO } from "@/lib/fieldroutes/scope";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
+
+// FieldRoutesClient paces requests MIN_REQUEST_INTERVAL_MS (1.1s) apart and a
+// month costs ~5 of them, so ~12 months is already past this route's
+// maxDuration of 60s. Stop well short and hand the rest back as
+// remainingMonths so the caller can continue, rather than being killed
+// mid-migration with the cache half-updated.
+const TIME_BUDGET_MS = 40_000;
+
+// A month costs ~5 FieldRoutes reads. Starting one with less headroom than this
+// risks the cap landing mid-computation, which computeMonthlyDone reports as
+// degraded rather than failing -- don't begin a month we can't finish.
+const MONTH_READ_ESTIMATE = 8;
 const clean = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
 // Computes completed-appointment aggregates (Initials / Specialty / Wildlife /
@@ -36,7 +48,12 @@ function recentMonthKeys(today: string, n: number): string[] {
   return keys;
 }
 
-async function handle(companyIdParam: string | undefined, monthParam?: string, monthsParam?: string) {
+async function handle(
+  companyIdParam: string | undefined,
+  monthParam?: string,
+  monthsParam?: string,
+  monthKeysParam?: string[],
+) {
   try {
     const db = adminDb();
 
@@ -85,28 +102,61 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
 
     const today = centralTodayISO();
     // Which months to compute: an explicit month, a backfill of the last N, or
-    // just the current month. Only backfill months not already cached (unless a
-    // specific month was requested, which always recomputes).
+    // just the current month. A backfill fills gaps and refreshes months cached
+    // under an older classifier (unless a specific month was requested, which
+    // always recomputes).
     let monthsToCompute: string[];
     const backfillN = Math.min(24, Math.max(0, Number(monthsParam) || 0));
+    // Explicit keys win: a period like "last month" or "last quarter" is a
+    // specific set of months, and deriving it from a COUNT of trailing months
+    // silently refreshes the wrong ones (in September, "last month" is 2026-08,
+    // but a count of 1 resolves to 2026-09 and leaves August stale).
+    const explicitKeys = (monthKeysParam || []).filter((k) => /^\d{4}-\d{2}$/.test(k)).slice(0, 24);
     if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
       monthsToCompute = [monthParam];
-    } else if (backfillN > 0) {
-      const keys = recentMonthKeys(today, backfillN);
+    } else if (explicitKeys.length > 0 || backfillN > 0) {
+      const keys = explicitKeys.length > 0 ? explicitKeys : recentMonthKeys(today, backfillN);
       const existing = await Promise.all(
         keys.map((k) => db.doc(`companies/${companyId}/monthlyDone/${k}`).get()),
       );
-      // Always refresh the current month; only fill gaps for prior months.
-      monthsToCompute = keys.filter((k, i) => k === today.slice(0, 7) || !existing[i].exists);
+      // Always refresh the current month; for prior months fill gaps AND redo any
+      // month cached under an older classifier. The dashboard's history range only
+      // ever sums these documents, so a stale one would report the old bucketing
+      // forever. The budget guard below stops a large re-lift cleanly and the rest
+      // is picked up on the next call.
+      monthsToCompute = keys.filter((k, i) => {
+        if (k === today.slice(0, 7) || !existing[i].exists) return true;
+        return Number(existing[i].data()?.version || 0) < MONTHLY_DONE_VERSION;
+      });
     } else {
       monthsToCompute = [today.slice(0, 7)];
     }
 
     const results: Array<Record<string, unknown>> = [];
+    const remainingMonths: string[] = [];
+    const startedAt = Date.now();
     try {
       for (const mk of monthsToCompute) {
-        if (client.readCount >= budget.remaining) break; // out of budget — stop cleanly
-        const { done, sample } = await computeMonthlyDone(client, today, mk);
+        // Not enough API headroom to finish a month, or close enough to the route
+        // timeout that another would not finish: hand the rest back instead of
+        // starting work that can only end up partial.
+        if (
+          budget.remaining - client.readCount < MONTH_READ_ESTIMATE ||
+          Date.now() - startedAt > TIME_BUDGET_MS
+        ) {
+          remainingMonths.push(mk);
+          continue;
+        }
+        const { done, sample, degraded } = await computeMonthlyDone(client, today, mk);
+        // A degraded month is never persisted. Its zeros are MISSING counts, not
+        // real ones, so writing it would replace a good cached month with partial
+        // data that every reader consumes immediately. Leaving the previous
+        // document in place and reporting the month as pending is strictly better:
+        // stale-but-complete beats fresh-but-wrong, and the next pass redoes it.
+        if (degraded) {
+          remainingMonths.push(mk);
+          continue;
+        }
         await db.doc(`companies/${companyId}/monthlyDone/${done.month}`).set(done);
         if (done.month === today.slice(0, 7)) {
           await db.doc(`companies/${companyId}/fieldRoutesState/monthlyDone`).set(done);
@@ -119,6 +169,9 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
 
     return NextResponse.json({
       computedMonths: results.map((r) => r.month),
+      // Non-empty when this invocation ran out of time or API budget. Call again
+      // with monthKeys set to these to continue; the work already done is saved.
+      remainingMonths,
       results,
       apiReads: client.readCount,
     });
@@ -130,11 +183,23 @@ async function handle(companyIdParam: string | undefined, monthParam?: string, m
 }
 
 export async function POST(request: Request) {
-  const body = (await request.json().catch(() => ({}))) as { companyId?: string; month?: string; months?: string | number };
-  return handle(body.companyId, body.month, body.months !== undefined ? String(body.months) : undefined);
+  const body = (await request.json().catch(() => ({}))) as {
+    companyId?: string;
+    month?: string;
+    months?: string | number;
+    monthKeys?: unknown;
+  };
+  const keys = Array.isArray(body.monthKeys) ? body.monthKeys.map((k) => String(k)) : undefined;
+  return handle(body.companyId, body.month, body.months !== undefined ? String(body.months) : undefined, keys);
 }
 
 export async function GET(request: NextRequest) {
   const params = new URL(request.url).searchParams;
-  return handle(params.get("companyId") || undefined, params.get("month") || undefined, params.get("months") || undefined);
+  const keys = (params.get("monthKeys") || "").split(",").map((k) => k.trim()).filter(Boolean);
+  return handle(
+    params.get("companyId") || undefined,
+    params.get("month") || undefined,
+    params.get("months") || undefined,
+    keys.length > 0 ? keys : undefined,
+  );
 }

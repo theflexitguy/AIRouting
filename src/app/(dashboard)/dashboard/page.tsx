@@ -395,6 +395,30 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userProfile]);
 
+  // The legacy single-doc current-month aggregate behind the "Completed This
+  // Month" cards. A refresh whose period includes the current month recomputes
+  // this document too, so Refresh has to re-read it or those cards keep the
+  // superseded numbers when the user switches back to This month.
+  async function loadMonthlyDone(companyId: string) {
+    const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
+    const md = mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null;
+    // Ignore a doc left over from a previous month — showing last month's numbers
+    // under "Completed This Month" would be misleading on the 1st.
+    setMonthlyDone(md && md.month === today.slice(0, 7) ? md : null);
+  }
+
+  // Trailing 15 months of cached aggregates, feeding the Technicians Needed
+  // forecast. Shared by the initial load and by Refresh -- a refresh that
+  // recomputed these documents must re-read them, or the forecast keeps using
+  // the superseded numbers while the UI reports success.
+  async function loadRecentDone(companyId: string) {
+    const histKeys = trailingMonthKeys(today, 15);
+    const doneSnaps = await Promise.all(
+      histKeys.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
+    );
+    setRecentDone(doneSnaps.filter((s2) => s2.exists()).map((s2) => s2.data() as MonthlyDoneLike));
+  }
+
   async function loadDashboardData(companyId: string) {
     try {
       // One routes read covering the 8-week trend through end of this week (which
@@ -423,11 +447,7 @@ export default function DashboardPage() {
       }));
 
       // Cached completed-this-month aggregate (Initials / Specialty / Wildlife).
-      // Ignore a doc left over from a previous month — showing last month's
-      // numbers under "Completed This Month" would be misleading on the 1st.
-      const mdSnap = await getDoc(doc(db, `companies/${companyId}/fieldRoutesState/monthlyDone`));
-      const md = mdSnap.exists() ? (mdSnap.data() as MonthlyDone) : null;
-      setMonthlyDone(md && md.month === today.slice(0, 7) ? md : null);
+      await loadMonthlyDone(companyId);
 
       const techSnap = await getDocs(collection(db, `companies/${companyId}/technicians`));
       setTechs(techSnap.docs.map(d => {
@@ -447,17 +467,12 @@ export default function DashboardPage() {
       const g = companySnap.exists() ? Number(companySnap.data().forecastMonthlyGrowthPct) : 0;
       setGrowthPct(Number.isFinite(g) && g !== 0 ? String(g) : "0");
 
-      // Trailing 15 months of cached completed-appointment aggregates — the
-      // Technicians Needed forecast reads them two ways: recent run rates AND
-      // year-over-year seasonality (same calendar month a year ago for each of
-      // the next 12 forecast months, plus the year-ago comparison for the recent
-      // trend). Missing docs just mean a fallback to flat recent-3mo until the
-      // history is backfilled via Refresh.
-      const histKeys = trailingMonthKeys(today, 15);
-      const doneSnaps = await Promise.all(
-        histKeys.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`)))
-      );
-      setRecentDone(doneSnaps.filter((s2) => s2.exists()).map((s2) => s2.data() as MonthlyDoneLike));
+      // The Technicians Needed forecast reads these two ways: recent run rates
+      // AND year-over-year seasonality (same calendar month a year ago for each
+      // of the next 12 forecast months, plus the year-ago comparison for the
+      // recent trend). Missing docs just mean a fallback to flat recent-3mo
+      // until the history is backfilled via Refresh.
+      await loadRecentDone(companyId);
     } catch (error) {
       console.error("Dashboard data error:", error);
       setRawRoutes([]);
@@ -517,18 +532,38 @@ export default function DashboardPage() {
     if (!companyId) return;
     setRangeRefreshing(true);
     try {
-      const months = monthKeysForPeriod(period, today).length;
-      const res = await fetch("/api/fieldroutes/monthly-done", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ companyId, months }),
-      });
-      if (!res.ok) {
+      // Send the period's actual month keys, not just how many there are: in
+      // September "last month" is 2026-08, and a count of 1 would refresh
+      // 2026-09 instead, leaving the month being viewed stale.
+      let pending = monthKeysForPeriod(period, today);
+      let failed = "";
+      // The endpoint stops short of its timeout on a long re-lift and returns
+      // what it did not reach; continue until nothing is left (bounded).
+      for (let i = 0; i < 8 && pending.length > 0; i++) {
+        const res = await fetch("/api/fieldroutes/monthly-done", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ companyId, monthKeys: pending }),
+        });
         const d = await res.json().catch(() => ({}));
-        toast.error(d.error || "Couldn't refresh history — check API budget.");
+        if (!res.ok) {
+          failed = d.error || "Couldn't refresh history — check API budget.";
+          break;
+        }
+        const remaining: string[] = Array.isArray(d.remainingMonths) ? d.remainingMonths.map(String) : [];
+        // No forward progress (out of API budget, say) — stop rather than spin.
+        if (remaining.length >= pending.length) { pending = remaining; break; }
+        pending = remaining;
+      }
+      if (failed) {
+        toast.error(failed);
       } else {
-        await loadRangeDone();
-        toast.success("History refreshed");
+        // Both readers of these documents, not just the range cards: the forecast
+        // reads recentDone, which would otherwise keep the superseded totals.
+        // Every reader of these documents: the range cards, the forecast, and the
+        // current-month cards (a period covering this month rewrites that doc too).
+        await Promise.all([loadRangeDone(), loadRecentDone(companyId), loadMonthlyDone(companyId)]);
+        toast.success(pending.length > 0 ? `History refreshed — ${pending.length} month(s) still pending` : "History refreshed");
       }
     } catch {
       toast.error("Couldn't refresh history.");

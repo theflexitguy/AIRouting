@@ -17,7 +17,7 @@
 
 import { FieldRoutesClient } from "./client";
 import { centralTodayISO, toDateOnly, num } from "./scope";
-import { deriveServiceLine, ServiceLine } from "@/lib/routing/service-line";
+import { matchServiceLine, ServiceLine } from "@/lib/routing/service-line";
 
 const str = (v: unknown): string => String(v ?? "").trim();
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
@@ -48,7 +48,8 @@ const isReserviceLabel = (n: string): boolean =>
   n.includes("callback");
 
 export interface TrackingClass {
-  line: ServiceLine;
+  /** null when the label names no service line — see matchServiceLine. */
+  line: ServiceLine | null;
   isInitial: boolean;
   isFollowup: boolean;
   isReservice: boolean;
@@ -58,7 +59,9 @@ export interface TrackingClass {
 
 /** Classify a service-type description for the dashboard trackers. */
 export function classifyServiceForTracking(description: string): TrackingClass {
-  const line = deriveServiceLine(description);
+  // matchServiceLine, NOT deriveServiceLine: an unrecognized label must stay
+  // unattributed here instead of defaulting into General Pest (see that function).
+  const line = matchServiceLine(description);
   const n = normalize(description);
   const isInitial = isInitialLabel(description);
   const isFollowup = !isInitial && isFollowupLabel(n);
@@ -69,7 +72,19 @@ export function classifyServiceForTracking(description: string): TrackingClass {
   return { line, isInitial, isFollowup, isReservice, isWildlife, isSpecialty };
 }
 
+/**
+ * Bump whenever the bucketing changes. Cached monthlyDone documents are the ONLY
+ * source the dashboard's history range reads (it never recomputes), so without a
+ * version a definition change silently applies to the current month alone and
+ * every past month keeps reporting the old numbers forever.
+ *
+ * 2: unrecognized service types no longer count as General Pest (matchServiceLine).
+ */
+export const MONTHLY_DONE_VERSION = 2;
+
 export interface MonthlyDone {
+  /** MONTHLY_DONE_VERSION this document was computed under. Absent = pre-versioning. */
+  version: number;
   month: string; // YYYY-MM
   monthStart: string;
   monthEnd: string; // last day of the month (or today, for the current month)
@@ -93,6 +108,9 @@ export interface MonthlyDone {
   newCustomers: number;
   newSubscriptions: number;
   unclassified: number;
+  /** Completed appointments whose service type names no line, by label. Empty is
+   *  the healthy state; entries here are work NOT counted in any line's done. */
+  unclassifiedTypes: Record<string, number>;
 }
 
 const RECURRING_LINES: ServiceLine[] = ["general", "mosquito", "lawn", "termite", "commercial"];
@@ -117,7 +135,14 @@ export async function computeMonthlyDone(
   client: FieldRoutesClient,
   today: string = centralTodayISO(),
   monthKey?: string,
-): Promise<{ done: MonthlyDone; sample: { keys: string[]; rows: Record<string, unknown>[]; serviceTypeFieldUsed: string } }> {
+) : Promise<{
+  done: MonthlyDone;
+  sample: { keys: string[]; rows: Record<string, unknown>[]; serviceTypeFieldUsed: string };
+  /** True when part of the aggregate could not be read (API cap hit mid-run, catalog
+   *  unavailable). The counts are then INCOMPLETE and must not be treated as final. */
+  degraded: boolean;
+}> {
+  let degraded = false;
   const month = monthKey && /^\d{4}-\d{2}$/.test(monthKey) ? monthKey : today.slice(0, 7);
   const monthStart = `${month}-01`;
   const isCurrentMonth = month === today.slice(0, 7);
@@ -135,7 +160,14 @@ export async function computeMonthlyDone(
     }
   } catch {
     // Catalog optional; we fall back to any description on the appointment itself.
+    degraded = true;
   }
+  // A successful-but-empty response does not throw, so the catch above never
+  // fires -- but an empty catalog is just as unusable. Appointments carry their
+  // service type as the numeric `type` id and no text field, so describe() would
+  // return "" for every one and the whole month would bucket as unclassified,
+  // then persist as if it were complete. An office always has service types.
+  if (catalog.size === 0) degraded = true;
 
   // 2) Completed appointments in [monthStart, monthEnd] (status 1 = Completed).
   const apptIds = await client.searchIds("appointment", {
@@ -177,6 +209,12 @@ export async function computeMonthlyDone(
   let grDone = 0;
   let wildlifeDone = 0;
   let unclassified = 0;
+  const unclassifiedTypes: Record<string, number> = {};
+  const dropUnclassified = (label: string) => {
+    unclassified++;
+    const k = label || "(no service type)";
+    unclassifiedTypes[k] = (unclassifiedTypes[k] || 0) + 1;
+  };
   let completed = 0;
 
   for (const a of appts) {
@@ -188,12 +226,19 @@ export async function computeMonthlyDone(
 
     const desc = describe(ar);
     if (!desc) {
-      unclassified++;
+      dropUnclassified("");
       continue;
     }
     const c = classifyServiceForTracking(desc);
     if (c.isInitial) {
-      const base = c.line === "wildlife" ? "wildlife" : c.line;
+      // An initial still has to belong to a line to be counted as one. "Bait Box
+      // Initial" names none, so it lands in unclassifiedTypes rather than being
+      // reported as a General Pest initial.
+      if (!c.line) {
+        dropUnclassified(desc);
+        continue;
+      }
+      const base = c.line;
       if (base in initialsByLine) initialsByLine[base]++;
       else initialsByLine[base] = (initialsByLine[base] || 0) + 1;
       continue;
@@ -215,8 +260,8 @@ export async function computeMonthlyDone(
       if (c.line === "gr") grDone++;
       continue;
     }
-    if (c.line in recurringDoneByLine) recurringDoneByLine[c.line]++;
-    else unclassified++;
+    if (c.line && c.line in recurringDoneByLine) recurringDoneByLine[c.line]++;
+    else dropUnclassified(desc);
   }
 
   const recurringDoneTotal = RECURRING_LINES.reduce((s, l) => s + recurringDoneByLine[l], 0);
@@ -235,6 +280,9 @@ export async function computeMonthlyDone(
       return ids.length;
     } catch (err) {
       console.warn(`[monthly-done] ${module} new-business count failed for ${month}:`, String(err));
+      // A zero here is a MISSING count, not a real one -- the caller must not
+      // persist this month as final (it feeds the forecast's growth rate).
+      degraded = true;
       return 0;
     }
   };
@@ -242,6 +290,7 @@ export async function computeMonthlyDone(
   const newSubscriptions = await countCreated("subscription");
 
   const done: MonthlyDone = {
+    version: MONTHLY_DONE_VERSION,
     month,
     monthStart,
     monthEnd,
@@ -260,6 +309,7 @@ export async function computeMonthlyDone(
     newCustomers,
     newSubscriptions,
     unclassified,
+    unclassifiedTypes,
   };
 
   const sample = {
@@ -278,5 +328,5 @@ export async function computeMonthlyDone(
     serviceTypeFieldUsed: serviceTypeFieldUsed || "(none resolved)",
   };
 
-  return { done, sample };
+  return { done, sample, degraded };
 }
