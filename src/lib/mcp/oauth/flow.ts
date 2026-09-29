@@ -20,7 +20,7 @@ import { SCOPE } from "./config.ts";
 import { RegistrationError, registerClient, resolveClient } from "./clients.ts";
 import { checkAccess, emailAllowed, type GoogleClient } from "./google.ts";
 import { consentPage, errorPage } from "./html.ts";
-import { signJwt, verifyJwt } from "./jwt.ts";
+import { MAX_JWT_CHARS, signJwt, verifyJwt } from "./jwt.ts";
 import { isValidChallenge, verifyS256 } from "./pkce.ts";
 import { redirectMatches } from "./redirect.ts";
 import type { OAuthStore } from "./store.ts";
@@ -192,6 +192,8 @@ export function createOAuthFlow(deps: FlowDeps) {
     const state = signJwt(cfg.secret, "state", {
       cid: client.clientId, ru: redirectUri, cc: challenge, cs: clientState, sc: SCOPE, rs: cfg.resource, nc: nonce, bd: sha256hex(binding), bi,
     }, { nowSec: nowSec(), ttlSec: 600 });
+    // Defensive: a state token our own verifier would refuse would strand the person at "Sign-in expired" after Google.
+    if (state.length > MAX_JWT_CHARS) return fail("invalid_request", "the authorization request is too large");
     return new Response(null, {
       status: 302,
       headers: {
@@ -240,6 +242,7 @@ export function createOAuthFlow(deps: FlowDeps) {
     const token = signJwt(cfg.secret, "consent", {
       cid: st.cid, ru, cc: st.cc, cs: st.cs, sc: st.sc, rs: st.rs, em: decision.email, bd: st.bd, bi,
     }, { nowSec: nowSec(), ttlSec: 300 });
+    if (token.length > MAX_JWT_CHARS) return errorPage(400, "Request too large", "Start connecting again from your application.", clear);
     // Re-send the binding cookie so it lives at least as long as the consent token (Google sign-in/MFA may have used up
     // most of the original cookie's lifetime).
     return consentPage({ email: decision.email, clientName: client.name, redirectUri: ru, token, action: url.consent }, { "set-cookie": setCookie(bi, readCookie(req, bi), 360) });
@@ -309,6 +312,8 @@ export function createOAuthFlow(deps: FlowDeps) {
       const rec = await deps.store.takeCode(sha256hex(code));
       if (!rec || rec.expiresAtMs <= nowMs()) return tokenError("invalid_grant", "the authorization code is invalid or expired");
       if (rec.clientId !== client.clientId) return tokenError("invalid_grant", "the code was issued to a different client");
+      // A code minted for another endpoint (MCP_PUBLIC_URL changed since) must not be re-targeted at this one.
+      if (rec.resource !== cfg.resource) return tokenError("invalid_grant", "the authorization was issued for a different resource");
       const ru = p.get("redirect_uri");
       if (ru !== null && ru !== rec.redirectUri) return tokenError("invalid_grant", "redirect_uri does not match the authorization request");
       if (!verifyS256(p.get("code_verifier"), rec.codeChallenge)) return tokenError("invalid_grant", "PKCE verification failed");
@@ -337,6 +342,7 @@ export function createOAuthFlow(deps: FlowDeps) {
         return tokenError("invalid_grant", "the refresh token is invalid, expired or already used");
       }
       if (rec.clientId !== client.clientId) return tokenError("invalid_grant", "the refresh token was issued to a different client");
+      if (rec.resource !== cfg.resource) return tokenError("invalid_grant", "the refresh token was issued for a different resource");
       const now = nowMs();
       if (rec.expiresAtMs <= now || now >= rec.familyStartMs + cfg.refreshMaxAgeSec * 1000) return tokenError("invalid_grant", "the refresh token has expired; sign in again");
       if (!emailAllowed(cfg, rec.email)) return tokenError("invalid_grant", "this account is no longer allowed");

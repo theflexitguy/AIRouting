@@ -189,6 +189,54 @@ describe("authorization request validation", () => {
   });
 });
 
+describe("resource binding", () => {
+  const elsewhere = (c: Ctx) => createOAuthFlow({ config: { ...c.config, publicUrl: "https://other.example.com", resource: "https://other.example.com/api/mcp" }, store: c.store, google: c.google, now: () => c.t.now });
+
+  it("refuses a refresh token issued for a different endpoint (MCP_PUBLIC_URL changed)", async () => {
+    const c = setup();
+    const p = await fullLogin(c);
+    const tokens = await json(await redeem(c, p));
+    const r = await elsewhere(c).token(new Request(`${BASE}/api/oauth/token`, form({ grant_type: "refresh_token", client_id: p.clientId, refresh_token: tokens.refresh_token })));
+    assert.equal((await json(r)).error, "invalid_grant");
+  });
+
+  it("refuses an authorization code issued for a different endpoint", async () => {
+    const c = setup();
+    const p = await fullLogin(c);
+    const r = await elsewhere(c).token(new Request(`${BASE}/api/oauth/token`, form({ grant_type: "authorization_code", client_id: p.clientId, code: p.code, code_verifier: p.verifier, redirect_uri: p.redirect })));
+    assert.equal((await json(r)).error, "invalid_grant");
+  });
+});
+
+describe("large but accepted registrations", () => {
+  it("a client id at the size cap still completes authorize → callback → consent (the nested tokens stay verifiable)", async () => {
+    const c = setup();
+    const uri = (i: number, n: number) => `https://claude.ai/${i}/${"a".repeat(n)}`;
+    // Grow the redirect URIs until the registration is just under the cap.
+    let n = 100, clientId = "", uris: string[] = [];
+    for (; n <= 500; n += 20) {
+      const u = [0, 1, 2, 3, 4].map((i) => uri(i, n));
+      const r = await c.flow.register(new Request(`${BASE}/api/oauth/register`, { method: "POST", body: JSON.stringify({ redirect_uris: u, client_name: "Big" }) }));
+      if (r.status !== 201) break;
+      clientId = (await json(r)).client_id; uris = u;
+    }
+    assert.ok(clientId.length > 1800 && clientId.length <= 2400, `client id length ${clientId.length}`);
+    const redirect = uris[4];
+    const { verifier, challenge } = pkce();
+    const bigState = "€".repeat(500);
+    const a = await start(c, { clientId, redirect, challenge, state: bigState });
+    assert.equal(a.status, 302, "authorize succeeds");
+    const cookie = cookieOf(a);
+    const cb = await c.flow.googleCallback(new Request(`${BASE}/api/oauth/google/callback?code=G&state=${encodeURIComponent(googleStateOf(a))}`, { headers: { cookie } }));
+    assert.equal(cb.status, 200, "the state token verifies after Google");
+    const done = await c.flow.consent(consentPost(await consentToken(cb), "allow", cookie));
+    assert.equal(done.status, 302);
+    const code = new URL(done.headers.get("location")!).searchParams.get("code")!;
+    const t = await json(await redeem(c, { clientId, code, verifier, redirect }));
+    assert.ok(t.access_token);
+  });
+});
+
 describe("concurrent sign-ins from one browser", () => {
   it("each attempt has its own binding cookie, so a second sign-in can't break the first", async () => {
     const c = setup();

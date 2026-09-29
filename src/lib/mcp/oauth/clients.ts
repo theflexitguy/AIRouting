@@ -12,7 +12,7 @@
 
 import type { OAuthConfig } from "./config.ts";
 import { SCOPE } from "./config.ts";
-import { MAX_JWT_CHARS, signJwt, verifyJwt } from "./jwt.ts";
+import { signJwt, verifyJwt } from "./jwt.ts";
 import { validateRedirectUri } from "./redirect.ts";
 
 export interface RegisteredClient {
@@ -31,6 +31,9 @@ export class RegistrationError extends Error {
 }
 
 const MAX_URIS = 5;
+/** The client id is nested inside the sign-in state and consent tokens (which also carry the redirect URI, the app's own
+ *  state and more), and each of those must stay under MAX_JWT_CHARS. Sizing the id at 2400 leaves them room. */
+export const MAX_CLIENT_ID_CHARS = 2400;
 const GRANTS = ["authorization_code", "refresh_token"];
 
 /** Untrusted display text: strip control and invisible format characters (bidi overrides, zero-width, BOM…) so the
@@ -65,7 +68,7 @@ export function registerClient(cfg: OAuthConfig, body: unknown, nowSec: number) 
   const redirectUris = Array.from(new Set(uris as string[]));
   const name = cleanName(b.client_name);
   const clientId = signJwt(cfg.secret, "client", { name, uris: redirectUris, gt: grantTypes }, { nowSec }); // no exp: revoke by rotating MCP_OAUTH_SECRET
-  if (clientId.length > MAX_JWT_CHARS) {
+  if (clientId.length > MAX_CLIENT_ID_CHARS) {
     // Would be issued but then rejected as unknown at /authorize, so refuse it up front.
     throw new RegistrationError("invalid_client_metadata", "the registration metadata is too large; use fewer or shorter redirect_uris and a shorter client_name");
   }
