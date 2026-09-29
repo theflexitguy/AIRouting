@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --experimental-strip-types --test src/lib/routing/drive-time-honesty.test.ts src/lib/routing/generate-selection.test.ts"
+    "test": "node --experimental-strip-types --import ./scripts/register-alias.mjs --test src/lib/routing/drive-time-honesty.test.ts src/lib/routing/generate-selection.test.ts src/lib/dashboard/dashboard.test.ts src/lib/mcp/auth.test.ts src/lib/mcp/format.test.ts src/lib/mcp/handler.test.ts src/lib/mcp/firestore-source.test.ts src/lib/mcp/tools.test.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -15,6 +15,7 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@googlemaps/js-api-loader": "^2.0.2",
     "@googlemaps/markerclusterer": "^2.6.2",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@radix-ui/react-avatar": "^1.1.11",
     "@radix-ui/react-checkbox": "^1.3.3",
     "@radix-ui/react-dialog": "^1.1.15",
@@ -42,7 +43,8 @@
     "recharts": "^3.8.1",
     "sonner": "^2.0.7",
     "stripe": "^21.0.1",
-    "vaul": "^1.1.2"
+    "vaul": "^1.1.2",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20.19.37",
