@@ -460,9 +460,42 @@ describe("refresh tokens", () => {
     const next = await json(await refresh(c, clientId, tokens.refresh_token));
     assert.ok(next.access_token && next.refresh_token && next.refresh_token !== tokens.refresh_token);
     assert.ok(c.flow.verifyAccessToken(next.access_token));
+    assert.equal(c.store.live.length, 1, "exactly one live refresh token remains after rotation");
     const reuse = await refresh(c, clientId, tokens.refresh_token);
     assert.equal((await json(reuse)).error, "invalid_grant", "a used refresh token is dead");
-    assert.equal(c.store.refresh.size, 1, "exactly one live refresh token remains");
+  });
+
+  it("reuse of a spent refresh token revokes the whole session, including the thief's descendant", async () => {
+    const c = setup();
+    const { clientId, tokens } = await login(c);
+    const stolen = tokens.refresh_token;
+    const thief = await json(await refresh(c, clientId, stolen)); // attacker redeems the copy first
+    assert.ok(thief.refresh_token);
+    const owner = await refresh(c, clientId, stolen); // owner presents the now-spent token
+    assert.equal((await json(owner)).error, "invalid_grant");
+    assert.equal(c.store.live.length, 0, "the attacker's descendant died with the family");
+    assert.equal((await json(await refresh(c, clientId, thief.refresh_token))).error, "invalid_grant");
+  });
+
+  it("reuse revokes only that login's family, not the same person's other sessions", async () => {
+    const c = setup();
+    const a = await login(c);
+    const b = await login(c);
+    await refresh(c, a.clientId, a.tokens.refresh_token);
+    await refresh(c, a.clientId, a.tokens.refresh_token); // reuse → family A revoked
+    assert.equal((await json(await refresh(c, b.clientId, b.tokens.refresh_token))).error, undefined, "session B still works");
+  });
+
+  it("rejects an oversized body even when Content-Length is absent (streamed)", async () => {
+    const c = setup();
+    const big = new Request(`${BASE}/api/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new ReadableStream({ start(ctl) { for (let i = 0; i < 40; i++) ctl.enqueue(new TextEncoder().encode("a".repeat(1024))); ctl.close(); } }),
+      duplex: "half",
+    } as RequestInit);
+    assert.equal(big.headers.get("content-length"), null);
+    assert.equal((await json(await c.flow.token(big))).error, "invalid_request");
   });
 
   it("is bound to its client", async () => {

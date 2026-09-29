@@ -61,8 +61,22 @@ function json(status: number, body: unknown, extra: Record<string, string> = {})
 async function readBody(req: Request): Promise<string | null> {
   const declared = Number(req.headers.get("content-length") || 0);
   if (declared > MAX_BODY) return null;
-  const text = await req.text();
-  return text.length > MAX_BODY ? null : text;
+  // Content-Length can be absent (chunked) or wrong, so count the bytes actually received and stop reading at the cap.
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
 export function createOAuthFlow(deps: FlowDeps) {
@@ -254,14 +268,14 @@ export function createOAuthFlow(deps: FlowDeps) {
   // ---------------------------------------------------------------- token
   const tokenError = (error: string, description: string, status = 400) => json(status, { error, error_description: description });
 
-  async function issue(clientId: string, email: string, scope: string, resource: string, familyStartMs: number): Promise<Response> {
+  async function issue(clientId: string, email: string, scope: string, resource: string, familyId: string, familyStartMs: number): Promise<Response> {
     const now = nowMs();
     const access = signJwt(cfg.secret, "access", {
       iss: cfg.publicUrl, aud: cfg.resource, sub: email, email, scope, azp: sha256hex(clientId).slice(0, 16), jti: rand(12).toString("base64url"),
     }, { nowSec: Math.floor(now / 1000), ttlSec: cfg.accessTtlSec });
     const refresh = secret();
     await deps.store.putRefresh(sha256hex(refresh), {
-      clientId, email, scope, resource, familyStartMs,
+      clientId, email, scope, resource, familyId, familyStartMs,
       expiresAtMs: Math.min(now + cfg.refreshTtlSec * 1000, familyStartMs + cfg.refreshMaxAgeSec * 1000),
     });
     return json(200, { access_token: access, token_type: "Bearer", expires_in: cfg.accessTtlSec, refresh_token: refresh, scope });
@@ -287,7 +301,7 @@ export function createOAuthFlow(deps: FlowDeps) {
       if (!verifyS256(p.get("code_verifier"), rec.codeChallenge)) return tokenError("invalid_grant", "PKCE verification failed");
       if (!emailAllowed(cfg, rec.email)) return tokenError("invalid_grant", "this account is no longer allowed");
       console.log(`[mcp-oauth] token issued user=${rec.email}`);
-      return issue(client.clientId, rec.email, rec.scope, rec.resource, nowMs());
+      return issue(client.clientId, rec.email, rec.scope, rec.resource, rand(16).toString("base64url"), nowMs());
     }
 
     if (grant === "refresh_token") {
@@ -295,13 +309,23 @@ export function createOAuthFlow(deps: FlowDeps) {
       if (!rt || rt.length > 200) return tokenError("invalid_request", "refresh_token is required");
       const scope = p.get("scope");
       if (scope && scope.split(/\s+/).some((s) => s && s !== SCOPE)) return tokenError("invalid_scope", `the only supported scope is ${SCOPE}`);
-      const rec = await deps.store.takeRefresh(sha256hex(rt)); // rotation: the old token dies here
-      if (!rec) return tokenError("invalid_grant", "the refresh token is invalid, expired or already used");
+      const taken = await deps.store.takeRefresh(sha256hex(rt)); // rotation: the old token is spent here
+      if (!taken) return tokenError("invalid_grant", "the refresh token is invalid, expired or already used");
+      const rec = taken.rec;
+      if (taken.consumed) {
+        // A spent token came back: either the owner or a thief holds a copy. We can't tell which, so end the whole
+        // login — every descendant token dies and the person signs in again.
+        if (rec.expiresAtMs > nowMs()) {
+          await deps.store.revokeFamily(rec.familyId);
+          console.warn(`[mcp-oauth] refresh token reuse detected; revoked the session for user=${rec.email}`);
+        }
+        return tokenError("invalid_grant", "the refresh token is invalid, expired or already used");
+      }
       if (rec.clientId !== client.clientId) return tokenError("invalid_grant", "the refresh token was issued to a different client");
       const now = nowMs();
       if (rec.expiresAtMs <= now || now >= rec.familyStartMs + cfg.refreshMaxAgeSec * 1000) return tokenError("invalid_grant", "the refresh token has expired; sign in again");
       if (!emailAllowed(cfg, rec.email)) return tokenError("invalid_grant", "this account is no longer allowed");
-      return issue(client.clientId, rec.email, rec.scope, rec.resource, rec.familyStartMs);
+      return issue(client.clientId, rec.email, rec.scope, rec.resource, rec.familyId, rec.familyStartMs);
     }
     return tokenError("unsupported_grant_type", "supported: authorization_code, refresh_token");
   }

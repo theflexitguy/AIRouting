@@ -255,8 +255,8 @@ company is resolved, before authentication succeeds — a test asserts that. Two
 **The sign-in flow (OAuth 2.1).** PKCE with S256 is mandatory (`plain` is refused). Redirect URIs must match exactly what a client
 registered (loopback clients may vary only the port), and the server **never redirects** until the client and redirect address are
 proven — so it can't be used as an open redirector. Authorization codes are single-use (consumed atomically, even on a failed attempt), expire in 60
-seconds and are stored only as hashes. Refresh tokens rotate on every use, so a stolen one dies the moment the real client refreshes; only
-hashes are stored. Client registration is **stateless** (the client ID is a signed token), so an unauthenticated caller can never cause a database write. The sign-in must
+seconds and are stored only as hashes. Refresh tokens rotate on every use, and a spent one is remembered: if it is ever presented again (a copy was stolen and used), the
+whole session — every token descended from that sign-in — is revoked and the person signs in again. Only hashes are stored. Client registration is **stateless** (the client ID is a signed token), so an unauthenticated caller can never cause a database write. The sign-in must
 finish in the browser that started it (a bound cookie), and the consent screen — which shows the requesting app and its return address, cannot be framed, and escapes
 everything an app can influence — must be approved by the signed-in person before any code is issued.
 

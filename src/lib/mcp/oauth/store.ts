@@ -20,6 +20,8 @@ export interface RefreshRecord {
   email: string;
   scope: string;
   resource: string;
+  /** Shared by every token descended from one login, so reuse of any spent token can revoke them all. */
+  familyId: string;
   /** When the ORIGINAL login happened; a family is capped at this + refreshMaxAgeSec. */
   familyStartMs: number;
   expiresAtMs: number;
@@ -30,7 +32,13 @@ export interface OAuthStore {
   /** Atomically returns and deletes. null if absent (never issued, expired-and-purged, or already used). */
   takeCode(hash: string): Promise<CodeRecord | null>;
   putRefresh(hash: string, rec: RefreshRecord): Promise<void>;
-  /** Atomically returns and deletes (rotation: the caller then puts the replacement). */
-  takeRefresh(hash: string): Promise<RefreshRecord | null>;
+  /**
+   * Atomically marks the token spent and returns it (rotation: the caller then puts the replacement).
+   * A spent token is KEPT (until its expiry) as a tombstone, so presenting it again comes back with
+   * `consumed: true` instead of looking like a token that never existed — that is how reuse is detected.
+   */
+  takeRefresh(hash: string): Promise<{ rec: RefreshRecord; consumed: boolean } | null>;
   deleteRefresh(hash: string): Promise<void>;
+  /** Deletes every token (live or spent) in a family. */
+  revokeFamily(familyId: string): Promise<void>;
 }

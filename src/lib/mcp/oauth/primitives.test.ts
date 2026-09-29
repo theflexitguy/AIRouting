@@ -158,8 +158,9 @@ describe("stateless client registration", () => {
   });
 
   it("cleans hostile display names", () => {
-    assert.equal(cleanName("  Claude \n Desktop\u0000‮ "), "Claude Desktop ‮".trim());
+    assert.equal(cleanName("  Claude \n Desktop\u0000\u202e "), "Claude Desktop");
     assert.equal(cleanName(""), "Unnamed application");
+    assert.equal(cleanName("Trusted\u202eevil\u202c App\u200b\ufeff"), "Trustedevil App", "bidi overrides and zero-width characters are removed");
     assert.equal(cleanName(42), "Unnamed application");
     assert.equal(cleanName("x".repeat(500)).length, 100);
     assert.ok(!/[\u0000-\u001f]/.test(cleanName("a\r\nb\tc")));

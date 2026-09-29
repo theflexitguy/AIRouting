@@ -32,9 +32,10 @@ export class RegistrationError extends Error {
 const MAX_URIS = 5;
 const GRANTS = ["authorization_code", "refresh_token"];
 
-/** Untrusted display text: strip control characters, collapse whitespace, bound the length. */
+/** Untrusted display text: strip control and invisible format characters (bidi overrides, zero-width, BOM…) so the
+ *  name cannot reorder or disguise the text around it, collapse whitespace, bound the length. */
 export function cleanName(v: unknown): string {
-  const s = typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, " ").replace(/\s+/g, " ").trim() : "";
+  const s = typeof v === "string" ? v.replace(/[\p{Cc}\u2028\u2029]/gu, " ").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim() : "";
   return (s || "Unnamed application").slice(0, 100);
 }
 

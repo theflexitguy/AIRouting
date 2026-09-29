@@ -25,15 +25,29 @@ class FakeFirestore {
           delete: async () => { await tick(); this.data.delete(key); },
         };
       },
+      where: (field: string, _op: string, value: unknown) => ({
+        get: async () => {
+          await tick();
+          const docs = [...this.data].filter(([k, v]) => k.startsWith(`${name}/`) && v[field] === value).map(([key]) => ({ ref: { key } }));
+          return { docs };
+        },
+      }),
     };
   }
-  runTransaction<T>(fn: (tx: { get: (r: { key: string }) => Promise<{ exists: boolean; data: () => Rec | undefined }>; delete: (r: { key: string }) => void }) => Promise<T>): Promise<T> {
+  batch() {
+    const keys: string[] = [];
+    return { delete: (r: { key: string }) => { keys.push(r.key); }, commit: async () => { await tick(); for (const k of keys) this.data.delete(k); } };
+  }
+  runTransaction<T>(fn: (tx: { get: (r: { key: string }) => Promise<{ exists: boolean; data: () => Rec | undefined }>; delete: (r: { key: string }) => void; update: (r: { key: string }, v: Rec) => void }) => Promise<T>): Promise<T> {
     const run = async () => {
       const pendingDeletes: string[] = [];
+      const pendingUpdates: Array<[string, Rec]> = [];
       const result = await fn({
         get: async (r) => { const d = this.data.get(r.key); return { exists: d !== undefined, data: () => d }; },
         delete: (r) => { pendingDeletes.push(r.key); },
+        update: (r, v) => { pendingUpdates.push([r.key, v]); },
       });
+      for (const [k, v] of pendingUpdates) this.data.set(k, { ...this.data.get(k), ...v });
       for (const k of pendingDeletes) this.data.delete(k);
       return result;
     };
@@ -44,7 +58,7 @@ class FakeFirestore {
 }
 
 const code: CodeRecord = { clientId: "cid", redirectUri: "https://a.com/cb", codeChallenge: "c".repeat(43), email: "a@flexpestcontrol.com", scope: "mcp:read", resource: "https://x/api/mcp", expiresAtMs: 1_800_000_060_000 };
-const refresh: RefreshRecord = { clientId: "cid", email: "a@flexpestcontrol.com", scope: "mcp:read", resource: "https://x/api/mcp", familyStartMs: 1_800_000_000_000, expiresAtMs: 1_802_592_000_000 };
+const refresh: RefreshRecord = { clientId: "cid", email: "a@flexpestcontrol.com", scope: "mcp:read", resource: "https://x/api/mcp", familyId: "fam1", familyStartMs: 1_800_000_000_000, expiresAtMs: 1_802_592_000_000 };
 const make = () => { const db = new FakeFirestore(); return { db, store: new FirestoreOAuthStore(db as never) }; };
 
 describe("FirestoreOAuthStore", () => {
@@ -96,8 +110,23 @@ describe("FirestoreOAuthStore", () => {
     const { store } = make();
     await store.putRefresh("R", refresh);
     const results = await Promise.all(Array.from({ length: 10 }, () => store.takeRefresh("R")));
-    assert.equal(results.filter(Boolean).length, 1);
-    assert.equal(results.find(Boolean)!.familyStartMs, refresh.familyStartMs, "the family start survives rotation");
+    assert.equal(results.filter((r) => r && !r.consumed).length, 1, "only one caller gets the live token; the rest see it spent");
+    assert.equal(results.find((r) => r && !r.consumed)!.rec.familyStartMs, refresh.familyStartMs, "the family start survives rotation");
+  });
+
+  it("keeps a spent refresh token as a tombstone and can revoke the whole family", async () => {
+    const { store } = make();
+    await store.putRefresh("R1", refresh);
+    await store.putRefresh("R2", refresh);
+    await store.putRefresh("OTHER", { ...refresh, familyId: "fam2" });
+    assert.equal((await store.takeRefresh("R1"))!.consumed, false);
+    const again = await store.takeRefresh("R1");
+    assert.equal(again!.consumed, true, "a second presentation is recognisable as reuse");
+    assert.equal(again!.rec.familyId, "fam1");
+    await store.revokeFamily("fam1");
+    assert.equal(await store.takeRefresh("R1"), null);
+    assert.equal(await store.takeRefresh("R2"), null);
+    assert.equal((await store.takeRefresh("OTHER"))!.consumed, false, "other families are untouched");
   });
 
   it("returns null for anything unknown, and deletes refresh tokens on request", async () => {
@@ -107,6 +136,7 @@ describe("FirestoreOAuthStore", () => {
     await store.putRefresh("R", refresh);
     await store.deleteRefresh("R");
     assert.equal(await store.takeRefresh("R"), null);
+    await store.revokeFamily("never-existed"); // must not throw
     await store.deleteRefresh("never-existed"); // must not throw
   });
 
