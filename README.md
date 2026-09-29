@@ -20,6 +20,10 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## MCP server
+
+Routiq exposes a read-only [Model Context Protocol](https://modelcontextprotocol.io) server at `/api/mcp` so an LLM can read the whole dashboard, from the overview down to individual stops. See [docs/MCP.md](docs/MCP.md) for setup, client configuration and the security model.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:
