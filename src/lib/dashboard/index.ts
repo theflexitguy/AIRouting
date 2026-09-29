@@ -7,3 +7,4 @@ export * from "./stats.ts";
 export * from "./drill.ts";
 export * from "./overdue.ts";
 export * from "./views.ts";
+export * from "./range-done.ts";

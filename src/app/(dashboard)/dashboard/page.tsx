@@ -38,6 +38,7 @@ import {
   computeDashboardStats,
   makeRouteFilter,
   selectScopedRoutes,
+  sumMonthlyDone,
   type DashboardStats,
   type JobRec,
   type OverdueRow,
@@ -55,7 +56,6 @@ import {
   TECH_CATEGORIES,
   type MonthlyDoneLike,
   DASHBOARD_PERIODS,
-  TARGET_SERVICE_LINES,
   TARGET_SERVICE_LINE_LABELS,
   type DashboardPeriod,
   type TargetServiceLine,
@@ -321,27 +321,7 @@ export default function DashboardPage() {
       const snaps = await Promise.all(
         months.map((mk) => getDoc(doc(db, `companies/${companyId}/monthlyDone/${mk}`))),
       );
-      const byLine: Record<string, number> = {};
-      const initialsByLine: Record<string, number> = {};
-      for (const l of TARGET_SERVICE_LINES) { byLine[l] = 0; initialsByLine[l] = 0; }
-      let initials = 0, reservices = 0, followups = 0, specialty = 0, wildlife = 0;
-      let newCustomers = 0, newSubscriptions = 0, completedAppointments = 0, monthsAvailable = 0;
-      for (const s of snaps) {
-        if (!s.exists()) continue;
-        monthsAvailable++;
-        const d = s.data() as MonthlyDone;
-        for (const l of TARGET_SERVICE_LINES) byLine[l] += Number(d.recurringDoneByLine?.[l] || 0);
-        for (const k of Object.keys(d.initialsByLine || {})) initialsByLine[k] = (initialsByLine[k] || 0) + Number(d.initialsByLine[k] || 0);
-        initials += Number(d.initialsTotal || 0);
-        reservices += Number(d.reserviceDone || 0);
-        followups += Number(d.followupDone || 0);
-        specialty += Number(d.specialtyDone || 0);
-        wildlife += Number(d.wildlifeDone || 0);
-        newCustomers += Number(d.newCustomers || 0);
-        newSubscriptions += Number(d.newSubscriptions || 0);
-        completedAppointments += Number(d.completedAppointments || 0);
-      }
-      setRangeDone({ byLine, initials, initialsByLine, reservices, followups, specialty, wildlife, newCustomers, newSubscriptions, completedAppointments, monthsAvailable, monthsTotal: months.length });
+      setRangeDone(sumMonthlyDone(snaps.map((s) => (s.exists() ? (s.data() as MonthlyDone) : null)), months.length));
     } catch (e) {
       console.error("Range done load error:", e);
       setRangeDone(null);
