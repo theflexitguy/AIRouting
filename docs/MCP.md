@@ -89,8 +89,8 @@ layer under this server's own check. The only scopes needed are `openid` and `em
 
 If any of the four required values is missing, sign-in stays **off** (it is never half-enabled) and the server log says which is missing.
 
-**c. (Optional) Let Firestore clean up.** Add a TTL policy on the field `expiresAt` for the collections `mcpOAuthCodes`
-and `mcpOAuthRefreshTokens` so expired records are purged automatically. The server already refuses expired records; this is only housekeeping.
+**c. (Optional) Let Firestore clean up.** Add a TTL policy on the field `expiresAt` for the collections `mcpOAuthCodes`,
+`mcpOAuthRefreshTokens` and `mcpOAuthRevokedFamilies` so expired records are purged automatically. The server already refuses expired records; this is only housekeeping.
 
 ### What users see
 
@@ -114,7 +114,7 @@ display hint and is never trusted. The allow-list and domain are re-checked on *
 | To stop… | Do this | Takes effect |
 |---|---|---|
 | One person | Remove them from `MCP_ALLOWED_EMAILS` (or, if you use only the domain, add an allow-list that excludes them) and redeploy | Immediately on next request |
-| One person's long-lived session | Delete their documents in `mcpOAuthRefreshTokens` | Their access token dies within 1 hour |
+| One person's long-lived session | Delete their documents in `mcpOAuthRefreshTokens` (and add their `familyId` to `mcpOAuthRevokedFamilies` if a rotation might be in flight) | Their access token dies within 1 hour |
 | **Everyone, right now** | Change `MCP_OAUTH_SECRET` and redeploy | Immediately — every token and registration becomes invalid |
 
 Access tokens live 1 hour and cannot be revoked individually before then; that is the trade for not hitting the database on every request.

@@ -12,13 +12,14 @@
 
 import type { OAuthConfig } from "./config.ts";
 import { SCOPE } from "./config.ts";
-import { signJwt, verifyJwt } from "./jwt.ts";
+import { MAX_JWT_CHARS, signJwt, verifyJwt } from "./jwt.ts";
 import { validateRedirectUri } from "./redirect.ts";
 
 export interface RegisteredClient {
   clientId: string;
   name: string;
   redirectUris: string[];
+  grants: string[];
 }
 
 export class RegistrationError extends Error {
@@ -53,16 +54,21 @@ export function registerClient(cfg: OAuthConfig, body: unknown, nowSec: number) 
     throw new RegistrationError("invalid_client_metadata", 'only token_endpoint_auth_method "none" (public clients using PKCE) is supported');
   }
   const grants = b.grant_types === undefined ? GRANTS : b.grant_types;
-  if (!Array.isArray(grants) || grants.some((g) => !GRANTS.includes(g as string))) {
-    throw new RegistrationError("invalid_client_metadata", `grant_types may only include: ${GRANTS.join(", ")}`);
+  if (!Array.isArray(grants) || grants.some((g) => !GRANTS.includes(g as string)) || !grants.includes("authorization_code")) {
+    throw new RegistrationError("invalid_client_metadata", `grant_types must include authorization_code and may only include: ${GRANTS.join(", ")}`);
   }
+  const grantTypes = Array.from(new Set(grants as string[]));
   if (b.response_types !== undefined && !(Array.isArray(b.response_types) && b.response_types.every((r) => r === "code"))) {
     throw new RegistrationError("invalid_client_metadata", 'response_types may only be ["code"]');
   }
 
   const redirectUris = Array.from(new Set(uris as string[]));
   const name = cleanName(b.client_name);
-  const clientId = signJwt(cfg.secret, "client", { name, uris: redirectUris }, { nowSec }); // no exp: revoke by rotating MCP_OAUTH_SECRET
+  const clientId = signJwt(cfg.secret, "client", { name, uris: redirectUris, gt: grantTypes }, { nowSec }); // no exp: revoke by rotating MCP_OAUTH_SECRET
+  if (clientId.length > MAX_JWT_CHARS) {
+    // Would be issued but then rejected as unknown at /authorize, so refuse it up front.
+    throw new RegistrationError("invalid_client_metadata", "the registration metadata is too large; use fewer or shorter redirect_uris and a shorter client_name");
+  }
   return {
     clientId,
     response: {
@@ -70,7 +76,7 @@ export function registerClient(cfg: OAuthConfig, body: unknown, nowSec: number) 
       client_id_issued_at: nowSec,
       client_name: name,
       redirect_uris: redirectUris,
-      grant_types: grants,
+      grant_types: grantTypes,
       response_types: ["code"],
       token_endpoint_auth_method: "none",
       scope: SCOPE,
@@ -84,5 +90,6 @@ export function resolveClient(cfg: OAuthConfig, clientId: unknown, nowSec: numbe
   if (!c || !Array.isArray(c.uris) || c.uris.length === 0) return null;
   // Belt and braces: never trust a redirect URI just because it came out of a signed token.
   if (c.uris.some((u) => validateRedirectUri(u) !== null)) return null;
-  return { clientId, name: cleanName(c.name), redirectUris: c.uris as string[] };
+  const grants = Array.isArray(c.gt) ? (c.gt as unknown[]).filter((g): g is string => typeof g === "string" && GRANTS.includes(g)) : GRANTS;
+  return { clientId, name: cleanName(c.name), redirectUris: c.uris as string[], grants };
 }

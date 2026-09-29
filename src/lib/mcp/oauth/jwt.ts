@@ -36,9 +36,12 @@ export function signJwt(
   return `${input}.${b64u(sign(deriveKey(secret, purpose), input))}`;
 }
 
+/** Longest token verifyJwt will look at; anything we mint must fit under it. */
+export const MAX_JWT_CHARS = 8192;
+
 /** Returns the claims, or null for ANY problem (malformed, wrong alg, bad signature, wrong purpose, expired). */
 export function verifyJwt(secret: string, purpose: string, token: string, opts: { nowSec: number }): Claims | null {
-  if (typeof token !== "string" || token.length > 8192) return null;
+  if (typeof token !== "string" || token.length > MAX_JWT_CHARS) return null;
   const parts = token.split(".");
   if (parts.length !== 3 || parts.some((p) => !/^[A-Za-z0-9_-]+$/.test(p))) return null;
   let header: Claims;

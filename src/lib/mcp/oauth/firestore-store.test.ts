@@ -38,15 +38,18 @@ class FakeFirestore {
     const keys: string[] = [];
     return { delete: (r: { key: string }) => { keys.push(r.key); }, commit: async () => { await tick(); for (const k of keys) this.data.delete(k); } };
   }
-  runTransaction<T>(fn: (tx: { get: (r: { key: string }) => Promise<{ exists: boolean; data: () => Rec | undefined }>; delete: (r: { key: string }) => void; update: (r: { key: string }, v: Rec) => void }) => Promise<T>): Promise<T> {
+  runTransaction<T>(fn: (tx: { get: (r: { key: string }) => Promise<{ exists: boolean; data: () => Rec | undefined }>; delete: (r: { key: string }) => void; update: (r: { key: string }, v: Rec) => void; set: (r: { key: string }, v: Rec) => void }) => Promise<T>): Promise<T> {
     const run = async () => {
       const pendingDeletes: string[] = [];
       const pendingUpdates: Array<[string, Rec]> = [];
+      const pendingSets: Array<[string, Rec]> = [];
       const result = await fn({
         get: async (r) => { const d = this.data.get(r.key); return { exists: d !== undefined, data: () => d }; },
         delete: (r) => { pendingDeletes.push(r.key); },
         update: (r, v) => { pendingUpdates.push([r.key, v]); },
+        set: (r, v) => { pendingSets.push([r.key, v]); },
       });
+      for (const [k, v] of pendingSets) this.data.set(k, v);
       for (const [k, v] of pendingUpdates) this.data.set(k, { ...this.data.get(k), ...v });
       for (const k of pendingDeletes) this.data.delete(k);
       return result;
@@ -123,21 +126,27 @@ describe("FirestoreOAuthStore", () => {
     const again = await store.takeRefresh("R1");
     assert.equal(again!.consumed, true, "a second presentation is recognisable as reuse");
     assert.equal(again!.rec.familyId, "fam1");
-    await store.revokeFamily("fam1");
+    await store.revokeFamily("fam1", refresh.expiresAtMs);
     assert.equal(await store.takeRefresh("R1"), null);
     assert.equal(await store.takeRefresh("R2"), null);
     assert.equal((await store.takeRefresh("OTHER"))!.consumed, false, "other families are untouched");
   });
 
-  it("returns null for anything unknown, and deletes refresh tokens on request", async () => {
+  it("refuses to add a token to a revoked family (a rotation racing a revocation cannot leave a survivor)", async () => {
+    const { db, store } = make();
+    assert.equal(await store.putRefresh("R1", refresh), true);
+    await store.revokeFamily("fam1", refresh.expiresAtMs);
+    assert.ok(db.data.has("mcpOAuthRevokedFamilies/fam1"), "the revocation is recorded durably");
+    assert.equal(await store.putRefresh("R2", refresh), false, "a successor written after revocation is refused");
+    assert.equal(await store.takeRefresh("R2"), null);
+    assert.equal(await store.putRefresh("R3", { ...refresh, familyId: "fam2" }), true, "other families are unaffected");
+  });
+
+  it("returns null for anything unknown", async () => {
     const { store } = make();
     assert.equal(await store.takeCode("nope"), null);
     assert.equal(await store.takeRefresh("nope"), null);
-    await store.putRefresh("R", refresh);
-    await store.deleteRefresh("R");
-    assert.equal(await store.takeRefresh("R"), null);
-    await store.revokeFamily("never-existed"); // must not throw
-    await store.deleteRefresh("never-existed"); // must not throw
+    await store.revokeFamily("never-existed", 1); // must not throw
   });
 
   it("keeps codes and refresh tokens in separate collections", async () => {

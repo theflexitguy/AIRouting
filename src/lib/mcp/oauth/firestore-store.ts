@@ -7,6 +7,7 @@ import type { CodeRecord, OAuthStore, RefreshRecord } from "./store.ts";
 
 const CODES = "mcpOAuthCodes";
 const REFRESH = "mcpOAuthRefreshTokens";
+const REVOKED = "mcpOAuthRevokedFamilies"; // one marker per revoked family; `expiresAt` lets a TTL policy purge it
 
 type Db = FirebaseFirestore.Firestore;
 type Data = FirebaseFirestore.DocumentData;
@@ -46,8 +47,16 @@ export class FirestoreOAuthStore implements OAuthStore {
     const d = await this.take(CODES, hash);
     return d && { clientId: d.clientId, redirectUri: d.redirectUri, codeChallenge: d.codeChallenge, email: d.email, scope: d.scope, resource: d.resource, expiresAtMs: ms(d.expiresAt) };
   }
-  async putRefresh(hash: string, r: RefreshRecord) {
-    await this.db.collection(REFRESH).doc(hash).set({ ...r, expiresAt: new Date(r.expiresAtMs) });
+  async putRefresh(hash: string, r: RefreshRecord): Promise<boolean> {
+    const ref = this.db.collection(REFRESH).doc(hash);
+    const marker = this.db.collection(REVOKED).doc(r.familyId);
+    // Read the revocation marker and write the token in ONE transaction: if a revocation lands in between,
+    // Firestore retries this and it sees the marker, so a revoked family can never gain a new member.
+    return this.db.runTransaction(async (tx) => {
+      if ((await tx.get(marker)).exists) return false;
+      tx.set(ref, { ...r, expiresAt: new Date(r.expiresAtMs) });
+      return true;
+    });
   }
   async takeRefresh(hash: string): Promise<{ rec: RefreshRecord; consumed: boolean } | null> {
     const ref = this.db.collection(REFRESH).doc(hash);
@@ -65,11 +74,9 @@ export class FirestoreOAuthStore implements OAuthStore {
       rec: { clientId: d.clientId, email: d.email, scope: d.scope, resource: d.resource, familyId: String(d.familyId ?? ""), familyStartMs: Number(d.familyStartMs), expiresAtMs: ms(d.expiresAt) },
     };
   }
-  async deleteRefresh(hash: string) {
-    await this.db.collection(REFRESH).doc(hash).delete();
-  }
-  async revokeFamily(familyId: string) {
+  async revokeFamily(familyId: string, untilMs: number) {
     if (!familyId) return;
+    await this.db.collection(REVOKED).doc(familyId).set({ familyId, expiresAt: new Date(untilMs) }); // marker first
     const snap = await this.db.collection(REFRESH).where("familyId", "==", familyId).get();
     for (let i = 0; i < snap.docs.length; i += 400) {
       const batch = this.db.batch();

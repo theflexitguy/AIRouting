@@ -234,7 +234,9 @@ export function createOAuthFlow(deps: FlowDeps) {
     const token = signJwt(cfg.secret, "consent", {
       cid: st.cid, ru, cc: st.cc, cs: st.cs, sc: st.sc, rs: st.rs, em: decision.email, bd: st.bd,
     }, { nowSec: nowSec(), ttlSec: 300 });
-    return consentPage({ email: decision.email, clientName: client.name, redirectUri: ru, token, action: url.consent });
+    // Re-send the binding cookie so it lives at least as long as the consent token (Google sign-in/MFA may have used up
+    // most of the original cookie's lifetime).
+    return consentPage({ email: decision.email, clientName: client.name, redirectUri: ru, token, action: url.consent }, { "set-cookie": setCookie(readCookie(req), 360) });
   }
 
   // ---------------------------------------------------------------- consent decision
@@ -268,17 +270,19 @@ export function createOAuthFlow(deps: FlowDeps) {
   // ---------------------------------------------------------------- token
   const tokenError = (error: string, description: string, status = 400) => json(status, { error, error_description: description });
 
-  async function issue(clientId: string, email: string, scope: string, resource: string, familyId: string, familyStartMs: number): Promise<Response> {
+  async function issue(clientId: string, email: string, scope: string, resource: string, familyId: string, familyStartMs: number, withRefresh: boolean): Promise<Response> {
     const now = nowMs();
-    const access = signJwt(cfg.secret, "access", {
-      iss: cfg.publicUrl, aud: cfg.resource, sub: email, email, scope, azp: sha256hex(clientId).slice(0, 16), jti: rand(12).toString("base64url"),
-    }, { nowSec: Math.floor(now / 1000), ttlSec: cfg.accessTtlSec });
     const refresh = secret();
-    await deps.store.putRefresh(sha256hex(refresh), {
+    // A client registered without the refresh_token grant gets an access token only.
+    const stored = !withRefresh || await deps.store.putRefresh(sha256hex(refresh), {
       clientId, email, scope, resource, familyId, familyStartMs,
       expiresAtMs: Math.min(now + cfg.refreshTtlSec * 1000, familyStartMs + cfg.refreshMaxAgeSec * 1000),
     });
-    return json(200, { access_token: access, token_type: "Bearer", expires_in: cfg.accessTtlSec, refresh_token: refresh, scope });
+    if (!stored) return tokenError("invalid_grant", "this session was revoked; sign in again");
+    const access = signJwt(cfg.secret, "access", {
+      iss: cfg.publicUrl, aud: cfg.resource, sub: email, email, scope, azp: sha256hex(clientId).slice(0, 16), jti: rand(12).toString("base64url"),
+    }, { nowSec: Math.floor(now / 1000), ttlSec: cfg.accessTtlSec });
+    return json(200, { access_token: access, token_type: "Bearer", expires_in: cfg.accessTtlSec, ...(withRefresh ? { refresh_token: refresh } : {}), scope });
   }
 
   async function token(req: Request): Promise<Response> {
@@ -290,6 +294,7 @@ export function createOAuthFlow(deps: FlowDeps) {
     const grant = p.get("grant_type");
 
     if (grant === "authorization_code") {
+      if (!client.grants.includes("authorization_code")) return tokenError("unauthorized_client", "this client is not registered for the authorization_code grant");
       const code = p.get("code") || "";
       if (!code || code.length > 200) return tokenError("invalid_request", "code is required");
       // Consume FIRST: a code is single-use even if this attempt fails, so a stolen code cannot be retried.
@@ -301,10 +306,11 @@ export function createOAuthFlow(deps: FlowDeps) {
       if (!verifyS256(p.get("code_verifier"), rec.codeChallenge)) return tokenError("invalid_grant", "PKCE verification failed");
       if (!emailAllowed(cfg, rec.email)) return tokenError("invalid_grant", "this account is no longer allowed");
       console.log(`[mcp-oauth] token issued user=${rec.email}`);
-      return issue(client.clientId, rec.email, rec.scope, rec.resource, rand(16).toString("base64url"), nowMs());
+      return issue(client.clientId, rec.email, rec.scope, rec.resource, rand(16).toString("base64url"), nowMs(), client.grants.includes("refresh_token"));
     }
 
     if (grant === "refresh_token") {
+      if (!client.grants.includes("refresh_token")) return tokenError("unauthorized_client", "this client is not registered for the refresh_token grant");
       const rt = p.get("refresh_token") || "";
       if (!rt || rt.length > 200) return tokenError("invalid_request", "refresh_token is required");
       const scope = p.get("scope");
@@ -316,7 +322,7 @@ export function createOAuthFlow(deps: FlowDeps) {
         // A spent token came back: either the owner or a thief holds a copy. We can't tell which, so end the whole
         // login — every descendant token dies and the person signs in again.
         if (rec.expiresAtMs > nowMs()) {
-          await deps.store.revokeFamily(rec.familyId);
+          await deps.store.revokeFamily(rec.familyId, rec.familyStartMs + cfg.refreshMaxAgeSec * 1000);
           console.warn(`[mcp-oauth] refresh token reuse detected; revoked the session for user=${rec.email}`);
         }
         return tokenError("invalid_grant", "the refresh token is invalid, expired or already used");
@@ -325,7 +331,7 @@ export function createOAuthFlow(deps: FlowDeps) {
       const now = nowMs();
       if (rec.expiresAtMs <= now || now >= rec.familyStartMs + cfg.refreshMaxAgeSec * 1000) return tokenError("invalid_grant", "the refresh token has expired; sign in again");
       if (!emailAllowed(cfg, rec.email)) return tokenError("invalid_grant", "this account is no longer allowed");
-      return issue(client.clientId, rec.email, rec.scope, rec.resource, rec.familyId, rec.familyStartMs);
+      return issue(client.clientId, rec.email, rec.scope, rec.resource, rec.familyId, rec.familyStartMs, true);
     }
     return tokenError("unsupported_grant_type", "supported: authorization_code, refresh_token");
   }
@@ -334,7 +340,12 @@ export function createOAuthFlow(deps: FlowDeps) {
   async function revoke(req: Request): Promise<Response> {
     const text = await readBody(req);
     const t = text === null ? "" : new URLSearchParams(text).get("token") || "";
-    if (t && t.length <= 200) await deps.store.deleteRefresh(sha256hex(t));
+    if (t && t.length <= 200) {
+      // Revoking any token of a login ends that whole login. (Deleting just this one would also erase the spent-token
+      // record that reuse detection relies on.)
+      const taken = await deps.store.takeRefresh(sha256hex(t));
+      if (taken) await deps.store.revokeFamily(taken.rec.familyId, taken.rec.familyStartMs + cfg.refreshMaxAgeSec * 1000);
+    }
     return json(200, {}); // always 200: never reveal whether a token existed
   }
 

@@ -119,7 +119,7 @@ describe("stateless client registration", () => {
     const { clientId, response } = registerClient(cfg, body, NOW);
     assert.equal(response.token_endpoint_auth_method, "none");
     assert.equal(response.scope, SCOPE);
-    assert.deepEqual(resolveClient(cfg, clientId, NOW + 5), { clientId, name: "Claude", redirectUris: body.redirect_uris });
+    assert.deepEqual(resolveClient(cfg, clientId, NOW + 5), { clientId, name: "Claude", redirectUris: body.redirect_uris, grants: ["authorization_code", "refresh_token"] });
   });
 
   it("rejects bad redirect URIs, counts and metadata with the right error code", () => {
@@ -132,6 +132,11 @@ describe("stateless client registration", () => {
     assert.equal(err({ redirect_uris: ["javascript:alert(1)"] })?.code, "invalid_redirect_uri");
     assert.equal(err({ ...body, token_endpoint_auth_method: "client_secret_basic" })?.code, "invalid_client_metadata");
     assert.equal(err({ ...body, grant_types: ["password"] })?.code, "invalid_client_metadata");
+    assert.equal(err({ ...body, grant_types: [] })?.code, "invalid_client_metadata");
+    assert.equal(err({ ...body, grant_types: ["refresh_token"] })?.code, "invalid_client_metadata");
+    // Five 512-char URIs of 3-byte characters pass the per-field limits but would sign to a client_id verifyJwt rejects.
+    const fat = Array.from({ length: 5 }, (_, i) => `https://a.com/${i}${"€".repeat(490)}`);
+    assert.equal(err({ redirect_uris: fat })?.code, "invalid_client_metadata", "an unusable registration must not be issued");
     assert.equal(err({ ...body, response_types: ["token"] })?.code, "invalid_client_metadata");
     assert.equal(err(null)?.code, "invalid_redirect_uri");
     assert.equal(err(body), null);

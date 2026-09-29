@@ -187,6 +187,17 @@ describe("authorization request validation", () => {
   });
 });
 
+describe("browser binding at the consent step", () => {
+  it("re-sends the binding cookie (same value) so it outlives the consent token", async () => {
+    const c = setup();
+    const { cb, cookie } = await toConsent(c, { clientId: await registerClient(c) });
+    const set = cb.headers.get("set-cookie")!;
+    assert.equal(set.split(";")[0], cookie, "same secret value, so the stored hash still matches");
+    assert.match(set, /Max-Age=360/);
+    for (const attr of ["HttpOnly", "Secure", "SameSite=Lax"]) assert.ok(set.includes(attr), attr);
+  });
+});
+
 describe("the full sign-in flow (happy path)", () => {
   it("registers, signs in, consents, redeems the code and calls the API as that person", async () => {
     const c = setup();
@@ -486,6 +497,23 @@ describe("refresh tokens", () => {
     assert.equal((await json(await refresh(c, b.clientId, b.tokens.refresh_token))).error, undefined, "session B still works");
   });
 
+  it("enforces the grant types a client registered with", async () => {
+    const c = setup();
+    const reg = async (grant_types: string[]) => (await json(await c.flow.register(new Request(`${BASE}/api/oauth/register`, { method: "POST", body: JSON.stringify({ redirect_uris: [REDIRECT], client_name: "X", grant_types }) })))).client_id as string;
+    const noRefresh = await reg(["authorization_code"]);
+    const p = await fullLogin(c, { clientId: noRefresh });
+    const t = await json(await redeem(c, p));
+    assert.ok(t.access_token);
+    assert.equal(t.refresh_token, undefined, "no refresh token for a client that didn't ask for the grant");
+    assert.equal(c.store.refresh.size, 0);
+    const bad = await json(await refresh(c, noRefresh, "anything"));
+    assert.equal(bad.error, "unauthorized_client");
+    const bogus = await c.flow.register(new Request(`${BASE}/api/oauth/register`, { method: "POST", body: JSON.stringify({ redirect_uris: [REDIRECT], grant_types: [] }) }));
+    assert.equal(bogus.status, 400);
+    const refreshOnly = await c.flow.register(new Request(`${BASE}/api/oauth/register`, { method: "POST", body: JSON.stringify({ redirect_uris: [REDIRECT], grant_types: ["refresh_token"] }) }));
+    assert.equal(refreshOnly.status, 400, "a client that can't use the code grant can never obtain a token");
+  });
+
   it("rejects an oversized body even when Content-Length is absent (streamed)", async () => {
     const c = setup();
     const big = new Request(`${BASE}/api/oauth/token`, {
@@ -538,6 +566,27 @@ describe("refresh tokens", () => {
     assert.equal((await json(await refresh(c, clientId, tokens.refresh_token, { scope: "admin" }))).error, "invalid_scope");
     assert.equal((await json(await refresh(c, clientId, "nope"))).error, "invalid_grant");
     assert.equal((await json(await refresh(c, clientId, ""))).error, "invalid_request");
+  });
+
+  it("revoking a SPENT token ends the whole login, so the thief's descendant can't survive it", async () => {
+    const c = setup();
+    const { clientId, tokens } = await login(c);
+    const thief = await json(await refresh(c, clientId, tokens.refresh_token)); // spends the original
+    const rev = (token: string) => c.flow.revoke(new Request(`${BASE}/api/oauth/revoke`, form({ token })));
+    assert.equal((await rev(tokens.refresh_token)).status, 200); // attacker tries to erase the record
+    assert.equal((await json(await refresh(c, clientId, thief.refresh_token))).error, "invalid_grant");
+    assert.equal(c.store.live.length, 0);
+  });
+
+  it("a rotation that finishes after its family was revoked gets no token", async () => {
+    const c = setup();
+    const { clientId, tokens } = await login(c);
+    const orig = c.store.putRefresh.bind(c.store);
+    // Simulate the race: while this rotation is between "mark spent" and "store successor", the family is revoked.
+    c.store.putRefresh = async (h, rec) => { await c.store.revokeFamily(rec.familyId, rec.expiresAtMs); return orig(h, rec); };
+    const res = await refresh(c, clientId, tokens.refresh_token);
+    assert.equal((await json(res)).error, "invalid_grant");
+    assert.equal(c.store.live.length, 0);
   });
 
   it("can be revoked, and revocation never reveals whether a token existed", async () => {
