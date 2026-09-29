@@ -15,33 +15,39 @@ import { Switch } from "@/components/ui/switch";
 import { DatePicker } from "@/components/ui/date-picker";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { formatTime } from "@/lib/utils";
-import { formatCurrency, calculateStopProductionValue } from "@/lib/production-value";
+import { formatCurrency } from "@/lib/production-value";
 import {
   deriveServiceLine,
-  lawnRoundsForMonth,
-  lawnRoundNumberFromServiceType,
-  lawnRoundNumberForWindow,
 } from "@/lib/routing/service-line";
 // Same constants the SYNC used to stamp overdueActionable — imported rather
 // than restated so the audit view can never drift from the real thresholds.
 // (scope.ts has no imports of its own, so it is safe on the client.)
-import { BALANCE_GATE, MAX_OVERDUE_DAYS, pastDueGraceDays } from "@/lib/fieldroutes/scope";
+import { BALANCE_GATE, MAX_OVERDUE_DAYS } from "@/lib/fieldroutes/scope";
 import type { MonthlyDone } from "@/lib/fieldroutes/monthly-done";
+// The dashboard's math lives in src/lib/dashboard so the MCP server computes the very
+// same numbers with the very same code.
 import {
-  stopsPerRoute,
-  stopsPerHour,
-  avgDriveTime,
-  monthlyServiced,
-  weeklyPace,
-  monthlyPace,
-  monthlyTargetsByLine,
+  STOP_KIND_OPTIONS,
+  buildAsOfView,
+  buildDrillData,
+  buildJobsByDocId,
+  buildOverdueDrill,
+  buildPeriodView,
+  buildTechKeys,
+  computeDashboardBounds,
+  computeDashboardStats,
+  makeRouteFilter,
+  selectScopedRoutes,
+  type DashboardStats,
+  type JobRec,
+  type OverdueRow,
+  type RangeDone,
+  type RouteRec,
+  type TechOption,
+} from "@/lib/dashboard";
+import {
   targetAuditForLine,
-  completedByLineFromRoutes,
   routesCoverRange,
-  isTrackedServiceLine,
-  scheduledCountByLine,
-  scheduledTrackedTotal,
-  targetsByLineForMonths,
   monthKeysForPeriod,
   trailingMonthKeys,
   technicianForecast,
@@ -52,18 +58,13 @@ import {
   TARGET_SERVICE_LINES,
   TARGET_SERVICE_LINE_LABELS,
   type DashboardPeriod,
-  type LineTarget,
   type TargetServiceLine,
   MONTH_WORKING_DAYS,
   meetsTarget,
   STOPS_PER_ROUTE_TARGET,
   STOPS_PER_HOUR_TARGET,
   DRIVE_TIME_TARGET,
-  type RouteLike,
-  type JobLike,
-  type MonthlyPace,
 } from "@/lib/metrics/operational";
-import { canonicalRouteGroup } from "@/lib/route-groups";
 import {
   Route,
   Briefcase,
@@ -93,105 +94,13 @@ import {
 } from "recharts";
 import {
   format,
-  addDays,
   parseISO,
   startOfWeek,
-  endOfWeek,
   startOfMonth,
-  endOfMonth,
-  subWeeks,
   subDays,
 } from "date-fns";
 
-interface WeekKpis {
-  stopsPerRoute: number | null;
-  stopsPerHour: number | null;
-  avgDriveTime: number | null;
-  routeCount: number;
-}
 
-interface TrendRow {
-  label: string; // week start, e.g. "Jun 1"
-  routeCount: number;
-  stopsPerRoute: number | null;
-  avgDriveTime: number | null;
-  stopsPerHour: number | null;
-}
-
-interface DashboardStats {
-  todayRoutes: number;
-  totalStops: number;
-  completedToday: number;
-  completedInScope: number;
-  stopsLeftToday: number;
-  estimatedDriveTime: number;
-  totalRouteValue: number;
-  avgRouteValue: number;
-  todayStopsPerHour: number | null;
-  overdueStops: number;
-  weekKpis: WeekKpis;
-  weekStopsBooked: number;
-  stopsLeftWeek: number;
-  lineTargets: LineTarget[];
-  monthScheduledByLine: Record<string, number>;
-  monthScheduledTotal: number;
-  weekScheduled: number;
-  todayScheduled: number;
-  monthlyTarget: number;
-  weeklyTarget: number;
-  dailyTarget: number;
-  // Per-service-line week/day segmentation: target (monthly ÷ 4 / ÷ working
-  // days), done (completed in the window), booked (appointments on the books).
-  lineWeekDay: Record<string, {
-    weekTarget: number; weekDone: number; weekBooked: number;
-    dayTarget: number; todayDone: number; todayBooked: number;
-  }>;
-  pace: MonthlyPace;
-  weekPace: MonthlyPace;
-  trend: TrendRow[];
-  jobsDueThisWeek: Array<{ date: string; count: number }>;
-}
-
-// Raw doc shapes the dashboard fetches once, then filters/derives client-side.
-interface RouteStopDetail {
-  id: string;
-  customerName?: string;
-  value?: number;
-  completed?: boolean; // stamped by the historical reconcile (appointment status 1)
-  // What the stop IS, as opposed to which subscription it hangs off: a General
-  // Pest regular service, a General Pest initial and a General Pest reservice
-  // all share one subscription type, so only the appointment separates them.
-  kind?: string; // "regular" | "initial" | "reservice"
-  serviceType?: string;
-}
-interface RouteRec extends RouteLike {
-  date: string;
-  techId?: string;
-  techName?: string;
-  routeGroupTitle?: string;
-  routeTemplateTitle?: string; // FieldRoutes route template ("Regular", "Rain Day", …)
-  routeValue?: number;
-  completedStops?: number; // stamped by the historical reconcile (appointment status 1)
-  stopSequence?: string[];
-  stops?: RouteStopDetail[]; // light per-stop detail persisted by the sync/reconcile
-  driveTimeSource?: string; // "routes_api_matrix" = real Google drive time, else straight-line estimate
-}
-/** One past-due subscription in the Overdue Stops audit view. */
-interface OverdueRow {
-  docId: string;
-  customerId: string;
-  customerName: string;
-  address: string;
-  balance: number;
-  serviceType: string;
-  frequencyLabel: string;
-  serviceLine: string;
-  dueDate: string;
-  daysOverdue: number;
-  graceDays: number; // the frequency-scaled window this sub had to be serviced in
-  lastCompleted: string;
-  reasons: string[]; // empty when counted; why it did NOT count otherwise
-}
 
 /**
  * One table for both halves of the Overdue audit. `showReason` swaps the last
@@ -245,60 +154,7 @@ function OverdueTable({ rows, showReason }: { rows: OverdueRow[]; showReason?: b
   );
 }
 
-interface JobRec extends JobLike {
-  docId?: string; // Firestore doc id (sub_<subscriptionId>), stamped at load
-  status?: string;
-  overdueActionable?: boolean;
-  // Audit fields behind the Overdue Stops drill-down. All already stored on the
-  // job docs by the sync; declared here so the drill can read them typed.
-  subscriptionBalance?: string; // stored as a string
-  schedulingRequest?: string; // special-scheduling note; any text blocks routing
-  potentialCustomer?: boolean;
-  serviceType?: string;
-  fieldRoutesStopKind?: string; // "regular" | "initial" | "reservice" on the booked appointment
-  fieldRoutesRouteGroup?: string;
-  fieldRoutesRouteTemplate?: string;
-  scheduledTech?: string; // FieldRoutes tech name on the booked appointment
-  customerName?: string;
-  address?: string;
-  duration?: number; // service minutes for the stop
-  // Billing fields feeding calculateStopProductionValue (per-stop route value
-  // fallback when a route doc's stops detail predates the value field).
-  recurringPrice?: string;
-  billingPrice?: string;
-  billingFrequency?: string;
-  revenue?: number | string;
-  productionValue?: number | string;
-}
-interface TechOption {
-  id: string;
-  name: string;
-  employeeId?: string;
-  fieldRoutesEmployeeId?: string;
-  fieldRoutesTechId?: string;
-}
 
-const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
-
-// Stop Type filter: a route mixes regular services, initials (a new signup's
-// first visit) and reservices (a return trip, booked with no subscription
-// behind it). FieldRoutes files all three under the same subscription service
-// type, so this is the only way to separate them.
-const STOP_KIND_OPTIONS = [
-  { value: "regular", label: "Regular Stops" },
-  { value: "initial", label: "Initials" },
-  { value: "reservice", label: "Reservices" },
-];
-const stopKindOf = (v: unknown) => {
-  const k = norm(v);
-  return k === "initial" || k === "reservice" ? k : "regular";
-};
-
-/** Saturday/Sunday check for a YYYY-MM-DD date string. */
-const isWeekendISO = (iso: string) => {
-  const day = new Date(`${iso}T00:00:00Z`).getUTCDay();
-  return day === 0 || day === 6;
-};
 
 // Lines shown in the Initials breakdown (new-signup first services).
 const INITIAL_LINE_LABELS: Array<{ key: string; label: string }> = [
@@ -308,12 +164,6 @@ const INITIAL_LINE_LABELS: Array<{ key: string; label: string }> = [
   { key: "commercial", label: "Comm" },
 ];
 
-// Does a route belong to the selected technician? Routes carry techId/techName;
-// match against any of the tech's known identifiers.
-function routeMatchesTech(r: RouteRec, keys: Set<string>): boolean {
-  if (keys.size === 0) return true;
-  return [r.techId, r.techName].map(norm).filter(Boolean).some((k) => keys.has(k));
-}
 
 export default function DashboardPage() {
   const { userProfile } = useAuth();
@@ -342,20 +192,7 @@ export default function DashboardPage() {
   // have been that far through the month. "" = live (today).
   const [asOfDate, setAsOfDate] = useState("");
   const [asOfRoutes, setAsOfRoutes] = useState<RouteRec[] | null>(null);
-  const [rangeDone, setRangeDone] = useState<{
-    byLine: Record<string, number>;
-    initials: number;
-    initialsByLine: Record<string, number>;
-    reservices: number;
-    followups: number;
-    specialty: number;
-    wildlife: number;
-    newCustomers: number;
-    newSubscriptions: number;
-    completedAppointments: number;
-    monthsAvailable: number;
-    monthsTotal: number;
-  } | null>(null);
+  const [rangeDone, setRangeDone] = useState<RangeDone | null>(null);
   const [rangeLoading, setRangeLoading] = useState(false);
   const [rangeRefreshing, setRangeRefreshing] = useState(false);
 
@@ -377,17 +214,7 @@ export default function DashboardPage() {
   const [excludeWeekends, setExcludeWeekends] = useState(false);
 
   // Calendar boundaries (compared as YYYY-MM-DD strings).
-  const bounds = useMemo(() => {
-    const d = parseISO(today);
-    return {
-      weekStart: format(startOfWeek(d, { weekStartsOn: 1 }), "yyyy-MM-dd"),
-      weekEnd: format(endOfWeek(d, { weekStartsOn: 1 }), "yyyy-MM-dd"),
-      monthStart: format(startOfMonth(d), "yyyy-MM-dd"),
-      monthEnd: format(endOfMonth(d), "yyyy-MM-dd"),
-      monthIndex: Number(today.slice(5, 7)),
-      trendStart: format(startOfWeek(subWeeks(d, 7), { weekStartsOn: 1 }), "yyyy-MM-dd"),
-    };
-  }, [today]);
+  const bounds = useMemo(() => computeDashboardBounds(today), [today]);
 
   useEffect(() => {
     if (!userProfile?.companyId) return;
@@ -659,17 +486,7 @@ export default function DashboardPage() {
   // Identifier set for the selected technicians (matched against route/job
   // fields). Union across every selected tech — a route/job matching ANY of
   // them passes the filter.
-  const techKeys = useMemo(() => {
-    const keys = new Set<string>();
-    for (const id of filterTechs) {
-      const t = techs.find(x => x.id === id);
-      for (const k of [t?.id, t?.name, t?.employeeId, t?.fieldRoutesEmployeeId, t?.fieldRoutesTechId]) {
-        const v = norm(k);
-        if (v) keys.add(v);
-      }
-    }
-    return keys;
-  }, [filterTechs, techs]);
+  const techKeys = useMemo(() => buildTechKeys(filterTechs, techs), [filterTechs, techs]);
 
   const filtersActive = dateFilterEnabled || filterTechs.length > 0 || filterGroups.length > 0 || filterTemplates.length > 0 || filterSubTypes.length > 0 || filterStopKinds.length > 0;
 
@@ -698,11 +515,7 @@ export default function DashboardPage() {
 
   // Join route stopSequence ids (sub_<subscriptionId> / appt_<id>) back to job
   // docs for customer id / service type / today's completion state.
-  const jobsByDocId = useMemo(() => {
-    const m = new Map<string, JobRec>();
-    for (const j of rawJobs) if (j.docId) m.set(j.docId, j);
-    return m;
-  }, [rawJobs]);
+  const jobsByDocId = useMemo(() => buildJobsByDocId(rawJobs), [rawJobs]);
 
   // Apply technician + route-group + route-template + subscription-type +
   // stop-type filters to a set of routes. Each filter is a multi-select: empty =
@@ -712,293 +525,30 @@ export default function DashboardPage() {
   // count, completions, value, service minutes) and every downstream metric
   // reads the rewritten numbers. The two stop-level filters compose: General
   // Pest + Initials shows only the GP first services on the day.
-  const filterRoutes = useMemo(() => {
-    const stopLevelActive = filterSubTypes.length > 0 || filterStopKinds.length > 0;
-    const stopMatches = (id: string, detail: RouteStopDetail | undefined) => {
-      if (filterSubTypes.length > 0) {
-        // The job doc is the authority on the subscription's type; the stop
-        // detail covers stops with no job doc (stand-alone reservices, and
-        // subscriptions whose doc was purged after a one-time completed).
-        const t = String(jobsByDocId.get(id)?.serviceType || detail?.serviceType || "").trim();
-        if (t === "" || !filterSubTypes.includes(t)) return false;
-      }
-      if (filterStopKinds.length > 0) {
-        const kind = detail?.kind !== undefined
-          ? stopKindOf(detail.kind)
-          : stopKindOf(jobsByDocId.get(id)?.fieldRoutesStopKind);
-        if (!filterStopKinds.includes(kind)) return false;
-      }
-      return true;
-    };
-    return (routes: RouteRec[]) => {
-      const base = routes.filter(r => {
-        // A route with no stops is a phantom (its underlying job docs were purged
-        // out from under it) — never count or display it as a route.
-        if ((r.totalStops || 0) <= 0) return false;
-        // Match on the canonical bucket so every FieldRoutes spelling variant of a
-        // group (GPC/gpc, Wildlife/WILD LIFE, …) is included under one selection.
-        if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(r.routeGroupTitle || "")))) return false;
-        if (filterTemplates.length > 0 && !filterTemplates.includes(String(r.routeTemplateTitle || "").trim())) return false;
-        if (!routeMatchesTech(r, techKeys)) return false;
-        return true;
-      });
-      if (!stopLevelActive) return base;
-      const rewritten: RouteRec[] = [];
-      for (const r of base) {
-        const seq = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
-        const allById = new Map((Array.isArray(r.stops) ? r.stops : []).map(s => [String(s.id), s]));
-        const keep = seq.filter(id => stopMatches(id, allById.get(id)));
-        if (keep.length === 0) continue;
-        const keepSet = new Set(keep);
-        const detail = (Array.isArray(r.stops) ? r.stops : []).filter(s => keepSet.has(String(s.id)));
-        const detailById = new Map(detail.map(s => [String(s.id), s]));
-        // Per-stop value: the reconcile-stamped stop value, falling back to the
-        // job's production value for docs that predate the stops detail.
-        const routeValue = keep.reduce((sum, id) => {
-          const d = detailById.get(id);
-          if (d && Number.isFinite(Number(d.value))) return sum + Number(d.value);
-          const j = jobsByDocId.get(id);
-          return sum + (j ? calculateStopProductionValue(j).value || 0 : 0);
-        }, 0);
-        const totalServiceMinutes = keep.reduce(
-          (sum, id) => sum + (Number(jobsByDocId.get(id)?.duration) || 25), 0
-        );
-        rewritten.push({
-          ...r,
-          stopSequence: keep,
-          stops: detail,
-          totalStops: keep.length,
-          completedStops: detail.filter(s => s.completed).length,
-          routeValue,
-          totalServiceMinutes,
-          // Drive time stays the whole route's (a drive isn't attributable to a
-          // single stop); work minutes pair it with the filtered service time.
-          totalWorkMinutes: (Number(r.totalDriveTimeMinutes) || 0) + totalServiceMinutes,
-        });
-      }
-      return rewritten;
-    };
-  }, [filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, jobsByDocId]);
+  const filterRoutes = useMemo(
+    () => makeRouteFilter({ filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, jobsByDocId }),
+    [filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, jobsByDocId],
+  );
 
   // Route set for the "Today" cards: the custom range when the date filter is
   // on, otherwise today's routes. Shared with the metric drill-downs so a
   // card's number and its detail list always come from the same route set.
   // Custom range with "skip weekends" on: Sat/Sun routes drop out of every
   // range-derived number (stops, drive, value, KPIs).
-  const scopedRoutes = useMemo(() => {
-    const rangeSet = dateFilterEnabled
-      ? (excludeWeekends ? (rangeRoutes ?? []).filter(r => !isWeekendISO(String(r.date))) : (rangeRoutes ?? []))
-      : null;
-    return filterRoutes(rangeSet ?? rawRoutes.filter(r => r.date === today));
-  }, [dateFilterEnabled, excludeWeekends, rangeRoutes, rawRoutes, filterRoutes, today]);
+  const scopedRoutes = useMemo(
+    () => selectScopedRoutes({ dateFilterEnabled, excludeWeekends, rangeRoutes, rawRoutes, filterRoutes, today }),
+    [dateFilterEnabled, excludeWeekends, rangeRoutes, rawRoutes, filterRoutes, today],
+  );
 
-  const stats: DashboardStats = useMemo(() => {
-    // KPIs use this week's routes (or the custom range).
-    const rangeSet = dateFilterEnabled
-      ? (excludeWeekends ? (rangeRoutes ?? []).filter(r => !isWeekendISO(String(r.date))) : (rangeRoutes ?? []))
-      : null;
-    const todaySet = scopedRoutes;
-    const kpiSet = filterRoutes(
-      rangeSet ?? rawRoutes.filter(r => r.date >= bounds.weekStart && r.date <= bounds.weekEnd)
-    );
-
-    const totalStops = todaySet.reduce((s, r) => s + (r.totalStops || 0), 0);
-    const estimatedDriveTime = todaySet.reduce((s, r) => s + (r.totalDriveTimeMinutes || 0), 0);
-    const totalRouteValue = todaySet.reduce((s, r) => s + (Number(r.routeValue) || 0), 0);
-    const avgRouteValue = todaySet.length > 0 ? totalRouteValue / todaySet.length : 0;
-
-    // Jobs completed today within the tech/group filter scope (jobs carry the
-    // scheduled tech name + route group). Freshness is bounded by the last sync.
-    const jobInFilterScope = (j: JobRec) => {
-      if (filterGroups.length > 0 && !filterGroups.includes(canonicalRouteGroup(String(j.fieldRoutesRouteGroup || "")))) return false;
-      if (filterTemplates.length > 0 && !filterTemplates.includes(String(j.fieldRoutesRouteTemplate || "").trim())) return false;
-      if (filterSubTypes.length > 0 && !filterSubTypes.includes(String(j.serviceType || "").trim())) return false;
-      if (filterStopKinds.length > 0 && !filterStopKinds.includes(stopKindOf(j.fieldRoutesStopKind))) return false;
-      if (techKeys.size > 0 && !techKeys.has(norm(j.scheduledTech))) return false;
-      return true;
-    };
-    // Completed stops on a route: the reconcile stamps completedStops from
-    // actual appointment statuses on past AND today's docs. Docs that predate
-    // the field (or non-FieldRoutes routes) fall back to counting stops whose
-    // job doc completed on the route's date, filtered like everything else.
-    const completedOnRoute = (r: RouteRec): number => {
-      if (typeof r.completedStops === "number") return r.completedStops;
-      const seq = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
-      return seq.filter(id => {
-        const j = jobsByDocId.get(id);
-        return j && j.subscriptionLastCompletedDate === r.date && jobInFilterScope(j);
-      }).length;
-    };
-    const completedToday = todaySet
-      .filter(r => r.date === today)
-      .reduce((s, r) => s + completedOnRoute(r), 0);
-    // "Completed" card: with a custom range, completions across the whole range;
-    // otherwise today's routes — both from the same per-route appointment truth.
-    const completedInScope = dateFilterEnabled
-      ? todaySet.reduce((s, r) => s + completedOnRoute(r), 0)
-      : completedToday;
-
-    // Work still sitting on routes: future days count whole; today and past
-    // days count each route's booked-minus-completed remainder (appointment
-    // truth as of the last sync) — a 68-stop day with 65 done shows 3
-    // remaining, not 0, and today's count no longer shrinks as work completes.
-    const stopsStillToDo = (routes: RouteRec[]): number => {
-      let left = 0;
-      for (const r of routes) {
-        if (r.date > today) left += r.totalStops || 0;
-        else left += Math.max(0, (r.totalStops || 0) - completedOnRoute(r));
-      }
-      return left;
-    };
-    const stopsLeftToday = stopsStillToDo(todaySet);
-    const stopsLeftWeek = stopsStillToDo(kpiSet);
-    const weekStopsBooked = kpiSet.reduce((s, r) => s + (r.totalStops || 0), 0);
-
-    // Already-booked FieldRoutes appointments (the schedule as it stands) — the
-    // forward half of pace: done + booked vs target says whether the current
-    // schedule is enough to stay on track or the books need more.
-    const monthScheduledByLine = scheduledCountByLine(rawJobs, today, bounds.monthEnd);
-    const monthScheduledTotal = scheduledTrackedTotal(monthScheduledByLine);
-    const weekScheduled = scheduledTrackedTotal(scheduledCountByLine(rawJobs, today, bounds.weekEnd));
-    // "Booked today" answers "did we put enough on today's schedule?" — so an
-    // appointment completed earlier today still counts (unlike the month/week
-    // projections, which exclude completed appts to avoid double-counting done).
-    const todayScheduled = rawJobs.filter(
-      j => j.alreadyScheduled === true &&
-        j.fieldRoutesScheduledDate === today &&
-        isTrackedServiceLine(String(j.serviceLine ?? ""))
-    ).length;
-
-    // Overdue + targets stay company-wide (subscriptions aren't tied to a route
-    // group, and overdue subs are typically unassigned).
-    const overdueStops = new Set(
-      rawJobs.filter(j => j.overdueActionable).map(j => String(j.customerId))
-    ).size;
-
-    // Per-service-line monthly targets (General Pest / Mosquito / Lawn / Termite /
-    // Commercial) plus a combined Total. GR + Wildlife are excluded (one-time /
-    // auto-scheduled). Weekly + Daily derive from the tracked-line Total.
-    const lineTargets = monthlyTargetsByLine(rawJobs, bounds.monthIndex, bounds.monthStart, bounds.monthEnd, today);
-    const totalRow = lineTargets[lineTargets.length - 1];
-    const monthlyTarget = totalRow.target;
-    const pace = totalRow.pace;
-    const weeklyTarget = Math.round(monthlyTarget / 4);
-    const dailyTarget = Math.round(monthlyTarget / MONTH_WORKING_DAYS);
-
-    // Week/day segmentation per service line: targets derive from the line's
-    // monthly target (÷4 weekly, ÷ working-days daily — same derivation the
-    // Total cards use); done counts distinct customers completed in the window
-    // (per-round subs for Lawn, matching its monthly card); booked counts
-    // appointments already on the books.
-    const weekBookedByLine = scheduledCountByLine(rawJobs, today, bounds.weekEnd);
-    const lineWeekDay: DashboardStats["lineWeekDay"] = {};
-    for (const lt of lineTargets) {
-      if (lt.line === "total") continue;
-      const lineJobs = rawJobs.filter(j => String(j.serviceLine ?? "") === lt.line);
-      // Lawn done: ONLY the current round (the round sub whose seasonal window
-      // covers this month), deduped to distinct plans (customers). A plan owns
-      // several round subs, so counting sub records — or other rounds — would
-      // over-report like the monthly card did (113 vs 82 plans). Other lines
-      // already count distinct customers.
-      // A lawn sub belongs to this month only if its round (from service type,
-      // else stamped window) is one the calendar marks active this month — the
-      // same rule the monthly card uses, so unattributable/other-round subs
-      // don't leak in.
-      const activeLawnRounds = new Set(lawnRoundsForMonth(bounds.monthIndex));
-      const lawnCurrentRound = (j: JobRec) => {
-        const round =
-          lawnRoundNumberFromServiceType(j.serviceType) ??
-          lawnRoundNumberForWindow(j.seasonalStartMonth, j.seasonalEndMonth);
-        return round !== null && activeLawnRounds.has(round);
-      };
-      const doneIn = (start: string, end: string) =>
-        lt.line === "lawn"
-          ? new Set(
-              lineJobs
-                .filter(j =>
-                  j.inScope !== false && j.pendingCancel !== true && lawnCurrentRound(j) &&
-                  j.subscriptionLastCompletedDate && j.subscriptionLastCompletedDate >= start && j.subscriptionLastCompletedDate <= end
-                )
-                .map(j => String(j.customerId || j.docId || ""))
-            ).size
-          : monthlyServiced(lineJobs, start, end);
-      lineWeekDay[lt.line] = {
-        weekTarget: Math.round(lt.target / 4),
-        weekDone: doneIn(bounds.weekStart, today),
-        weekBooked: weekBookedByLine[lt.line] || 0,
-        dayTarget: Math.round(lt.target / MONTH_WORKING_DAYS),
-        todayDone: doneIn(today, today),
-        todayBooked: lineJobs.filter(j => j.alreadyScheduled === true && j.fieldRoutesScheduledDate === today).length,
-      };
-    }
-    const trackedJobs = rawJobs.filter(j => isTrackedServiceLine(String(j.serviceLine ?? "")));
-    const weeklyDone = monthlyServiced(trackedJobs, bounds.weekStart, today);
-    const weekPace = weeklyPace(weeklyTarget, weeklyDone, bounds.weekStart, today);
-
-    const weekKpis: WeekKpis = {
-      stopsPerRoute: stopsPerRoute(kpiSet),
-      stopsPerHour: stopsPerHour(kpiSet),
-      avgDriveTime: avgDriveTime(kpiSet),
-      routeCount: kpiSet.length,
-    };
-
-    // 8-week trend: always the last 8 weeks of routes, with tech/group filters
-    // applied (but not the date-range filter).
-    const trendSet = filterRoutes(rawRoutes);
-    const trend: TrendRow[] = [];
-    const d0 = parseISO(today);
-    for (let w = 7; w >= 0; w--) {
-      const wkStartDate = startOfWeek(subWeeks(d0, w), { weekStartsOn: 1 });
-      const wkStart = format(wkStartDate, "yyyy-MM-dd");
-      const wkEnd = format(endOfWeek(wkStartDate, { weekStartsOn: 1 }), "yyyy-MM-dd");
-      const wk = trendSet.filter(r => r.date >= wkStart && r.date <= wkEnd);
-      trend.push({
-        label: format(wkStartDate, "MMM d"),
-        routeCount: wk.length,
-        stopsPerRoute: stopsPerRoute(wk),
-        avgDriveTime: avgDriveTime(wk),
-        stopsPerHour: stopsPerHour(wk),
-      });
-    }
-
-    // Jobs due over the next 7 days (company-wide).
-    const jobsDueThisWeek = Array.from({ length: 7 }, (_, i) => {
-      const dd = format(addDays(parseISO(today), i), "yyyy-MM-dd");
-      const count = rawJobs.filter(j =>
-        j.scheduledDate === dd && (j.status === "pending" || j.status === "scheduled")
-      ).length;
-      return { date: format(addDays(parseISO(today), i), "EEE"), count };
-    });
-
-    return {
-      todayRoutes: todaySet.length,
-      totalStops,
-      completedToday,
-      completedInScope,
-      stopsLeftToday,
-      estimatedDriveTime,
-      totalRouteValue,
-      avgRouteValue,
-      todayStopsPerHour: stopsPerHour(todaySet),
-      overdueStops,
-      weekKpis,
-      weekStopsBooked,
-      stopsLeftWeek,
-      lineTargets,
-      monthScheduledByLine,
-      monthScheduledTotal,
-      weekScheduled,
-      todayScheduled,
-      monthlyTarget,
-      weeklyTarget,
-      dailyTarget,
-      lineWeekDay,
-      pace,
-      weekPace,
-      trend,
-      jobsDueThisWeek,
-    };
-  }, [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, bounds, today, scopedRoutes, jobsByDocId]);
+  const stats: DashboardStats = useMemo(
+    () =>
+      computeDashboardStats({
+        rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes,
+        filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, bounds, today,
+        scopedRoutes, jobsByDocId,
+      }),
+    [rawRoutes, rawJobs, rangeRoutes, dateFilterEnabled, excludeWeekends, filterRoutes, filterGroups, filterTemplates, filterSubTypes, filterStopKinds, techKeys, bounds, today, scopedRoutes, jobsByDocId],
+  );
 
   // ── Metric drill-downs ──────────────────────────────────────────────────
   // Clicking Routes / Total Stops / Completed / Stops Remaining opens an audit
@@ -1007,92 +557,7 @@ export default function DashboardPage() {
     "routes" | "stops" | "completed" | "remaining" | "drive" | "value" | "stopsHour" | "overdue" | null
   >(null);
 
-  const drillData = useMemo(() => {
-    const routes = [...scopedRoutes].sort(
-      (a, b) => a.date.localeCompare(b.date) || String(a.techName || "").localeCompare(String(b.techName || ""))
-    );
-
-    interface StopRow {
-      key: string;
-      customerId: string;
-      customerName: string;
-      techName: string;
-      date: string;
-      template: string;
-      group: string;
-      serviceType: string;
-      address: string;
-      status: "completed" | "pending" | "scheduled" | "unknown";
-    }
-    const stopRows: StopRow[] = [];
-    const routeRows = routes.map((r) => {
-      const seq: string[] = Array.isArray(r.stopSequence) ? r.stopSequence.map(String) : [];
-      const detailById = new Map((Array.isArray(r.stops) ? r.stops : []).map((s) => [String(s.id), s]));
-      let liveCompleted = 0;
-      for (const id of seq) {
-        const detail = detailById.get(id);
-        const job = jobsByDocId.get(id);
-        let status: StopRow["status"];
-        if (r.date > today) status = "scheduled";
-        else if (detail && typeof detail.completed === "boolean") {
-          // Per-stop appointment truth stamped by the reconcile — covers past
-          // days AND today (as of the last sync).
-          status = detail.completed ? "completed" : "pending";
-        } else if (r.date === today) {
-          // Today's docs that predate the appointment rebuild: job-doc fallback.
-          status = job?.subscriptionLastCompletedDate === today ? "completed" : "pending";
-        } else {
-          // Past day, doc predates the stops array — unknown until re-verified.
-          status = "unknown";
-        }
-        if (status === "completed") liveCompleted++;
-        stopRows.push({
-          key: `${r.date}-${String(r.techId || r.techName)}-${id}`,
-          customerId: String(job?.customerId || ""),
-          customerName: String(detail?.customerName || job?.customerName || id),
-          techName: String(r.techName || r.techId || "—"),
-          date: r.date,
-          template: String(r.routeTemplateTitle || "").trim(),
-          group: String(r.routeGroupTitle || "").trim(),
-          serviceType: String(job?.serviceType || ""),
-          address: String(job?.address || ""),
-          status,
-        });
-      }
-      // Completed on the route card: trust the reconcile-stamped count when
-      // present (past days and today alike); docs that predate the field use
-      // the per-stop tally above.
-      const completed = typeof r.completedStops === "number" ? r.completedStops : liveCompleted;
-      // Working hours for the per-route Stops/Hr column — same formula as the
-      // stopsPerHour KPI (work minutes when present, else drive + service).
-      const workMinutes = (Number(r.totalWorkMinutes) || 0) > 0
-        ? Number(r.totalWorkMinutes)
-        : (Number(r.totalDriveTimeMinutes) || 0) + (Number(r.totalServiceMinutes) || 0);
-      return {
-        key: `${r.date}-${String(r.techId || r.techName)}`,
-        date: r.date,
-        techName: String(r.techName || r.techId || "—"),
-        template: String(r.routeTemplateTitle || "").trim(),
-        group: String(r.routeGroupTitle || "").trim(),
-        totalStops: r.totalStops || 0,
-        completed,
-        driveMinutes: Number(r.totalDriveTimeMinutes) || 0,
-        driveEstimated: String(r.driveTimeSource || "") !== "routes_api_matrix",
-        routeValue: Number(r.routeValue) || 0,
-        workMinutes,
-        stopsPerHour: workMinutes > 0 ? (r.totalStops || 0) / (workMinutes / 60) : null,
-      };
-    });
-
-    return {
-      routeRows,
-      stopRows,
-      completedRows: stopRows.filter((s) => s.status === "completed"),
-      remainingRows: stopRows.filter((s) => s.status === "pending" || s.status === "scheduled"),
-      hasUnknown: stopRows.some((s) => s.status === "unknown"),
-      hasEstimatedDrive: routeRows.some((r) => r.driveEstimated),
-    };
-  }, [scopedRoutes, jobsByDocId, today]);
+  const drillData = useMemo(() => buildDrillData({ scopedRoutes, jobsByDocId, today }), [scopedRoutes, jobsByDocId, today]);
 
   // ── Targets by Service drill-down ───────────────────────────────────────
   // Each line's target uses a DIFFERENT model, so the audit reports which one
@@ -1114,80 +579,7 @@ export default function DashboardPage() {
   // reason — that is where the collections and constraint backlog hides.
   // Thresholds come from scope.ts (the same ones the sync stamped with), never
   // restated here, so this view can't drift from the real rule.
-  const overdueDrill = useMemo(() => {
-    const daysBetweenISO = (from: string, to: string) =>
-      Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
-
-    const counted: OverdueRow[] = [];
-    const excluded: OverdueRow[] = [];
-
-    for (const j of rawJobs) {
-      const dueDate = String(j.scheduledDate || "");
-      const daysOverdue = dueDate ? daysBetweenISO(dueDate, today) : 0;
-      // Grace scales with service frequency: a monthly sub is "past due" at 5
-      // days, a quarterly one at 15.
-      const graceDays = pastDueGraceDays(j.frequency);
-      const balance = Number(j.subscriptionBalance ?? 0) || 0;
-      const note = String(j.schedulingRequest || "").trim();
-      const row: OverdueRow = {
-        docId: String(j.docId || ""),
-        customerId: String(j.customerId || ""),
-        customerName: String(j.customerName || j.customerId || ""),
-        address: String(j.address || ""),
-        balance,
-        serviceType: String(j.serviceType || ""),
-        frequencyLabel: String(j.recurringFrequency || ""),
-        serviceLine: String(j.serviceLine || ""),
-        dueDate,
-        daysOverdue,
-        graceDays,
-        lastCompleted: String(j.subscriptionLastCompletedDate || ""),
-        reasons: [],
-      };
-
-      // Counted rows are EXACTLY the stamped flag, with no re-filtering on the
-      // dates — otherwise this list would disagree with the card whenever the
-      // flag is older than the data (it is refreshed by sync, not live). Such a
-      // row still shows its real due date and day count, which is the point.
-      if (j.overdueActionable === true) {
-        counted.push(row);
-        continue;
-      }
-
-      // Everything below is the EXCLUDED half: genuinely past its own window,
-      // but not carrying the flag.
-      if (!dueDate || dueDate >= today) continue;
-      if (daysOverdue <= graceDays) continue; // still inside its window — Pending, not overdue
-
-      // Say which gate it failed, in the order scope.ts applies them. A row can
-      // fail several.
-      const reasons: string[] = [];
-      if (daysOverdue > MAX_OVERDUE_DAYS) reasons.push(`stale — due ${daysOverdue} days ago`);
-      if (balance > BALANCE_GATE) reasons.push(`balance ${formatCurrency(balance)} (over ${formatCurrency(BALANCE_GATE)})`);
-      if (note) reasons.push(`scheduling note: ${note}`);
-      if (j.alreadyScheduled === true) {
-        reasons.push(`already booked${j.fieldRoutesScheduledDate ? ` ${j.fieldRoutesScheduledDate}` : ""}`);
-      }
-      if (j.pendingCancel === true) reasons.push("pending cancel");
-      if (j.potentialCustomer === true) reasons.push("prospect, not a customer");
-      // Nothing else explains it: the stamped flag predates the current dates
-      // (it is refreshed by the sync / recompute-past-due cron, not live).
-      if (reasons.length === 0) reasons.push("flag not refreshed since last sync");
-      excluded.push({ ...row, reasons });
-    }
-
-    const byMostOverdue = (a: OverdueRow, b: OverdueRow) => b.daysOverdue - a.daysOverdue;
-    counted.sort(byMostOverdue);
-    excluded.sort(byMostOverdue);
-    return {
-      counted,
-      excluded,
-      // The card counts customers, not subscriptions — show both so the number
-      // is never ambiguous.
-      customerCount: new Set(counted.map((r) => r.customerId).filter(Boolean)).size,
-      excludedBalanceTotal: excluded.reduce((sum, r) => sum + (r.balance > BALANCE_GATE ? r.balance : 0), 0),
-    };
-  }, [rawJobs, today]);
+  const overdueDrill = useMemo(() => buildOverdueDrill({ rawJobs, today }), [rawJobs, today]);
 
   // Targets by Service rewound to `asOfDate` (null when live). The month's TARGET
   // is unchanged — what moves is how much was done by that date and how far
@@ -1196,56 +588,13 @@ export default function DashboardPage() {
   // truth that never rolls forward); if routes don't cover the month-to-date
   // window we fall back to subscription last-completed dates and say so, since
   // that source can undercount a past date once a subscription rolls forward.
-  const asOfView = useMemo(() => {
-    if (!asOfDate || asOfDate >= today) return null;
-    const d = parseISO(asOfDate);
-    const monthStart = format(startOfMonth(d), "yyyy-MM-dd");
-    const monthEnd = format(endOfMonth(d), "yyyy-MM-dd");
-    const rows = monthlyTargetsByLine(rawJobs, Number(asOfDate.slice(5, 7)), monthStart, monthEnd, asOfDate);
-    const routes = asOfRoutes ?? rawRoutes;
-    const covered = routesCoverRange(routes, monthStart, asOfDate);
-    const doneByLine = covered
-      ? completedByLineFromRoutes(routes, (id) => String(jobsByDocId.get(id)?.serviceLine ?? ""), monthStart, asOfDate)
-      : null;
-    return {
-      monthStart,
-      covered,
-      rows: rows.map((r) => {
-        const done = !doneByLine
-          ? r.done
-          : r.line === "total"
-            ? TARGET_SERVICE_LINES.reduce((s, l) => s + (doneByLine[l] || 0), 0)
-            : doneByLine[r.line] || 0;
-        return {
-          line: r.line,
-          label: r.line === "total" ? "Total (All)" : r.label,
-          target: r.target,
-          done,
-          pace: monthlyPace(r.target, done, asOfDate),
-          rounds: r.rounds,
-        };
-      }),
-    };
-  }, [asOfDate, today, rawJobs, rawRoutes, asOfRoutes, jobsByDocId]);
+  const asOfView = useMemo(
+    () => buildAsOfView({ asOfDate, today, rawJobs, rawRoutes, asOfRoutes, jobsByDocId }),
+    [asOfDate, today, rawJobs, rawRoutes, asOfRoutes, jobsByDocId],
+  );
 
   // Historical period view (null for the current month, which uses the live cards).
-  const periodView = useMemo(() => {
-    if (period === "this_month") return null;
-    const months = monthKeysForPeriod(period, today);
-    const targets = targetsByLineForMonths(rawJobs, months);
-    const rows = TARGET_SERVICE_LINES.map((line) => ({
-      line,
-      label: TARGET_SERVICE_LINE_LABELS[line],
-      target: targets[line] || 0,
-      done: rangeDone?.byLine?.[line] || 0,
-    }));
-    const total = {
-      target: rows.reduce((s, r) => s + r.target, 0),
-      done: rows.reduce((s, r) => s + r.done, 0),
-    };
-    const label = DASHBOARD_PERIODS.find((p) => p.value === period)?.label || "";
-    return { months, rows, total, label };
-  }, [period, today, rawJobs, rangeDone]);
+  const periodView = useMemo(() => buildPeriodView({ period, today, rawJobs, rangeDone }), [period, today, rawJobs, rangeDone]);
 
   // Technicians Needed: 12-month forecast. `recentDone` holds the trailing 15
   // months of aggregates, used for both YoY seasonality and the recent trend.
