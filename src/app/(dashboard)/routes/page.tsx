@@ -82,6 +82,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useEditHistory } from "@/hooks/useEditHistory";
 import { Undo2, Redo2 } from "lucide-react";
+import { apiFetch } from "@/lib/api-client";
 
 const TECH_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4"];
 // Neutral gray for FieldRoutes appointments with no tech assigned.
@@ -541,7 +542,7 @@ async function getRoadRouteForJobs(jobs: Job[], routeDate?: string): Promise<Roa
   if (cached) return cached;
 
   const promise = (async () => {
-    const res = await fetch("/api/route-geometry", {
+    const res = await apiFetch("/api/route-geometry", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1637,7 +1638,7 @@ export default function RoutesPage() {
       await batch.commit();
 
       if (!fromRouteIsVirtual) {
-        fetch("/api/record-feedback", {
+        apiFetch("/api/record-feedback", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1649,7 +1650,7 @@ export default function RoutesPage() {
           }),
         }).catch(() => {});
       }
-      fetch("/api/record-feedback", {
+      apiFetch("/api/record-feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1785,7 +1786,7 @@ export default function RoutesPage() {
         before: [{ routeId: toRouteId, stopSequence: oldSeq, date: toRoute.route.date }],
         after: [{ routeId: toRouteId, stopSequence: newSeq, date: toRoute.route.date }],
       });
-      fetch("/api/record-feedback", {
+      apiFetch("/api/record-feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1873,7 +1874,7 @@ export default function RoutesPage() {
         before: [{ routeId: tr.route.id, stopSequence: oldSeq, date: tr.route.date }],
         after: [{ routeId: tr.route.id, stopSequence: newSeq, date: tr.route.date }],
       });
-      fetch("/api/record-feedback", {
+      apiFetch("/api/record-feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1955,7 +1956,7 @@ export default function RoutesPage() {
         before: [{ routeId: sourceRoute.route.id, stopSequence: oldSeq, date: sourceRoute.route.date }],
         after: [{ routeId: sourceRoute.route.id, stopSequence: newSeq, date: sourceRoute.route.date }],
       });
-      fetch("/api/record-feedback", {
+      apiFetch("/api/record-feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2039,7 +2040,7 @@ export default function RoutesPage() {
         before: [{ routeId, stopSequence: oldSeq, date: tr.route.date }],
         after: [{ routeId, stopSequence: newSeq, date: tr.route.date }],
       });
-      fetch("/api/record-feedback", {
+      apiFetch("/api/record-feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2302,7 +2303,7 @@ export default function RoutesPage() {
     autoGeocodeInFlightRef.current = true;
     (async () => {
       try {
-        const res = await fetch("/api/geocode-jobs", {
+        const res = await apiFetch("/api/geocode-jobs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ companyId, jobIds: ids }),
@@ -2866,7 +2867,7 @@ export default function RoutesPage() {
     const timers = stages.map(s => setTimeout(() => setGenStage(s.msg), s.delay));
 
     try {
-      const res = await fetch("/api/generate-routes", {
+      const res = await apiFetch("/api/generate-routes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2934,7 +2935,7 @@ export default function RoutesPage() {
 
   const approveRouteInFieldRoutes = async (tr: TechRoute) => {
     if (!userProfile?.companyId) throw new Error("Missing company profile");
-    const res = await fetch("/api/approve-route", {
+    const res = await apiFetch("/api/approve-route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2955,7 +2956,7 @@ export default function RoutesPage() {
     const loggedRouteId = tr.route.fieldRoutesSync?.routeId;
     if (!loggedRouteId) throw new Error("This route has no logged FieldRoutes route ID.");
 
-    const res = await fetch("/api/delete-fieldroutes-route", {
+    const res = await apiFetch("/api/delete-fieldroutes-route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3013,7 +3014,7 @@ export default function RoutesPage() {
     }
     setGeocodingStops(true);
     try {
-      const res = await fetch("/api/geocode-jobs", {
+      const res = await apiFetch("/api/geocode-jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3038,7 +3039,7 @@ export default function RoutesPage() {
     if (!userProfile?.companyId) return;
     setApproving(tr.route.id);
     try {
-      const res = await fetch("/api/unschedule-routeiq-route", {
+      const res = await apiFetch("/api/unschedule-routeiq-route", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3080,7 +3081,7 @@ export default function RoutesPage() {
     if (!userProfile?.companyId) return;
     setApproving(tr.route.id);
     try {
-      const res = await fetch("/api/undo-fieldroutes-stops", {
+      const res = await apiFetch("/api/undo-fieldroutes-stops", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

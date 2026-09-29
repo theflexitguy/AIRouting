@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { computeRouteGeometry, googleApisPaused, type RoutePoint } from "@/lib/google-routing";
 import { publicRouteGeometryPayload } from "@/lib/routing/drive-time-honesty";
+import { guarded } from "@/lib/api-guard";
 
 type RouteGeometryRequest = {
   companyId?: string;
@@ -44,7 +45,7 @@ async function loadJobPoints(companyId: string, jobIds: string[]) {
   return points;
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = (await request.json()) as RouteGeometryRequest;
     const jobIds = Array.isArray(body.jobIds) ? body.jobIds.filter(Boolean) : [];
@@ -94,3 +95,5 @@ export async function POST(request: NextRequest) {
     );
   }
 }
+
+export const POST = guarded("company", POSTHandler, { implicitCompany: true });

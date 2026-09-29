@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 export const maxDuration = 120;
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const { companyId } = await request.json();
     if (!companyId) {
@@ -68,3 +69,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Failed to sync jobs" }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

@@ -4,6 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 // Deletes ALL FieldRoutes-sourced job docs (source == "api") for a company so a
 // subsequent full sync rebuilds them clean — clearing any stragglers left by an
@@ -52,12 +53,15 @@ async function resetJobs(companyId: string | undefined, confirm: string | undefi
   }
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const params = new URL(request.url).searchParams;
   return resetJobs(params.get("companyId") || undefined, params.get("confirm") || undefined);
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   const body = (await request.json().catch(() => ({}))) as { companyId?: string; confirm?: string };
   return resetJobs(body.companyId, body.confirm);
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

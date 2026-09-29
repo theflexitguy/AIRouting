@@ -12,6 +12,7 @@ import {
 } from "@/lib/job-id";
 import { normalizeRouteDateValue } from "@/lib/route-bundles";
 import { geocodeAddresses, hasGoogleRoutesApiKey } from "@/lib/google-routing";
+import { guarded, type ApiAuth } from "@/lib/api-guard";
 
 interface CsvRow {
   [key: string]: string;
@@ -172,7 +173,7 @@ async function getExistingJobDocs(
   return existing;
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest, auth: ApiAuth) {
   try {
     const formData = await request.formData();
     const file = formData.get("file") as File | null;
@@ -186,6 +187,8 @@ export async function POST(request: NextRequest) {
         { status: 400 },
       );
     }
+
+    if (!auth.mayAccess(companyId)) return NextResponse.json({ error: "forbidden" }, { status: 403 });
 
     const text = await file.text();
     const rows = parseCsv(text);
@@ -660,3 +663,5 @@ export async function POST(request: NextRequest) {
     );
   }
 }
+
+export const POST = guarded("company-write", POSTHandler, { routeChecksCompany: true });

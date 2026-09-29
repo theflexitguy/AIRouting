@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --experimental-strip-types --import ./scripts/register-alias.mjs --test src/lib/routing/drive-time-honesty.test.ts src/lib/routing/generate-selection.test.ts src/lib/dashboard/dashboard.test.ts src/lib/mcp/auth.test.ts src/lib/mcp/format.test.ts src/lib/mcp/handler.test.ts src/lib/mcp/firestore-source.test.ts src/lib/mcp/tools.test.ts src/lib/mcp/oauth/jwt.test.ts src/lib/mcp/oauth/primitives.test.ts src/lib/mcp/oauth/flow.test.ts src/lib/mcp/oauth/firestore-store.test.ts"
+    "test": "node --experimental-strip-types --import ./scripts/register-alias.mjs --test src/lib/api-auth.test.ts src/lib/api-auth.routes.test.ts src/lib/routing/drive-time-honesty.test.ts src/lib/routing/generate-selection.test.ts src/lib/dashboard/dashboard.test.ts src/lib/mcp/auth.test.ts src/lib/mcp/format.test.ts src/lib/mcp/handler.test.ts src/lib/mcp/firestore-source.test.ts src/lib/mcp/tools.test.ts src/lib/mcp/oauth/jwt.test.ts src/lib/mcp/oauth/primitives.test.ts src/lib/mcp/oauth/flow.test.ts src/lib/mcp/oauth/firestore-store.test.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

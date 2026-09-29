@@ -16,6 +16,7 @@ import { Technician } from "@/types";
 import { Loader2, Plus, Trash2, Save, ExternalLink, Key, Users, CreditCard, Bell, SlidersHorizontal, Gauge, RefreshCw, Download, Check } from "lucide-react";
 import { toast } from "sonner";
 import { groupRouteGroupTitles } from "@/lib/route-groups";
+import { apiFetch } from "@/lib/api-client";
 
 // Headroom under FieldRoutes' account-wide 3,000 reads/day limit. Mirrors
 // DEFAULT_API_DAILY_CAP in src/lib/fieldroutes/usage.ts.
@@ -209,7 +210,7 @@ export default function SettingsPage() {
     if (!userProfile?.companyId) return;
     setPullingServices(true);
     try {
-      const res = await fetch("/api/fieldroutes/service-types", {
+      const res = await apiFetch("/api/fieldroutes/service-types", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ companyId: userProfile.companyId }),
@@ -242,7 +243,7 @@ export default function SettingsPage() {
     if (!userProfile?.companyId) return;
     setPullingRouteGroups(true);
     try {
-      const res = await fetch("/api/fieldroutes/route-groups", {
+      const res = await apiFetch("/api/fieldroutes/route-groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ companyId: userProfile.companyId }),

@@ -9,6 +9,7 @@ import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { centralTodayISO, toDateOnly, num } from "@/lib/fieldroutes/scope";
 import { deriveServiceLine, serviceLineMeta, isInScopeForLine, lawnRoundSeasonalWindow, ServiceLine } from "@/lib/routing/service-line";
 import { TARGET_SERVICE_LINES, TARGET_SERVICE_LINE_LABELS, monthlyTargetsByLine, type JobLike } from "@/lib/metrics/operational";
+import { guarded } from "@/lib/api-guard";
 
 // Live reconciliation for ALL service-line monthly targets in ONE FieldRoutes
 // pull: fetches every active subscription once, classifies each by line, and
@@ -309,12 +310,15 @@ async function handle(companyIdParam: string | undefined) {
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   const body = (await request.json().catch(() => ({}))) as { companyId?: string };
   return handle(body.companyId);
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const companyId = new URL(request.url).searchParams.get("companyId") || undefined;
   return handle(companyId);
 }
+
+export const POST = guarded("operator", POSTHandler);
+export const GET = guarded("operator", GETHandler);

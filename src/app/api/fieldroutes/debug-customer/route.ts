@@ -4,6 +4,7 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
+import { guarded } from "@/lib/api-guard";
 
 // Read-only diagnostic: dump the RAW FieldRoutes customer (and optionally
 // subscription) JSON for a handful of IDs so we can see the exact field names
@@ -52,10 +53,13 @@ async function handle(request: NextRequest) {
   }
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   return handle(request);
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   return handle(request);
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

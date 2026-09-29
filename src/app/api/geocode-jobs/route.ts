@@ -5,13 +5,14 @@ export const maxDuration = 300;
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { geocodeAddresses, hasGoogleRoutesApiKey } from "@/lib/google-routing";
+import { guarded } from "@/lib/api-guard";
 
 /**
  * Backfills coordinates for existing jobs that have an address but no lat/lng.
  * Pass { companyId, jobIds? }. When jobIds is omitted, every job in the company
  * missing coordinates is geocoded.
  */
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
   const { companyId, jobIds } = body as { companyId?: string; jobIds?: string[] };
 
@@ -114,3 +115,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

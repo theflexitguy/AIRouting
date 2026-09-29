@@ -2,9 +2,12 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Users can only read/write their own profile
+    // Users can read their own profile but NEVER write it. Profiles are created by the server (POST /api/account/init)
+    // and changed only with the Admin SDK. A profile names the user's companyId and role, so if a browser could write
+    // it, anyone could name another company and become an admin of it.
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
     }
 
     // Company data: only users with matching companyId can access

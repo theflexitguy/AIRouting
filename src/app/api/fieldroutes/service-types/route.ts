@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
+import { guarded } from "@/lib/api-guard";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -8,7 +9,7 @@ function clean(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const { companyId } = (await request.json()) as { companyId?: string };
     if (!companyId) {
@@ -62,3 +63,5 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

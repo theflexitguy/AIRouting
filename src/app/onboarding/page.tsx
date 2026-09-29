@@ -13,6 +13,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Building2, Plug, Users, RefreshCw, CheckCircle, Loader2, ChevronRight, Plus, Trash2 } from "lucide-react";
 import Image from "next/image";
 import { generateId } from "@/lib/utils";
+import { apiFetch } from "@/lib/api-client";
 
 interface TechEntry { id: string; name: string; employeeId: string; maxStopsPerDay: number; }
 const STEPS = [
@@ -48,9 +49,8 @@ export default function OnboardingPage() {
     setLoading(true);
     setError("");
     try {
-      const newCompanyId = "company_" + generateId();
-      await createAccount(email, password, newCompanyId);
-      await setDoc(doc(db, "companies", newCompanyId), { name: companyName, plan: "pro", active: true, createdAt: new Date().toISOString() });
+      // The server picks the company id and creates the company record.
+      const newCompanyId = await createAccount(email, password, companyName);
       setCompanyId(newCompanyId);
       setStep(2);
     } catch (err: unknown) {
@@ -119,7 +119,7 @@ export default function OnboardingPage() {
     setSyncMessage("Connecting to FieldRoutes...");
     setSyncProgress(10);
 
-    fetch("/api/sync-jobs", {
+    apiFetch("/api/sync-jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ companyId }),

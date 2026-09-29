@@ -5,6 +5,7 @@ export const maxDuration = 120;
 import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { reconcileRouteRange } from "@/lib/fieldroutes/sync";
+import { guarded, type ApiAuth } from "@/lib/api-guard";
 
 // On-demand "make this date range exact": rebuilds a PAST window's route docs
 // from the actual FieldRoutes appointments so a custom date-range view always
@@ -20,7 +21,7 @@ const TTL_MINUTES = 10;
 // instead of returning a result computed by the old logic.
 const REBUILD_VERSION = "v5";
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request, auth: ApiAuth) {
   try {
     const body = (await request.json().catch(() => ({}))) as {
       startDate?: string;
@@ -38,8 +39,8 @@ export async function POST(request: Request) {
 
     // TTL guard BEFORE any FieldRoutes spend.
     const db = adminDb();
-    const companiesSnap = await db.collection("companies").limit(2).get();
-    const companyId = companiesSnap.docs[0]?.id || "";
+    // A signed-in user's own company; only the operator (no company of their own) falls back to the first one.
+    const companyId = auth.companyId || (await db.collection("companies").limit(2).get()).docs[0]?.id || "";
     const key = `${REBUILD_VERSION}_${startDate}_${endDate}`;
     const ttlRef = companyId ? db.doc(`companies/${companyId}/fieldRoutesState/rangeReconcile`) : null;
     if (ttlRef && !force) {
@@ -64,3 +65,5 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler, { implicitCompany: true });

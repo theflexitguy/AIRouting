@@ -1,9 +1,10 @@
 export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
+import { guarded } from "@/lib/api-guard";
 
 const BACKEND_URL = process.env.BACKEND_URL || "";
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = await request.json();
     const { companyId } = body;
@@ -34,3 +35,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Failed to retrain model" }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

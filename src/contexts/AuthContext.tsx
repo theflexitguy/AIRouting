@@ -8,9 +8,10 @@ import {
   signOut as firebaseSignOut,
   createUserWithEmailAndPassword,
 } from 'firebase/auth';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc } from 'firebase/firestore';
 import { auth, db } from '@/lib/firebase';
 import { User } from '@/types';
+import { apiFetch } from '@/lib/api-client';
 
 interface AuthContextType {
   user: FirebaseUser | null;
@@ -18,7 +19,8 @@ interface AuthContextType {
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
-  createAccount: (email: string, password: string, companyId: string) => Promise<void>;
+  /** Creates the login and a brand-new company (chosen by the server); resolves to the new company id. */
+  createAccount: (email: string, password: string, companyName: string) => Promise<string>;
 }
 
 const AuthContext = createContext<AuthContextType>({} as AuthContextType);
@@ -63,17 +65,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await firebaseSignOut(auth);
   };
 
-  const createAccount = async (email: string, password: string, companyId: string) => {
+  const createAccount = async (email: string, password: string, companyName: string) => {
     if (!auth || !db) throw new Error('Firebase not configured.');
     const { user: newUser } = await createUserWithEmailAndPassword(auth, email, password);
-    const profile: User = {
-      uid: newUser.uid,
-      email,
-      companyId,
-      role: 'admin',
-    };
-    await setDoc(doc(db, 'users', newUser.uid), profile);
-    setUserProfile(profile);
+    // The server creates the profile and the company: browsers are not allowed to write users/{uid} (a browser that
+    // could would be able to name any company and join it as an admin).
+    const res = await apiFetch('/api/account/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ companyName }),
+    });
+    if (!res.ok) throw new Error('Account setup failed.');
+    const { companyId } = (await res.json()) as { companyId: string };
+    setUserProfile({ uid: newUser.uid, email, companyId, role: 'admin' } as User);
+    return companyId;
   };
 
   return (

@@ -4,6 +4,7 @@ export const maxDuration = 300;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 // Permanently remove a company and everything under it. This is IRREVERSIBLE,
 // so it is deliberately hard to fire by accident:
@@ -28,7 +29,7 @@ interface Body {
   dryRun?: boolean;
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   const body = (await request.json().catch(() => ({}))) as Body;
   const companyId = String(body.companyId || "").trim();
   const confirm = String(body.confirm || "").trim();
@@ -131,3 +132,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message, companyId }, { status: 500 });
   }
 }
+
+export const POST = guarded("operator", POSTHandler);

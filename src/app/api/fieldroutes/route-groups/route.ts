@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
+import { guarded } from "@/lib/api-guard";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -19,7 +20,7 @@ function centralDaysAgo(days: number): string {
 // "Lawn") seen on recent FieldRoutes routes. FieldRoutes has no clean "list all
 // groups" endpoint that returns titles, but each route carries a stable
 // `groupTitle`, so we derive the list from routes in a recent window.
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const { companyId } = (await request.json()) as { companyId?: string };
     if (!companyId) {
@@ -73,3 +74,5 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);
