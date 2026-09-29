@@ -41,6 +41,9 @@ export function errorPage(status: number, title: string, message: string, extra:
 }
 
 export function consentPage(p: { email: string; clientName: string; redirectUri: string; token: string; action: string }, extra: Record<string, string> = {}): Response {
+  // `same-origin`, NOT the `no-referrer` the other pages use: with no-referrer a browser sends `Origin: null` on the
+  // Allow button's form POST (Fetch spec), and the consent endpoint's origin check would reject the real user.
+  // same-origin sends the true Origin to us and still sends nothing to any other site.
   return htmlResponse(
     200,
     "Authorize access to Routiq",
@@ -53,6 +56,6 @@ export function consentPage(p: { email: string; clientName: string; redirectUri:
 <input type="hidden" name="token" value="${esc(p.token)}">
 <div class="row"><button class="allow" type="submit" name="decision" value="allow">Allow</button><button type="submit" name="decision" value="deny">Cancel</button></div>
 </form>`,
-    extra,
+    { "referrer-policy": "same-origin", ...extra },
   );
 }
