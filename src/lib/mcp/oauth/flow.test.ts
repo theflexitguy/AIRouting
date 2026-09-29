@@ -458,6 +458,17 @@ describe("the consent screen", () => {
     assert.equal(c.store.codes.size, 0);
   });
 
+  it("serves the consent page with a referrer policy that lets the browser send its real Origin on Allow", async () => {
+    // With `no-referrer` browsers send `Origin: null` on the form POST, which the origin check (rightly) refuses,
+    // so a real person clicking Allow would be blocked. `null` must stay refused; the page must avoid producing it.
+    const c = setup();
+    const { cb, cookie } = await toConsent(c, { clientId: await registerClient(c) });
+    assert.equal(cb.headers.get("referrer-policy"), "same-origin");
+    const token = await consentToken(cb);
+    assert.equal((await c.flow.consent(consentPost(token, "allow", cookie, { origin: "null" }))).status, 403, "Origin: null is still refused");
+    assert.equal((await c.flow.consent(consentPost(token, "allow", cookie, { origin: BASE }))).status, 302, "the real Origin is accepted");
+  });
+
   it("accepts a same-origin post and clears the binding cookie afterwards", async () => {
     const c = setup();
     const { cb, cookie } = await toConsent(c, { clientId: await registerClient(c) });

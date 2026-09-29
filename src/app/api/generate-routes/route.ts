@@ -43,6 +43,7 @@ import {
   techIsPreferredForJob,
   type GenerateException,
 } from "@/lib/routing/generate-selection";
+import { guarded } from "@/lib/api-guard";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
@@ -1674,7 +1675,7 @@ async function buildFastFallbackRoutes({
   };
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   // Route generation is the most expensive thing the app does: a Route
   // Optimization solve (billed per stop) plus a drive-time matrix per route.
   // While paused, refuse before touching anything rather than silently
@@ -2861,3 +2862,5 @@ export async function POST(request: NextRequest) {
     }
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

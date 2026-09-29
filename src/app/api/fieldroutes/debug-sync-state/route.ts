@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 // Read-only: dumps fieldRoutesState/sync + fieldRoutesState/manualSync +
 // job/technician counts for one or more company docs, so we can tell which
@@ -14,7 +15,7 @@ import { adminDb } from "@/lib/firebase-admin";
 //   GET /api/fieldroutes/debug-sync-state            -> all company docs
 //   GET /api/fieldroutes/debug-sync-state?companyId=x -> just that one
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   try {
     const db = adminDb();
     const companyId = new URL(request.url).searchParams.get("companyId") || "";
@@ -63,3 +64,5 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const GET = guarded("operator", GETHandler);

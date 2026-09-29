@@ -3,11 +3,12 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 const BACKEND_URL =
   process.env.BACKEND_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
   const { companyId } = body as { companyId?: string };
 
@@ -66,3 +67,5 @@ export async function POST(request: NextRequest) {
     { status: hasError ? 502 : 200 },
   );
 }
+
+export const POST = guarded("operator", POSTHandler);

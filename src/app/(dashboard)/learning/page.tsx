@@ -16,6 +16,7 @@ import { ModelMetrics } from "@/types";
 import { formatDate } from "@/lib/utils";
 import { Brain, Loader2, RefreshCw, Target, Database, Eye } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import { apiFetch } from "@/lib/api-client";
 
 export default function LearningPage() {
   const { userProfile } = useAuth();
@@ -66,7 +67,7 @@ export default function LearningPage() {
     if (!userProfile?.companyId) return;
     setRetraining(true);
     try {
-      const res = await fetch("/api/retrain-model", {
+      const res = await apiFetch("/api/retrain-model", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ companyId: userProfile.companyId }),

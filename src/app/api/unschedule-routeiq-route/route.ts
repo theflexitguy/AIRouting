@@ -5,6 +5,7 @@ export const maxDuration = 120;
 import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 function clean(value: unknown) {
   return String(value ?? "").trim();
@@ -27,7 +28,7 @@ function syncDetailsFromRoute(route: FirebaseFirestore.DocumentData) {
   };
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const { companyId, routeId, requestedBy } = await request.json();
     if (!companyId || !routeId) {
@@ -82,3 +83,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Failed to unschedule routiq route", details: String(error) }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

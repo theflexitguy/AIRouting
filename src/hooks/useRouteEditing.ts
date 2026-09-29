@@ -7,6 +7,7 @@ import { doc, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { Job, Route } from "@/types";
 import { toast } from "sonner";
+import { apiFetch } from "@/lib/api-client";
 
 interface TechRoute {
   route: Route;
@@ -156,7 +157,7 @@ export function useRouteEditing({
 
         // Record feedback
         try {
-          await fetch("/api/record-feedback", {
+          await apiFetch("/api/record-feedback", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -210,7 +211,7 @@ export function useRouteEditing({
         toast.success(`Moved ${job?.customerName || "stop"} to ${currentRoute.tech.name}`);
 
         // Record feedback for both routes
-        fetch("/api/record-feedback", {
+        apiFetch("/api/record-feedback", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -222,7 +223,7 @@ export function useRouteEditing({
           }),
         }).catch(() => {});
 
-        fetch("/api/record-feedback", {
+        apiFetch("/api/record-feedback", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { adminDb } from "@/lib/firebase-admin";
 import { recordApiUsage } from "@/lib/fieldroutes/usage";
+import { guarded } from "@/lib/api-guard";
 
 const FIELDROUTES_NWA_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -169,7 +170,7 @@ function syncDetailsFromRoute(route: FirebaseFirestore.DocumentData) {
   };
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const { companyId, routeId, requestedBy } = await request.json();
     if (!companyId || !routeId) {
@@ -326,3 +327,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Failed to undo FieldRoutes stops", details: String(error) }, { status: 500 });
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

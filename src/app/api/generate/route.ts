@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || process.env.BACKEND_URL || "";
 
@@ -16,7 +17,7 @@ const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || process.env.BACKEND_U
  * If BACKEND_URL is not set the endpoint returns a clear error — the JS
  * fallback solver was removed in favour of the Python engine.
  */
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = await request.json();
     const { companyId, date, runSettings } = body as {
@@ -132,3 +133,5 @@ export async function POST(request: NextRequest) {
     );
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

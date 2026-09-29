@@ -7,6 +7,7 @@ import { adminDb } from "@/lib/firebase-admin";
 import { CRITICAL_CLASSES, parseSchedulingRequest } from "@/lib/scheduling-constraints";
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
+import { guarded } from "@/lib/api-guard";
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const APPOINTMENT_ID_FIELDS = ["appointmentID", "appointmentId", "appointment_id", "id"];
@@ -1680,7 +1681,7 @@ async function uploadRouteToFieldRoutes({
   return summary;
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   // Hoisted so the finally block can meter whatever API quota this approval spent.
   let usageClient: FieldRoutesClient | null = null;
   let usageCompanyId = "";
@@ -1858,3 +1859,5 @@ export async function POST(request: NextRequest) {
     }
   }
 }
+
+export const POST = guarded("company-write", POSTHandler);

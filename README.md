@@ -24,6 +24,8 @@ This project uses [`next/font`](https://nextjs.org/docs/app/building-your-applic
 
 Routiq exposes a read-only [Model Context Protocol](https://modelcontextprotocol.io) server at `/api/mcp` so an LLM can read the whole dashboard, from the overview down to individual stops. See [docs/MCP.md](docs/MCP.md) for setup, client configuration and the security model.
 
+Every API route requires a signed-in user of the right company (or the operator secret). See [docs/SECURITY.md](docs/SECURITY.md) for who can call what, and the Firestore-rules deploy step.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

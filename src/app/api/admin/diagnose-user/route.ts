@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb, adminAuth } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 interface DiagnoseResult {
   status: number;
@@ -105,7 +106,7 @@ async function diagnose(email: string, targetCompanyId?: string): Promise<Diagno
 
 // GET is read-only: pass ?email=... to look up the account's companyId from a
 // browser. Reassignment is intentionally POST-only.
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const email = new URL(request.url).searchParams.get("email")?.trim();
   if (!email) {
     return NextResponse.json({ error: "email query parameter is required" }, { status: 400 });
@@ -119,7 +120,7 @@ export async function GET(request: NextRequest) {
   }
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
   const { email, targetCompanyId } = body as { email?: string; targetCompanyId?: string };
 
@@ -135,3 +136,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: msg, email }, { status: 500 });
   }
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

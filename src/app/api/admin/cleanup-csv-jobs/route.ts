@@ -4,27 +4,13 @@ export const maxDuration = 60;
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 // Stop deleting once we approach the function time budget; the caller repeats
 // the request until the response reports done:true.
 const SOFT_DEADLINE_MS = 45_000;
 
-// Same fail-closed guard as the sync routes.
-function authorized(request: NextRequest): boolean {
-  const secret = (process.env.CRON_SECRET || "").trim();
-  if (!secret) return false;
-  const auth = request.headers.get("authorization") || "";
-  if (auth === `Bearer ${secret}`) return true;
-  if ((request.headers.get("x-cron-secret") || "") === secret) return true;
-  if (new URL(request.url).searchParams.get("secret") === secret) return true;
-  return false;
-}
-
 async function handle(request: NextRequest) {
-  if (!authorized(request)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
-
   const url = new URL(request.url);
   const companyId = (
     url.searchParams.get("companyId") ||
@@ -88,10 +74,13 @@ async function handle(request: NextRequest) {
   return NextResponse.json({ success: true, companyId, dryRun, scanned, matched, deleted, done, message });
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   return handle(request);
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   return handle(request);
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

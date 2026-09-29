@@ -8,6 +8,7 @@ import {
   skillCatalogIdToName,
   requiredSkillsByServiceTypeDescription,
 } from "@/lib/fieldroutes/skills";
+import { guarded } from "@/lib/api-guard";
 
 // Read-only diagnostic: discover how FieldRoutes exposes the Skills feature so we
 // can wire skill-aware routing precisely (technician skills + service-type
@@ -167,14 +168,17 @@ async function handle(companyIdParam: string | undefined, lookupEmployeeId?: str
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   const body = (await request.json().catch(() => ({}))) as { companyId?: string; employeeId?: string };
   return handle(body.companyId, body.employeeId);
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const url = new URL(request.url);
   const companyId = url.searchParams.get("companyId") || undefined;
   const employeeId = url.searchParams.get("employeeId") || undefined;
   return handle(companyId, employeeId);
 }
+
+export const POST = guarded("operator", POSTHandler);
+export const GET = guarded("operator", GETHandler);

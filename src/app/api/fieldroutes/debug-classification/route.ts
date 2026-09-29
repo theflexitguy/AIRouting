@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { centralTodayISO } from "@/lib/fieldroutes/scope";
 import { deriveServiceLine } from "@/lib/routing/service-line";
+import { guarded } from "@/lib/api-guard";
 
 // Read-only diagnostic over already-synced job docs (Firestore only — no
 // FieldRoutes API calls). Answers two questions:
@@ -14,7 +15,7 @@ import { deriveServiceLine } from "@/lib/routing/service-line";
 
 const isInitialLabel = (s: string) => /initial/i.test(s);
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const body = (await request.json().catch(() => ({}))) as { companyId?: string };
     const db = adminDb();
@@ -131,3 +132,5 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+export const POST = guarded("operator", POSTHandler);

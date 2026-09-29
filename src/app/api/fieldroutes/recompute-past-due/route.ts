@@ -2,23 +2,11 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { recomputePastDue, purgeNonRecurring, reconcileActiveSubscriptions, purgeInactiveCustomers } from "@/lib/fieldroutes/sync";
+import { guarded } from "@/lib/api-guard";
 
-function authorized(request: NextRequest): boolean {
-  const secret = (process.env.CRON_SECRET || "").trim();
-  if (!secret) return false;
-  const auth = request.headers.get("authorization") || "";
-  if (auth === `Bearer ${secret}`) return true;
-  if ((request.headers.get("x-cron-secret") || "") === secret) return true;
-  if (new URL(request.url).searchParams.get("secret") === secret) return true;
-  return false;
-}
-
-async function handle(request: NextRequest) {
-  if (!authorized(request)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
+async function handle() {
   try {
     // Sweep cancelled/frozen subs (one cheap API search) and one-time/as-needed
     // stragglers, then refresh derived date-window flags.
@@ -49,10 +37,13 @@ async function handle(request: NextRequest) {
   }
 }
 
-export async function GET(request: NextRequest) {
-  return handle(request);
+async function GETHandler() {
+  return handle();
 }
 
-export async function POST(request: NextRequest) {
-  return handle(request);
+async function POSTHandler() {
+  return handle();
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

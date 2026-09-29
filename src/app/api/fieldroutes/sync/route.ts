@@ -5,25 +5,9 @@ export const maxDuration = 120;
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { runSync, type SyncMode } from "@/lib/fieldroutes/sync";
-
-// Guards the route with CRON_SECRET. Vercel Cron automatically sends
-// `Authorization: Bearer ${CRON_SECRET}`; manual callers may use that header,
-// `x-cron-secret`, or `?secret=`.
-function authorized(request: NextRequest): boolean {
-  const secret = (process.env.CRON_SECRET || "").trim();
-  if (!secret) return false; // fail closed — never run unguarded
-  const auth = request.headers.get("authorization") || "";
-  if (auth === `Bearer ${secret}`) return true;
-  if ((request.headers.get("x-cron-secret") || "") === secret) return true;
-  if (new URL(request.url).searchParams.get("secret") === secret) return true;
-  return false;
-}
+import { guarded } from "@/lib/api-guard";
 
 async function handle(request: NextRequest) {
-  if (!authorized(request)) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
-
   const url = new URL(request.url);
 
   // ?action=cleanup wipes all stale FieldRoutes-derived data so the next sync
@@ -118,10 +102,13 @@ async function handle(request: NextRequest) {
   }
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   return handle(request);
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   return handle(request);
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

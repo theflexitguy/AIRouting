@@ -99,6 +99,7 @@ import {
   startOfMonth,
   subDays,
 } from "date-fns";
+import { apiFetch } from "@/lib/api-client";
 
 
 
@@ -347,7 +348,7 @@ export default function DashboardPage() {
       // The endpoint stops short of its timeout on a long re-lift and returns
       // what it did not reach; continue until nothing is left (bounded).
       for (let i = 0; i < 8 && pending.length > 0; i++) {
-        const res = await fetch("/api/fieldroutes/monthly-done", {
+        const res = await apiFetch("/api/fieldroutes/monthly-done", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ companyId, monthKeys: pending }),
@@ -443,7 +444,7 @@ export default function DashboardPage() {
     const timer = setTimeout(async () => {
       setRangeVerifying(true);
       try {
-        const res = await fetch("/api/fieldroutes/reconcile-range", {
+        const res = await apiFetch("/api/fieldroutes/reconcile-range", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ startDate: dateFrom, endDate: dateTo }),

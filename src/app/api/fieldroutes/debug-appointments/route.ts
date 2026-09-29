@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
 import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadServiceTypeCatalog, stopKindFor } from "@/lib/fieldroutes/sync";
+import { guarded } from "@/lib/api-guard";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -196,9 +197,12 @@ async function handle(request: NextRequest) {
   }
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   return handle(request);
 }
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   return handle(request);
 }
+
+export const GET = guarded("operator", GETHandler);
+export const POST = guarded("operator", POSTHandler);

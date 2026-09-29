@@ -3,8 +3,9 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const companyId = searchParams.get("companyId");
@@ -44,3 +45,5 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Failed to fetch jobs" }, { status: 500 });
   }
 }
+
+export const GET = guarded("company", GETHandler);

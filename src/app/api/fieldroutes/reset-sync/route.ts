@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
+import { guarded } from "@/lib/api-guard";
 
 // Resets a company's FieldRoutes sync state:
 //  - clears the daily manual-sync counter (the 3/day rate limit)
@@ -60,7 +61,7 @@ async function resetSync(companyId: string | undefined, clearRun: boolean, clear
   return NextResponse.json({ success: !hasError, companyId, ...results }, { status: hasError ? 502 : 200 });
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   const body = await request.json().catch(() => ({}));
   const { companyId, clearRun = true, clearCursor = false } = body as {
     companyId?: string;
@@ -70,10 +71,13 @@ export async function POST(request: NextRequest) {
   return resetSync(companyId, clearRun, clearCursor);
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const params = new URL(request.url).searchParams;
   const companyId = params.get("companyId") || undefined;
   const clearRun = params.get("clearRun") !== "false";
   const clearCursor = params.get("clearCursor") === "true";
   return resetSync(companyId, clearRun, clearCursor);
 }
+
+export const POST = guarded("operator", POSTHandler);
+export const GET = guarded("operator", GETHandler);

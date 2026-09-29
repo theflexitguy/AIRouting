@@ -8,6 +8,7 @@ import { FieldRoutesClient } from "@/lib/fieldroutes/client";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { computeMonthlyDone, MONTHLY_DONE_VERSION } from "@/lib/fieldroutes/monthly-done";
 import { centralTodayISO } from "@/lib/fieldroutes/scope";
+import { guarded, type ApiAuth } from "@/lib/api-guard";
 
 const FIELDROUTES_DEFAULT_BASE_URL = "https://flexpc.fieldroutes.com/api";
 
@@ -182,7 +183,7 @@ async function handle(
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request, auth: ApiAuth) {
   const body = (await request.json().catch(() => ({}))) as {
     companyId?: string;
     month?: string;
@@ -190,16 +191,19 @@ export async function POST(request: Request) {
     monthKeys?: unknown;
   };
   const keys = Array.isArray(body.monthKeys) ? body.monthKeys.map((k) => String(k)) : undefined;
-  return handle(body.companyId, body.month, body.months !== undefined ? String(body.months) : undefined, keys);
+  return handle(body.companyId || auth.companyId, body.month, body.months !== undefined ? String(body.months) : undefined, keys);
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest, auth: ApiAuth) {
   const params = new URL(request.url).searchParams;
   const keys = (params.get("monthKeys") || "").split(",").map((k) => k.trim()).filter(Boolean);
   return handle(
-    params.get("companyId") || undefined,
+    params.get("companyId") || auth.companyId,
     params.get("month") || undefined,
     params.get("months") || undefined,
     keys.length > 0 ? keys : undefined,
   );
 }
+
+export const POST = guarded("company", POSTHandler, { implicitCompany: true });
+export const GET = guarded("company", GETHandler, { implicitCompany: true });
