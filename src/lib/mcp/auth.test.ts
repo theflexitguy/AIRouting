@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { authorize, extractToken } from "./auth.ts";
 import { MIN_KEY_LENGTH, readMcpConfig } from "./config.ts";
+import { signJwt } from "./oauth/jwt.ts";
 
 const KEY = "k".repeat(40);
 const OTHER = "z".repeat(40);
@@ -101,5 +102,60 @@ describe("authorize", () => {
       assert.ok(!r.message.includes(OTHER));
       assert.ok(!r.message.includes(KEY));
     }
+  });
+});
+
+describe("authorize — signed-in users", () => {
+  const SECRET = "j".repeat(40);
+  const NOW = 1_800_000_000;
+  const jwt = signJwt(SECRET, "access", { email: "kalin@flexpestcontrol.com" }, { nowSec: NOW, ttlSec: 60 });
+  const verify = (t: string) => (t === jwt ? { email: "kalin@flexpestcontrol.com" } : null);
+
+  it("accepts a valid access token and identifies the person", () => {
+    const r = authorize(h({ authorization: `Bearer ${jwt}` }), [], verify);
+    assert.ok(r.ok);
+    if (r.ok) {
+      assert.equal(r.principal, "user:kalin@flexpestcontrol.com");
+      assert.equal(r.email, "kalin@flexpestcontrol.com");
+      assert.equal(r.keyId, undefined);
+    }
+  });
+
+  it("is enough on its own: no static key is needed, and a missing token is 401 (not 503)", () => {
+    const r = authorize(h({}), [], verify);
+    assert.ok(!r.ok);
+    if (!r.ok) {
+      assert.equal(r.status, 401);
+      assert.equal(r.invalidToken, undefined, "no token was presented");
+    }
+  });
+
+  it("refuses a JWT the verifier rejects, flagging it as an invalid token", () => {
+    const stale = signJwt(SECRET, "access", { email: "x@flexpestcontrol.com" }, { nowSec: NOW, ttlSec: 60 });
+    const r = authorize(h({ authorization: `Bearer ${stale}` }), [], verify);
+    assert.ok(!r.ok);
+    if (!r.ok) assert.deepEqual([r.status, r.invalidToken], [401, true]);
+  });
+
+  it("still accepts the static key alongside sign-in, and reports it as a key", () => {
+    const r = authorize(h({ authorization: `Bearer ${KEY}` }), [KEY], verify);
+    assert.ok(r.ok);
+    if (r.ok) assert.match(r.principal, /^key:[0-9a-f]{8}$/);
+  });
+
+  it("does not let a bad JWT fall through to matching as a static key", () => {
+    const r = authorize(h({ authorization: "Bearer aaaa.bbbb.cccc" }), [KEY], verify);
+    assert.ok(!r.ok);
+  });
+
+  it("stays closed (503) only when NEITHER sign-in nor a key is configured", () => {
+    const r = authorize(h({ authorization: `Bearer ${jwt}` }), [], null);
+    assert.ok(!r.ok);
+    if (!r.ok) assert.equal(r.status, 503);
+  });
+
+  it("ignores a JWT-shaped token when sign-in is off, treating it as a (wrong) key", () => {
+    const r = authorize(h({ authorization: `Bearer ${jwt}` }), [KEY], null);
+    assert.ok(!r.ok);
   });
 });

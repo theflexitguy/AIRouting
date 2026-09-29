@@ -10,7 +10,7 @@
 // Nothing about the company, its data or its tools is reachable before step 2 succeeds.
 
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { authorize } from "./auth.ts";
+import { authorize, type BearerVerifier } from "./auth.ts";
 import type { McpConfig } from "./config.ts";
 import type { McpContext } from "./data-source.ts";
 import { createRoutiqMcpServer } from "./server.ts";
@@ -42,24 +42,27 @@ export interface HandlerDeps {
   config: McpConfig;
   /** Resolves the data source (and today's date) for an authenticated request. */
   resolveContext: () => Promise<McpContext | { error: string }>;
+  /** Google sign-in, when configured. Absent = only the static API key is accepted. */
+  oauth?: { verifyAccessToken: BearerVerifier; resourceMetadataUrl: string } | null;
 }
 
 export async function handleMcpRequest(request: Request, deps: HandlerDeps): Promise<Response> {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: BASE_HEADERS });
 
-  const auth = authorize(request.headers, deps.config.keys);
+  const auth = authorize(request.headers, deps.config.keys, deps.oauth?.verifyAccessToken ?? null);
   if (!auth.ok) {
-    if (auth.status === 503) console.error("[mcp] refused: no valid MCP_API_KEY configured");
+    if (auth.status === 503) console.error("[mcp] refused: neither MCP_API_KEY nor Google sign-in is configured");
     else console.warn("[mcp] refused: bad credentials");
-    return json(
-      auth.status,
-      { error: auth.message },
-      auth.status === 401 ? { "WWW-Authenticate": 'Bearer realm="routiq-mcp"' } : {},
-    );
+    // With sign-in configured the challenge points clients at the discovery document (RFC 9728),
+    // which is how an MCP client learns it should open a browser and sign the user in.
+    const challenge = deps.oauth
+      ? `Bearer realm="routiq-mcp", resource_metadata="${deps.oauth.resourceMetadataUrl}"${auth.invalidToken ? ', error="invalid_token"' : ""}`
+      : 'Bearer realm="routiq-mcp"';
+    return json(auth.status, { error: auth.message }, auth.status === 401 ? { "WWW-Authenticate": challenge } : {});
   }
-  // Which key is in use (a short digest, never the key) — lets you see when the old key stops
-  // being used during a rotation.
-  console.log(`[mcp] authorized key=${auth.keyId}`);
+  // Who is calling: a signed-in user's email, or a short digest of the static key (never the key) —
+  // the digest lets you see when an old key stops being used during a rotation.
+  console.log(`[mcp] authorized ${auth.principal}`);
   if (deps.config.rejectedShortKeys > 0) {
     console.warn(`[mcp] ${deps.config.rejectedShortKeys} configured key(s) ignored: keys must be at least 24 characters`);
   }

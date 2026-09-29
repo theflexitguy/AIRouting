@@ -13,6 +13,7 @@ import { centralTodayISO } from "@/lib/fieldroutes/scope";
 import { readMcpConfig } from "@/lib/mcp/config";
 import { handleMcpRequest } from "@/lib/mcp/handler";
 import { FirestoreDataSource } from "@/lib/mcp/firestore-source";
+import { getOAuth } from "@/lib/mcp/oauth/runtime";
 
 // Company ids already confirmed to exist, for the life of this server instance.
 const verified = new Set<string>();
@@ -38,8 +39,10 @@ async function resolveCompanyId(configured: string | null): Promise<string | { e
 
 async function handle(request: Request): Promise<Response> {
   const config = readMcpConfig();
+  const oauth = getOAuth();
   return handleMcpRequest(request, {
     config,
+    oauth: oauth ? { verifyAccessToken: oauth.verifyAccessToken, resourceMetadataUrl: oauth.resourceMetadataUrl } : null,
     resolveContext: async () => {
       const companyId = await resolveCompanyId(config.companyId);
       if (typeof companyId !== "string") return companyId;
