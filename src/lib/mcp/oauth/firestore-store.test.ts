@@ -61,7 +61,7 @@ class FakeFirestore {
 }
 
 const code: CodeRecord = { clientId: "cid", redirectUri: "https://a.com/cb", codeChallenge: "c".repeat(43), email: "a@flexpestcontrol.com", scope: "mcp:read", resource: "https://x/api/mcp", expiresAtMs: 1_800_000_060_000 };
-const refresh: RefreshRecord = { clientId: "cid", email: "a@flexpestcontrol.com", scope: "mcp:read", resource: "https://x/api/mcp", familyId: "fam1", familyStartMs: 1_800_000_000_000, expiresAtMs: 1_802_592_000_000 };
+const refresh: RefreshRecord = { clientId: "cid", email: "a@flexpestcontrol.com", scope: "mcp:read", resource: "https://x/api/mcp", familyId: "fam1", familyStartMs: 1_800_000_000_000, familyEndMs: 1_807_776_000_000, expiresAtMs: 1_802_592_000_000 };
 const make = () => { const db = new FakeFirestore(); return { db, store: new FirestoreOAuthStore(db as never) }; };
 
 describe("FirestoreOAuthStore", () => {
@@ -126,7 +126,7 @@ describe("FirestoreOAuthStore", () => {
     const again = await store.takeRefresh("R1");
     assert.equal(again!.consumed, true, "a second presentation is recognisable as reuse");
     assert.equal(again!.rec.familyId, "fam1");
-    await store.revokeFamily("fam1", refresh.expiresAtMs);
+    await store.revokeFamily("fam1", refresh.familyEndMs);
     assert.equal(await store.takeRefresh("R1"), null);
     assert.equal(await store.takeRefresh("R2"), null);
     assert.equal((await store.takeRefresh("OTHER"))!.consumed, false, "other families are untouched");
@@ -135,7 +135,7 @@ describe("FirestoreOAuthStore", () => {
   it("refuses to add a token to a revoked family (a rotation racing a revocation cannot leave a survivor)", async () => {
     const { db, store } = make();
     assert.equal(await store.putRefresh("R1", refresh), true);
-    await store.revokeFamily("fam1", refresh.expiresAtMs);
+    await store.revokeFamily("fam1", refresh.familyEndMs);
     assert.ok(db.data.has("mcpOAuthRevokedFamilies/fam1"), "the revocation is recorded durably");
     assert.equal(await store.putRefresh("R2", refresh), false, "a successor written after revocation is refused");
     assert.equal(await store.takeRefresh("R2"), null);

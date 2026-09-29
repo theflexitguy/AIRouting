@@ -18,9 +18,11 @@ class FakeGoogle implements GoogleClient {
   identity: GoogleIdentity | Error = GOOD;
   nonceOverride: string | undefined;
   lastNonce = "";
+  nonceByCode = new Map<string, string>();
   calls: Array<{ code: string; redirectUri: string }> = [];
   authorizationUrl(p: { redirectUri: string; state: string; nonce: string }) {
     this.lastNonce = p.nonce;
+    this.nonceByCode.set(p.state, p.nonce);
     return `https://accounts.google.com/auth?state=${encodeURIComponent(p.state)}&nonce=${p.nonce}&redirect_uri=${encodeURIComponent(p.redirectUri)}`;
   }
   async exchangeCode(p: { code: string; redirectUri: string }) {
@@ -182,8 +184,34 @@ describe("authorization request validation", () => {
     const c = setup();
     const r = await start(c, { clientId: await registerClient(c) });
     const cookie = r.headers.get("set-cookie")!;
-    assert.match(cookie, /^__Host-routiq_mcp_bind=/);
+    assert.match(cookie, /^__Host-routiq_mcp_bind_[A-Za-z0-9_-]+=/);
     for (const attr of ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"]) assert.ok(cookie.includes(attr), attr);
+  });
+});
+
+describe("concurrent sign-ins from one browser", () => {
+  it("each attempt has its own binding cookie, so a second sign-in can't break the first", async () => {
+    const c = setup();
+    const clientId = await registerClient(c);
+    const a1 = await start(c, { clientId });
+    const a2 = await start(c, { clientId });
+    const c1 = cookieOf(a1), c2 = cookieOf(a2);
+    assert.notEqual(c1.split("=")[0], c2.split("=")[0], "different cookie names");
+    const both = `${c1}; ${c2}`; // the browser now holds both
+    for (const a of [a1, a2]) {
+      c.google.lastNonce = c.google.nonceByCode.get(googleStateOf(a))!; // the nonce Google would echo for THIS attempt
+      const cb = await c.flow.googleCallback(new Request(`${BASE}/api/oauth/google/callback?code=G-CODE&state=${encodeURIComponent(googleStateOf(a))}`, { headers: { cookie: both } }));
+      assert.equal(cb.status, 200, await cb.clone().text());
+    }
+  });
+
+  it("a cookie from one attempt cannot satisfy another attempt's state", async () => {
+    const c = setup();
+    const clientId = await registerClient(c);
+    const a1 = await start(c, { clientId });
+    const a2 = await start(c, { clientId });
+    const cb = await c.flow.googleCallback(new Request(`${BASE}/api/oauth/google/callback?code=G-CODE&state=${encodeURIComponent(googleStateOf(a1))}`, { headers: { cookie: cookieOf(a2) } }));
+    assert.equal(cb.status, 400);
   });
 });
 
@@ -578,12 +606,23 @@ describe("refresh tokens", () => {
     assert.equal(c.store.live.length, 0);
   });
 
+  it("a spent token is still caught after ITS OWN expiry, until the whole family ends", async () => {
+    const c = setup();
+    const { clientId, tokens } = await login(c);
+    const thief = await json(await refresh(c, clientId, tokens.refresh_token)); // copy redeemed first
+    c.t.now += 31 * 86400 * 1000; // the ORIGINAL token's 30-day expiry has passed; the thief's successor's has not
+    const owner = await refresh(c, clientId, tokens.refresh_token);
+    assert.equal((await json(owner)).error, "invalid_grant");
+    assert.equal(c.store.live.length, 0, "the thief's descendant is revoked, not left rotating");
+    assert.equal((await json(await refresh(c, clientId, thief.refresh_token))).error, "invalid_grant");
+  });
+
   it("a rotation that finishes after its family was revoked gets no token", async () => {
     const c = setup();
     const { clientId, tokens } = await login(c);
     const orig = c.store.putRefresh.bind(c.store);
     // Simulate the race: while this rotation is between "mark spent" and "store successor", the family is revoked.
-    c.store.putRefresh = async (h, rec) => { await c.store.revokeFamily(rec.familyId, rec.expiresAtMs); return orig(h, rec); };
+    c.store.putRefresh = async (h, rec) => { await c.store.revokeFamily(rec.familyId, rec.familyEndMs); return orig(h, rec); };
     const res = await refresh(c, clientId, tokens.refresh_token);
     assert.equal((await json(res)).error, "invalid_grant");
     assert.equal(c.store.live.length, 0);

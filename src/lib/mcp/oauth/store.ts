@@ -24,6 +24,9 @@ export interface RefreshRecord {
   familyId: string;
   /** When the ORIGINAL login happened; a family is capped at this + refreshMaxAgeSec. */
   familyStartMs: number;
+  /** When the family ends (familyStartMs + the max age). Spent tokens stay detectable until then. */
+  familyEndMs: number;
+  /** This token's own expiry — enforced by the caller; the stored TTL field is the family end, so spent tokens outlive it. */
   expiresAtMs: number;
 }
 

@@ -98,17 +98,21 @@ export function createOAuthFlow(deps: FlowDeps) {
 
   // ---- same-browser binding cookie (defeats a login started in one browser finishing in another) ----
   const secure = cfg.publicUrl.startsWith("https:");
-  const COOKIE = secure ? "__Host-routiq_mcp_bind" : "routiq_mcp_bind";
-  const setCookie = (value: string, maxAge: number) =>
-    `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
-  const readCookie = (req: Request): string => {
+  // One cookie PER sign-in attempt (name carries a short random id), so two sign-ins started from the same browser
+  // at once — a retry, or two connectors — never overwrite each other's binding.
+  const COOKIE_BASE = secure ? "__Host-routiq_mcp_bind_" : "routiq_mcp_bind_";
+  const bindId = (v: unknown): string => (typeof v === "string" && /^[A-Za-z0-9_-]{1,16}$/.test(v) ? v : "");
+  const setCookie = (id: string, value: string, maxAge: number) =>
+    `${COOKIE_BASE}${id}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
+  const readCookie = (req: Request, id: string): string => {
+    if (!id) return "";
     for (const part of (req.headers.get("cookie") || "").split(";")) {
       const [k, ...v] = part.trim().split("=");
-      if (k === COOKIE) return v.join("=");
+      if (k === COOKIE_BASE + id) return v.join("=");
     }
     return "";
   };
-  const boundTo = (req: Request, bd: unknown) => typeof bd === "string" && !!readCookie(req) && same(sha256hex(readCookie(req)), bd);
+  const boundTo = (req: Request, id: string, bd: unknown) => typeof bd === "string" && !!readCookie(req, id) && same(sha256hex(readCookie(req, id)), bd);
 
   function redirectTo(uri: string, params: Record<string, string | undefined>, extra: Record<string, string> = {}): Response {
     const u = new URL(uri);
@@ -183,15 +187,16 @@ export function createOAuthFlow(deps: FlowDeps) {
     if (resource && normResource(resource) !== cfg.resource) return fail("invalid_target", "resource must be the Routiq MCP endpoint");
 
     const binding = secret();
+    const bi = rand(6).toString("base64url");
     const nonce = secret();
     const state = signJwt(cfg.secret, "state", {
-      cid: client.clientId, ru: redirectUri, cc: challenge, cs: clientState, sc: SCOPE, rs: cfg.resource, nc: nonce, bd: sha256hex(binding),
+      cid: client.clientId, ru: redirectUri, cc: challenge, cs: clientState, sc: SCOPE, rs: cfg.resource, nc: nonce, bd: sha256hex(binding), bi,
     }, { nowSec: nowSec(), ttlSec: 600 });
     return new Response(null, {
       status: 302,
       headers: {
         location: deps.google.authorizationUrl({ redirectUri: url.callback, state, nonce }),
-        "set-cookie": setCookie(binding, 600),
+        "set-cookie": setCookie(bi, binding, 600),
         "cache-control": "no-store",
         "referrer-policy": "no-referrer",
       },
@@ -201,10 +206,11 @@ export function createOAuthFlow(deps: FlowDeps) {
   // ---------------------------------------------------------------- Google callback
   async function googleCallback(req: Request): Promise<Response> {
     const q = new URL(req.url).searchParams;
-    const clear = { "set-cookie": setCookie("", 0) };
     const st = verifyJwt(cfg.secret, "state", q.get("state") || "", { nowSec: nowSec() });
+    const bi = bindId(st?.bi);
+    const clear: Record<string, string> = bi ? { "set-cookie": setCookie(bi, "", 0) } : {};
     if (!st) return errorPage(400, "Sign-in expired", "Return to your application and start connecting again.", clear);
-    if (!boundTo(req, st.bd)) {
+    if (!boundTo(req, bi, st.bd)) {
       return errorPage(400, "Sign-in must finish in the same browser", "This sign-in was started in a different browser or window. Start connecting again from your application.", clear);
     }
     const client = resolveClient(cfg, st.cid, nowSec());
@@ -232,24 +238,26 @@ export function createOAuthFlow(deps: FlowDeps) {
     }
 
     const token = signJwt(cfg.secret, "consent", {
-      cid: st.cid, ru, cc: st.cc, cs: st.cs, sc: st.sc, rs: st.rs, em: decision.email, bd: st.bd,
+      cid: st.cid, ru, cc: st.cc, cs: st.cs, sc: st.sc, rs: st.rs, em: decision.email, bd: st.bd, bi,
     }, { nowSec: nowSec(), ttlSec: 300 });
     // Re-send the binding cookie so it lives at least as long as the consent token (Google sign-in/MFA may have used up
     // most of the original cookie's lifetime).
-    return consentPage({ email: decision.email, clientName: client.name, redirectUri: ru, token, action: url.consent }, { "set-cookie": setCookie(readCookie(req), 360) });
+    return consentPage({ email: decision.email, clientName: client.name, redirectUri: ru, token, action: url.consent }, { "set-cookie": setCookie(bi, readCookie(req, bi), 360) });
   }
 
   // ---------------------------------------------------------------- consent decision
   async function consent(req: Request): Promise<Response> {
-    const clear = { "set-cookie": setCookie("", 0) };
+    let clear: Record<string, string> = {};
     const origin = req.headers.get("origin");
     if (origin && origin !== cfg.publicUrl) return errorPage(403, "Request blocked", "This request did not come from the consent page.", clear);
     const text = await readBody(req);
     if (text === null) return errorPage(413, "Request too large", "Start again.", clear);
     const form = new URLSearchParams(text);
     const c = verifyJwt(cfg.secret, "consent", form.get("token") || "", { nowSec: nowSec() });
+    const bi = bindId(c?.bi);
+    if (bi) clear = { "set-cookie": setCookie(bi, "", 0) };
     if (!c) return errorPage(400, "This page has expired", "Return to your application and start connecting again.", clear);
-    if (!boundTo(req, c.bd)) return errorPage(400, "Sign-in must finish in the same browser", "Start connecting again from your application.", clear);
+    if (!boundTo(req, bi, c.bd)) return errorPage(400, "Sign-in must finish in the same browser", "Start connecting again from your application.", clear);
     const client = resolveClient(cfg, c.cid, nowSec());
     const ru = c.ru as string;
     if (!client || !redirectMatches(client.redirectUris, ru)) return errorPage(400, "Unknown application", "Start the connection again from the app.", clear);
@@ -275,7 +283,7 @@ export function createOAuthFlow(deps: FlowDeps) {
     const refresh = secret();
     // A client registered without the refresh_token grant gets an access token only.
     const stored = !withRefresh || await deps.store.putRefresh(sha256hex(refresh), {
-      clientId, email, scope, resource, familyId, familyStartMs,
+      clientId, email, scope, resource, familyId, familyStartMs, familyEndMs: familyStartMs + cfg.refreshMaxAgeSec * 1000,
       expiresAtMs: Math.min(now + cfg.refreshTtlSec * 1000, familyStartMs + cfg.refreshMaxAgeSec * 1000),
     });
     if (!stored) return tokenError("invalid_grant", "this session was revoked; sign in again");
@@ -321,8 +329,9 @@ export function createOAuthFlow(deps: FlowDeps) {
       if (taken.consumed) {
         // A spent token came back: either the owner or a thief holds a copy. We can't tell which, so end the whole
         // login — every descendant token dies and the person signs in again.
-        if (rec.expiresAtMs > nowMs()) {
-          await deps.store.revokeFamily(rec.familyId, rec.familyStartMs + cfg.refreshMaxAgeSec * 1000);
+        // Actionable until the whole FAMILY ends, not just this token's own expiry: a thief's successor can outlive it.
+        if (rec.familyEndMs > nowMs()) {
+          await deps.store.revokeFamily(rec.familyId, rec.familyEndMs);
           console.warn(`[mcp-oauth] refresh token reuse detected; revoked the session for user=${rec.email}`);
         }
         return tokenError("invalid_grant", "the refresh token is invalid, expired or already used");
@@ -344,7 +353,7 @@ export function createOAuthFlow(deps: FlowDeps) {
       // Revoking any token of a login ends that whole login. (Deleting just this one would also erase the spent-token
       // record that reuse detection relies on.)
       const taken = await deps.store.takeRefresh(sha256hex(t));
-      if (taken) await deps.store.revokeFamily(taken.rec.familyId, taken.rec.familyStartMs + cfg.refreshMaxAgeSec * 1000);
+      if (taken) await deps.store.revokeFamily(taken.rec.familyId, taken.rec.familyEndMs);
     }
     return json(200, {}); // always 200: never reveal whether a token existed
   }

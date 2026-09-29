@@ -54,7 +54,7 @@ export class FirestoreOAuthStore implements OAuthStore {
     // Firestore retries this and it sees the marker, so a revoked family can never gain a new member.
     return this.db.runTransaction(async (tx) => {
       if ((await tx.get(marker)).exists) return false;
-      tx.set(ref, { ...r, expiresAt: new Date(r.expiresAtMs) });
+      tx.set(ref, { ...r, expiresAt: new Date(r.familyEndMs) }); // TTL = family end, not token expiry: a spent token must stay detectable
       return true;
     });
   }
@@ -71,7 +71,7 @@ export class FirestoreOAuthStore implements OAuthStore {
     const d = got.d;
     return {
       consumed: got.consumed,
-      rec: { clientId: d.clientId, email: d.email, scope: d.scope, resource: d.resource, familyId: String(d.familyId ?? ""), familyStartMs: Number(d.familyStartMs), expiresAtMs: ms(d.expiresAt) },
+      rec: { clientId: d.clientId, email: d.email, scope: d.scope, resource: d.resource, familyId: String(d.familyId ?? ""), familyStartMs: Number(d.familyStartMs), familyEndMs: Number(d.familyEndMs) || ms(d.expiresAt), expiresAtMs: Number.isFinite(Number(d.expiresAtMs)) ? Number(d.expiresAtMs) : ms(d.expiresAt) },
     };
   }
   async revokeFamily(familyId: string, untilMs: number) {
