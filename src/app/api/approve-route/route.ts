@@ -8,6 +8,7 @@ import { CRITICAL_CLASSES, parseSchedulingRequest } from "@/lib/scheduling-const
 import { routeAddressKey, serviceDueAlreadyCompleted } from "@/lib/route-bundles";
 import { loadBudget, recordApiUsage } from "@/lib/fieldroutes/usage";
 import { guarded } from "@/lib/api-guard";
+import { fieldRoutesOfficeIdsFromEnv } from "@/lib/fieldroutes/client";
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const APPOINTMENT_ID_FIELDS = ["appointmentID", "appointmentId", "appointment_id", "id"];
@@ -150,6 +151,8 @@ class FieldRoutesClient {
   // daily budget). Defaults to no limit; set via setMaxTotal() before uploading.
   private maxTotal = Infinity;
 
+  private readonly officeIds: number[] = fieldRoutesOfficeIdsFromEnv();
+
   constructor({ baseUrl, authKey, authToken }: { baseUrl: string; authKey: string; authToken: string }) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.authKey = authKey;
@@ -172,6 +175,12 @@ class FieldRoutesClient {
     if (write) this.writes++;
     else this.reads++;
     const ep = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+    // Office scope (see lib/fieldroutes/client.ts): with a key that spans several offices, searches must name our
+    // office(s) or they return every office, and creates must name it or they may land in the wrong office.
+    if (this.officeIds.length > 0 && !("officeIDs" in payload) && !("officeID" in payload)) {
+      if (ep.endsWith("/search")) payload = { ...payload, officeIDs: this.officeIds };
+      else if (ep.endsWith("/create")) payload = { ...payload, officeID: this.officeIds[0] };
+    }
     const requestBody = Object.fromEntries(
       Object.entries({
         ...payload,
