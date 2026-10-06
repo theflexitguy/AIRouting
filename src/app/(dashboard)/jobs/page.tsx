@@ -16,7 +16,6 @@ import { formatDate } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency, parseMoney } from "@/lib/production-value";
 import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw, ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import { toast } from "sonner";
-import { apiFetch } from "@/lib/api-client";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
 
@@ -117,7 +116,6 @@ export default function JobsPage() {
   const [techs, setTechs] = useState<TechOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
-  const [syncRemaining, setSyncRemaining] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterTech, setFilterTech] = useState("all");
@@ -448,48 +446,9 @@ export default function JobsPage() {
     if (currentPage > totalPages) setCurrentPage(totalPages);
   }, [currentPage, totalPages]);
 
-  const fetchSyncLimit = useCallback(async () => {
-    if (!firebaseAuth?.currentUser) return;
-    try {
-      const token = await firebaseAuth.currentUser.getIdToken();
-      const res = await fetch("/api/fieldroutes/manual-sync", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setSyncRemaining(data.remaining ?? null);
-      }
-    } catch { /* ignore */ }
-  }, []);
-
-  useEffect(() => { fetchSyncLimit(); }, [fetchSyncLimit]);
-
-  const [resettingLimit, setResettingLimit] = useState(false);
-  const handleResetSyncLimit = async () => {
-    setResettingLimit(true);
-    try {
-      const res = await apiFetch("/api/fieldroutes/reset-sync", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      toast.success("Sync limit reset");
-      await fetchSyncLimit();
-    } catch {
-      toast.error("Couldn't reset the sync limit");
-    } finally {
-      setResettingLimit(false);
-    }
-  };
-
   const handleManualSync = async () => {
     if (!firebaseAuth?.currentUser) {
       toast.error("Not authenticated");
-      return;
-    }
-    if (syncRemaining !== null && syncRemaining <= 0) {
-      toast.error("Daily sync limit reached (3 per day)");
       return;
     }
 
@@ -518,22 +477,13 @@ export default function JobsPage() {
         const data = await res.json();
 
         if (!res.ok) {
-          if (res.status === 429) {
-            toast.error("Daily sync limit reached (3 per day)");
-            setSyncRemaining(0);
-          } else {
-            toast.error(data.error || "Sync failed");
-          }
+          toast.error(data.error || "Sync failed");
           return;
         }
 
         totalSubs = data.total || data.subscriptionsProcessed || totalSubs;
         totalWritten = data.written || totalWritten;
         done = data.done !== false;
-
-        if (data.syncLimit) {
-          setSyncRemaining(data.syncLimit.remaining);
-        }
 
         if (!done) {
           toast.info(`Syncing... ${data.offset || 0} of ${totalSubs} processed`);
@@ -655,23 +605,12 @@ export default function JobsPage() {
           </Select>
           <Button
             onClick={handleManualSync}
-            disabled={syncing || (syncRemaining !== null && syncRemaining <= 0)}
+            disabled={syncing}
             className="bg-blue-500 hover:bg-blue-600 text-white shrink-0 h-9"
           >
             {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
             {syncing ? "Syncing..." : "Sync Jobs"}
           </Button>
-          {syncRemaining !== null && (
-            <span className="text-xs text-muted-foreground self-center">
-              {syncRemaining} sync{syncRemaining !== 1 ? "s" : ""} left today
-            </span>
-          )}
-          {syncRemaining !== null && syncRemaining <= 0 && !syncing && (
-            <Button variant="outline" onClick={handleResetSyncLimit} disabled={resettingLimit} className="shrink-0 h-9">
-              {resettingLimit ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
-              Reset
-            </Button>
-          )}
         </div>
 
         <div className="flex flex-col lg:flex-row gap-2.5">
