@@ -30,7 +30,7 @@ const OPERATOR_ONLY = [
   "api/admin/cleanup-csv-jobs", "api/admin/delete-company", "api/admin/diagnose-user",
   "api/fieldroutes/debug-appointments", "api/fieldroutes/debug-classification", "api/fieldroutes/debug-customer",
   "api/fieldroutes/debug-line-target", "api/fieldroutes/debug-skills", "api/fieldroutes/debug-sync-state",
-  "api/fieldroutes/reset-jobs", "api/fieldroutes/reset-sync", "api/reset-routing",
+  "api/fieldroutes/reset-jobs", "api/reset-routing",
   "api/fieldroutes/sync", "api/fieldroutes/recompute-past-due",
 ];
 

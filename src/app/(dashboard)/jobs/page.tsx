@@ -16,6 +16,7 @@ import { formatDate } from "@/lib/utils";
 import { calculateStopProductionValue, formatCurrency, parseMoney } from "@/lib/production-value";
 import { Search, MapPin, Calendar, User, Loader2, AlertTriangle, DollarSign, Repeat, Briefcase, Trash2, RotateCcw, RefreshCw, ChevronUp, ChevronDown, ChevronsUpDown } from "lucide-react";
 import { toast } from "sonner";
+import { apiFetch } from "@/lib/api-client";
 import { DatePicker } from "@/components/ui/date-picker";
 import { format, addDays, startOfYear } from "date-fns";
 
@@ -463,6 +464,25 @@ export default function JobsPage() {
 
   useEffect(() => { fetchSyncLimit(); }, [fetchSyncLimit]);
 
+  const [resettingLimit, setResettingLimit] = useState(false);
+  const handleResetSyncLimit = async () => {
+    setResettingLimit(true);
+    try {
+      const res = await apiFetch("/api/fieldroutes/reset-sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      toast.success("Sync limit reset");
+      await fetchSyncLimit();
+    } catch {
+      toast.error("Couldn't reset the sync limit");
+    } finally {
+      setResettingLimit(false);
+    }
+  };
+
   const handleManualSync = async () => {
     if (!firebaseAuth?.currentUser) {
       toast.error("Not authenticated");
@@ -645,6 +665,12 @@ export default function JobsPage() {
             <span className="text-xs text-muted-foreground self-center">
               {syncRemaining} sync{syncRemaining !== 1 ? "s" : ""} left today
             </span>
+          )}
+          {syncRemaining !== null && syncRemaining <= 0 && !syncing && (
+            <Button variant="outline" onClick={handleResetSyncLimit} disabled={resettingLimit} className="shrink-0 h-9">
+              {resettingLimit ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
+              Reset
+            </Button>
           )}
         </div>
 
