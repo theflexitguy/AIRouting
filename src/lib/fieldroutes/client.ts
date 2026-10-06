@@ -11,6 +11,10 @@
 //  - response.ignoredParams must be []; if a filter is echoed there it was silently
 //    dropped and we must fail loud.
 //  - Limits: 3,000 reads/day, 60/min. Throttle to <= ~1 request/second.
+//  - Office scope: a single-office key silently filters every read to its office, but a GLOBAL key (one key for
+//    several offices) does not — it returns every office unless the request sends `officeIDs`. So every search
+//    sends officeIDs (FR_OFFICE_IDS, default "1" = the NWA office). Get calls fetch IDs that came from those
+//    filtered searches, so they stay in-office too.
 
 const SEARCH_ID_CAP = 50_000;
 const GET_CHUNK = 1_000;
@@ -21,6 +25,23 @@ export interface FieldRoutesConfig {
   authKey: string;
   authToken: string;
   timeoutMs: number;
+  /** Offices to read. Undefined = FR_OFFICE_IDS from the environment. Empty = no filter (every office the key sees). */
+  officeIds?: number[];
+}
+
+/**
+ * FR_OFFICE_IDS: comma-separated FieldRoutes office IDs to sync ("1" = NWA, "1,2" = NWA + Central AR).
+ * Unset means "1" — Routiq covers the NWA office only. "all" turns the filter off.
+ */
+export function fieldRoutesOfficeIdsFromEnv(raw: string | undefined = process.env.FR_OFFICE_IDS): number[] {
+  const v = (raw ?? "").trim();
+  if (!v) return [1];
+  if (v.toLowerCase() === "all") return [];
+  const ids = v.split(",").map((s) => Number(s.trim()));
+  if (ids.some((n) => !Number.isInteger(n) || n <= 0)) {
+    throw new Error(`FR_OFFICE_IDS must be a comma-separated list of office IDs (or "all"); got "${v}"`);
+  }
+  return Array.from(new Set(ids));
 }
 
 export function fieldRoutesConfigFromEnv(): FieldRoutesConfig {
@@ -108,8 +129,14 @@ export class FieldRoutesClient {
   // Hard cap on reads this client instance may perform (the remaining daily
   // budget). Defaults to no limit; set via setMaxReads() before a run.
   private maxReads = Infinity;
+  private readonly config: FieldRoutesConfig;
+  private readonly officeIds: number[];
 
-  constructor(private config: FieldRoutesConfig = fieldRoutesConfigFromEnv()) {}
+  // (No constructor parameter property: the test runner strips types but cannot transform those.)
+  constructor(config: FieldRoutesConfig = fieldRoutesConfigFromEnv()) {
+    this.config = config;
+    this.officeIds = config.officeIds ?? fieldRoutesOfficeIdsFromEnv();
+  }
 
   get readCount() {
     return this.reads;
@@ -131,6 +158,10 @@ export class FieldRoutesClient {
     }
     const endpoint = `/${module}/${action}`;
     const url = `${this.config.baseUrl}${endpoint}`;
+    // Keep every search inside our office(s). A caller that names an office explicitly is left alone.
+    if (action === "search" && this.officeIds.length > 0 && !("officeIDs" in payload) && !("officeID" in payload)) {
+      payload = { ...payload, officeIDs: this.officeIds };
+    }
     // Auth fields appended LAST, per the verified contract.
     const form = encodeForm({
       ...payload,

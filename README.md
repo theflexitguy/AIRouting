@@ -40,3 +40,15 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+## FieldRoutes office scope
+
+The FieldRoutes key (`FR_AUTH_KEY` / `FR_AUTH_TOKEN`) may be a **global** key covering several offices. A global key
+returns every office unless told otherwise, so every FieldRoutes search sends `officeIDs` and every route/appointment
+create sends `officeID`, taken from `FR_OFFICE_IDS`:
+
+| `FR_OFFICE_IDS` | Effect |
+|---|---|
+| unset | `1` — NWA only (the default) |
+| `1,2` | NWA and Central AR |
+| `all` | no office filter |
