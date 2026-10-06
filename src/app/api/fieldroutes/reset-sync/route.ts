@@ -12,7 +12,9 @@ import { guarded } from "@/lib/api-guard";
 // Supports both POST (companyId in JSON body) and GET (companyId in query
 // string) so it can be triggered straight from the browser address bar, e.g.
 //   /api/fieldroutes/reset-sync?companyId=company_xxx
-async function resetSync(companyId: string | undefined, clearRun: boolean, clearCursor: boolean = false) {
+async function resetSync(companyIdParam: string | undefined, clearRun: boolean, clearCursor: boolean = false) {
+  // Default to the company the FieldRoutes sync writes to, so the URL only needs the secret.
+  const companyId = companyIdParam || (process.env.FIELDROUTES_COMPANY_ID || "").trim() || undefined;
   if (!companyId) {
     return NextResponse.json({ success: false, error: "companyId is required" }, { status: 400 });
   }
