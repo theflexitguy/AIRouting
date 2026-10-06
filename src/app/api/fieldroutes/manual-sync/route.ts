@@ -128,6 +128,10 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[fieldroutes/manual-sync] failed:", message);
+    // A sync that failed (e.g. FieldRoutes rejected the key) shouldn't use up one of the day's syncs.
+    if (isNewSession) {
+      await limitRef.set({ date: today, count: Math.max(0, usedToday - 1) }, { merge: true }).catch(() => undefined);
+    }
     return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
 }

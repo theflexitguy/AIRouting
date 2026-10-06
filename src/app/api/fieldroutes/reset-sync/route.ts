@@ -3,7 +3,7 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { adminDb } from "@/lib/firebase-admin";
-import { guarded } from "@/lib/api-guard";
+import { guarded, type ApiAuth } from "@/lib/api-guard";
 
 // Resets a company's FieldRoutes sync state:
 //  - clears the daily manual-sync counter (the 3/day rate limit)
@@ -12,7 +12,9 @@ import { guarded } from "@/lib/api-guard";
 // Supports both POST (companyId in JSON body) and GET (companyId in query
 // string) so it can be triggered straight from the browser address bar, e.g.
 //   /api/fieldroutes/reset-sync?companyId=company_xxx
-async function resetSync(companyId: string | undefined, clearRun: boolean, clearCursor: boolean = false) {
+async function resetSync(companyIdParam: string | undefined, clearRun: boolean, clearCursor: boolean = false) {
+  // Default to the company the FieldRoutes sync writes to, so the URL only needs the secret.
+  const companyId = companyIdParam || (process.env.FIELDROUTES_COMPANY_ID || "").trim() || undefined;
   if (!companyId) {
     return NextResponse.json({ success: false, error: "companyId is required" }, { status: 400 });
   }
@@ -61,23 +63,27 @@ async function resetSync(companyId: string | undefined, clearRun: boolean, clear
   return NextResponse.json({ success: !hasError, companyId, ...results }, { status: hasError ? 502 : 200 });
 }
 
-async function POSTHandler(request: NextRequest) {
+// A signed-in user resets THEIR OWN company (the Jobs page's "Reset" button); only the operator may name another
+// company or clear the cursor (which forces an expensive full re-pull from FieldRoutes).
+async function POSTHandler(request: NextRequest, auth: ApiAuth) {
   const body = await request.json().catch(() => ({}));
   const { companyId, clearRun = true, clearCursor = false } = body as {
     companyId?: string;
     clearRun?: boolean;
     clearCursor?: boolean;
   };
-  return resetSync(companyId, clearRun, clearCursor);
+  const operator = auth.kind === "operator";
+  return resetSync(operator ? companyId : auth.companyId, clearRun, operator && clearCursor);
 }
 
-async function GETHandler(request: NextRequest) {
+async function GETHandler(request: NextRequest, auth: ApiAuth) {
   const params = new URL(request.url).searchParams;
-  const companyId = params.get("companyId") || undefined;
+  const operator = auth.kind === "operator";
+  const companyId = operator ? params.get("companyId") || undefined : auth.companyId;
   const clearRun = params.get("clearRun") !== "false";
-  const clearCursor = params.get("clearCursor") === "true";
+  const clearCursor = operator && params.get("clearCursor") === "true";
   return resetSync(companyId, clearRun, clearCursor);
 }
 
-export const POST = guarded("operator", POSTHandler);
-export const GET = guarded("operator", GETHandler);
+export const POST = guarded("company-write", POSTHandler, { implicitCompany: true });
+export const GET = guarded("company-write", GETHandler, { implicitCompany: true });
